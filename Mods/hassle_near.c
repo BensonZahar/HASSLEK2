@@ -369,6 +369,7 @@ static void* server_main(void* arg) {
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
                 else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
                 else if (sprefix(rq, "GET /diag")) handle_diag(c);
+                else if (sprefix(rq, "GET /konstt")) { static const char kid[] = "KONSTT-CLIENT " HM_BUILD_ID; respond(c, "200 OK", "text/plain", kid, (unsigned)(sizeof kid - 1)); }   /* константа «это клиент konstt» — по ней Load.js решает, запускать ли скрипты */
                 else if (sprefix(rq, "GET /ping")) respond(c, "200 OK", "text/plain", "hassle-near", 11);
                 else respond(c, "404 Not Found", "text/plain", "no", 2);
             }
