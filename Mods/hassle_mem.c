@@ -36,11 +36,21 @@
  *   /mem gc           GC + возврат памяти ОС сейчас                           /mem purge  только возврат памяти ОС
  *   /mem full         полная очистка сейчас                                   /mem tex N  masterTextureLimit (0 — полное качество, 1 — вдвое меньше …)
  *   /mem auto on|off  включить / выключить авто-очистку (замеры остаются)
+ *   /mem restart      подсказка; /mem restart yes — ЗАКРЫТЬ игру и сам запустить её заново (единственный способ вернуть память «как после старта»;
+ *                     после этого нужно заново войти на сервер). Планируется будильник AlarmManager на ~2,5 с, затем процесс убивается;
+ *                     если будильник поставить не вышло (нет JavaVM / Application / launch-intent), игра НЕ закрывается, причина — в журнале.
  *   Итоги очисток команда не ждёт — они в HLOG/konstt_mem.log и в /mem.
  *
  * ФАЙЛ-ПЕРЕКЛЮЧАТЕЛЬ  HLOG/konstt_mem.txt  (слова через пробел; читается на лету, перезапуск не нужен) — чтобы проверить, не мешает ли сама очистка:
  *   monitor   только замеры, ничего не чистить        nounload  не вызывать UnloadUnusedAssets        notex  не трогать качество текстур
  *   nogc      не вызывать il2cpp_gc_collect           nopurge   не вызывать mallopt
+ *
+ * ИГРА В ФОНЕ / НА ПАУЗЕ. Главный поток Unity в этот момент не крутит очередь Post, поэтому заказ ему не выполняется. Раньше мод ждал 20 с и
+ * отменял заказ (а «простой» как раз и бывает, когда игра свёрнута, — выгрузка ассетов не выполнялась ни разу). Теперь ждём MEM_MAIN_WAIT_MS,
+ * а если главный поток молчит, заказ (выгрузка ассетов / текстуры) ОСТАЁТСЯ в очереди и выполнится сам, как только игра вернётся на экран;
+ * пока он висит, авто-очистки не плодят новые заказы. Остальное (GC) делается из потока мода сразу.
+ * ЖУРНАЛ ПОСЛЕ ПОЛНОЙ ОЧИСТКИ. UnloadUnusedAssets асинхронный, поэтому кроме строки «итог» (через ~6 с) мод пишет строку «ПОСЛЕ #N»:
+ * RSS через 1, 5, 10, 20 и 40 с, изменение за 40 с и двигался ли за это время персонаж (при движении рост — подгрузка мира, а не очистка).
  *
  * КАК ЭТО ЗАПУСКАЕТСЯ В ГЛАВНОМ ПОТОКЕ. UnloadUnusedAssets и QualitySettings можно звать только в главном потоке Unity. Контекст главного потока
  * (UnitySynchronizationContext) мод находит сам, без команды: у управляемого объекта Thread главного потока в m_ExecutionContext._syncContext лежит
@@ -121,6 +131,13 @@
 #define MEM_J_TEX    4                  /* QualitySettings.masterTextureLimit (главный поток) */
 #define MEM_J_PURGE  8                  /* mallopt(M_PURGE) */
 #define MEM_J_MAPS   16                 /* только снимок карты памяти */
+#define MEM_J_RESTART 32                /* /mem restart yes: перезапуск игры (поток мода, не главный) */
+#ifndef MEM_MAIN_WAIT_MS
+#define MEM_MAIN_WAIT_MS 4000           /* сколько ждём ответ главного потока; не ответил — игра в фоне/на паузе, заказ остаётся в очереди */
+#endif
+#ifndef MEM_RESTART_DELAY_MS
+#define MEM_RESTART_DELAY_MS 2500       /* через сколько будильник запустит игру после /mem restart yes */
+#endif
 /* слова файла konstt_mem.txt */
 #define MEM_C_MONITOR 1
 #define MEM_C_NOUNLOAD 2
@@ -164,6 +181,9 @@ static volatile int g_mem_cmdReq;            /* заказ из чат-кома�
 static volatile int g_mem_texWant;           /* значение masterTextureLimit для MEM_J_TEX */
 static volatile int g_mem_jobKind;           /* что просим сделать главный поток */
 static volatile int g_mem_jobDone;
+static volatile int g_mem_deferred;          /* заказ главному потоку не ответили: остался в очереди, выполнится при возвращении игры */
+static long g_mem_deferOrderS;
+static int g_mem_purgeDead;                  /* возврат памяти ОС на этой Android не работает (mallopt 0/0, malloc_trim нет) — больше не зовём */
 static volatile int g_mem_inGame;
 static long g_mem_t0, g_mem_readyAt, g_mem_idleSince, g_mem_lastJobS, g_mem_lastGcS, g_mem_lastFullS, g_mem_nextSample, g_mem_nextTrend, g_mem_nextMaps, g_mem_cfgPoll;
 static int g_mem_hasAnchor; static float g_mem_anchor[3];
@@ -606,7 +626,7 @@ static void mem_do_tex(int lim) {                        /* только гла�
 /* то, что исполняется в главном потоке (из Post или из команды /mem) */
 static void mem_main_job(void) {
     int mf = g_mem_jobKind;
-    if (!mf) return;                                    /* заказ уже снят (поток мода не дождался) */
+    if (!mf || g_mem_jobDone) return;                   /* заказ уже снят (поток мода не дождался) или уже выполнен более ранним Post */
     if (mf & MEM_J_GC) mem_do_gc("главный поток");
     if (mf & MEM_J_UNLOAD) mem_do_unload();
     if (mf & MEM_J_TEX) mem_do_tex(g_mem_texWant);
@@ -614,11 +634,43 @@ static void mem_main_job(void) {
 }
 static void mem_do_purge(void) {
     int r1 = -999, r2 = -999, r3 = -999; char t[300]; Buf b;
+    if (g_mem_purgeDead) return;
     mem_libc();
     if (MLC.mallopt) { r1 = MLC.mallopt(-101, 0); r2 = MLC.mallopt(-104, 0); }          /* M_PURGE, M_PURGE_ALL */
     if (MLC.malloc_trim) r3 = MLC.malloc_trim(0);
     b_init(&b, t, sizeof t); b_s(&b, "возврат памяти ОС: mallopt(M_PURGE) "); b_int(&b, r1); b_s(&b, ", M_PURGE_ALL "); b_int(&b, r2);
     b_s(&b, ", malloc_trim "); b_int(&b, r3); b_s(&b, "  (−999 — функции нет, 0 у mallopt — не поддерживается этой Android)");
+    if (r1 == 0 && r2 == 0 && r3 == -999) { g_mem_purgeDead = 1; b_s(&b, "; возврат памяти ОС тут не работает — больше не вызываю"); }
+    mem_log(t);
+}
+
+/* ───────────── отчёт «ПОСЛЕ #N» (не блокирует поток мода) ───────────── */
+#define MEM_REP_N 5
+static const int g_mem_repMarks[MEM_REP_N] = { 1, 5, 10, 20, 40 };
+static struct { int active, job, step; long startS; long long t0ms, rss[MEM_REP_N]; MemSample before; } g_mem_rep;
+static MemSample g_mem_deferBefore;
+static void mem_rep_start(int job, const MemSample* before) {
+    int i;
+    g_mem_rep.active = 1; g_mem_rep.job = job; g_mem_rep.step = 0; g_mem_rep.startS = time(NULL); g_mem_rep.t0ms = mem_now_ms(); g_mem_rep.before = *before;
+    for (i = 0; i < MEM_REP_N; i++) g_mem_rep.rss[i] = -1;
+}
+static void mem_rep_tick(void) {                 /* раз в секунду из цикла потока мода */
+    long long el; int i; MemSample a; char t[800]; Buf x;
+    if (!g_mem_rep.active) return;
+    el = mem_now_ms() - g_mem_rep.t0ms;
+    while (g_mem_rep.step < MEM_REP_N && el >= (long long)g_mem_repMarks[g_mem_rep.step] * 1000) { g_mem_rep.rss[g_mem_rep.step] = mem_rss_now(); g_mem_rep.step++; }
+    if (g_mem_rep.step < MEM_REP_N) return;
+    g_mem_rep.active = 0;
+    mem_take(&a, 0);
+    b_init(&x, t, sizeof t); b_s(&x, "ПОСЛЕ #"); b_int(&x, g_mem_rep.job); b_s(&x, ": RSS до "); mem_b_mb(&x, g_mem_rep.before.rss); b_s(&x, " МБ; потом");
+    for (i = 0; i < MEM_REP_N; i++) { b_s(&x, i ? ", " : " "); b_int(&x, g_mem_repMarks[i]); b_s(&x, "с "); mem_b_mb(&x, g_mem_rep.rss[i]); }
+    b_s(&x, " МБ; за "); b_int(&x, g_mem_repMarks[MEM_REP_N - 1]); b_s(&x, " с "); mem_b_dmb(&x, (a.rss >= 0 && g_mem_rep.before.rss >= 0) ? a.rss - g_mem_rep.before.rss : 0);
+    b_s(&x, " МБ (анон "); mem_b_dmb(&x, (a.anon >= 0 && g_mem_rep.before.anon >= 0) ? a.anon - g_mem_rep.before.anon : 0);
+    b_s(&x, ", malloc "); mem_b_dmb(&x, (a.natUsed >= 0 && g_mem_rep.before.natUsed >= 0) ? a.natUsed - g_mem_rep.before.natUsed : 0);
+    b_s(&x, ", GC "); mem_b_dmb(&x, (a.gcUsed >= 0 && g_mem_rep.before.gcUsed >= 0) ? a.gcUsed - g_mem_rep.before.gcUsed : 0);
+    b_s(&x, "; куча GC "); mem_b_mb(&x, g_mem_rep.before.gcHeap); b_s(&x, " -> "); mem_b_mb(&x, a.gcHeap);
+    b_s(&x, "); ОЗУ доступно "); mem_b_mb(&x, a.avail); b_s(&x, " МБ; персонаж ");
+    b_s(&x, !g_mem_inGame ? "не в игре" : (g_mem_idleSince > g_mem_rep.startS ? "двигался (рост может быть подгрузкой мира, а не провалом очистки)" : "стоял"));
     mem_log(t);
 }
 
@@ -642,18 +694,23 @@ static void mem_run_job(int flags, const char* why) {
     b_s(&x, " МБ");
     mem_log(t);
     if (mf) {
+        int keep = 0;                                                                        /* заказ оставлен в очереди главного потока (игра в фоне) */
         if (mem_main_ready()) {
-            g_mem_jobDone = 0; g_mem_jobKind = mf;
+            g_mem_deferred = 0; g_mem_jobDone = 0; g_mem_jobKind = mf;
             if (mem_post_main()) {
-                for (i = 0; i < 400 && !g_mem_jobDone; i++) usleep(50000);                 /* до 20 с: главный поток мог быть на паузе */
+                for (i = 0; i < MEM_MAIN_WAIT_MS / 50 && !g_mem_jobDone; i++) usleep(50000);
                 mainOk = g_mem_jobDone;
-                if (!mainOk) mem_log("главный поток не выполнил заказ за 20 с (игра на паузе/в фоне?) — заказ снят");
+                if (!mainOk && (mf & (MEM_J_UNLOAD | MEM_J_TEX))) {
+                    keep = 1; g_mem_deferred = 1; g_mem_deferOrderS = now; g_mem_deferBefore = b;
+                    mem_log_i("главный поток не ответил за мс: ", MEM_MAIN_WAIT_MS);
+                    mem_log("игра свёрнута или на паузе: выгрузка ассетов ОТЛОЖЕНА, заказ остался в очереди и выполнится сам, когда игра вернётся; GC делаю сейчас из потока мода");
+                } else if (!mainOk) mem_log("главный поток не ответил (игра в фоне/на паузе) — заказ GC снят, GC делаю из потока мода");
             }
-            g_mem_jobKind = 0;
+            if (!keep) g_mem_jobKind = 0;
         }
         if (!mainOk) {                                                                       /* запасной путь: GC можно и из потока мода */
             if (mf & MEM_J_GC) mem_do_gc("поток мода");
-            if (mf & (MEM_J_UNLOAD | MEM_J_TEX)) mem_log("выгрузка ассетов/качество пропущены: нет доступа к главному потоку (наберите /mem один раз)");
+            if (!keep && (mf & (MEM_J_UNLOAD | MEM_J_TEX))) mem_log("выгрузка ассетов/качество пропущены: нет доступа к главному потоку (наберите /mem один раз)");
         }
     }
     sec = (mainOk && (flags & MEM_J_UNLOAD) && g_mem_unloadFn) ? MEM_SETTLE_FULL_S : MEM_SETTLE_GC_S;
@@ -670,13 +727,126 @@ static void mem_run_job(int flags, const char* why) {
     b_s(&x, " МБ; всего за "); b_fix(&x, (double)(mem_now_ms() - t0) / 1000.0, 1); b_s(&x, " с");
     if (sec > 1) { b_s(&x, "; RSS по секундам после: 1с "); mem_b_mb(&x, r[1]); b_s(&x, ", 3с "); mem_b_mb(&x, r[3]); b_s(&x, ", "); b_int(&x, sec); b_s(&x, "с "); mem_b_mb(&x, r[sec < 8 ? sec : 7]); }
     mem_log(t);
-    { char d[300]; Buf y; b_init(&y, d, sizeof d); b_s(&y, "#"); b_int(&y, g_mem_jobs); b_s(&y, ": RSS "); mem_b_mb(&y, b.rss); b_s(&y, " → "); mem_b_mb(&y, a.rss); b_s(&y, " МБ, доступно "); mem_b_mb(&y, a.avail); b_s(&y, " МБ; причина: "); b_s(&y, why);
+    { char d[300]; Buf y; b_init(&y, d, sizeof d); b_s(&y, "#"); b_int(&y, g_mem_jobs); b_s(&y, ": RSS "); mem_b_mb(&y, b.rss); b_s(&y, " -> "); mem_b_mb(&y, a.rss); b_s(&y, " МБ, доступно "); mem_b_mb(&y, a.avail); b_s(&y, " МБ; причина: "); b_s(&y, why);
       mem_copy(g_mem_lastSummary, d, sizeof g_mem_lastSummary); mem_both(d); }
     g_mem_level = mem_level(&a);
+    if (mainOk && (flags & MEM_J_UNLOAD) && g_mem_unloadFn) mem_rep_start(g_mem_jobs, &b);   /* дальше RSS по секундам пишется без блокировки потока мода */
     /* помогло ли: если и после полной очистки памяти критически мало, а освободилось мало — копим неудачи и в итоге режем текстуры */
     if ((flags & MEM_J_UNLOAD) && g_mem_level >= 2 && freed < 30 * 1024) g_mem_failStreak++;
     else if (g_mem_level < 2) g_mem_failStreak = 0;
     g_mem_busy = 0;
+}
+
+/* ───────────── перезапуск игры (/mem restart yes) ─────────────
+   Единственный способ вернуть память «как после старта»: Unity и malloc не отдают освобождённые страницы системе (см. журнал очисток).
+   Как: через JNI берём Application (ActivityThread.currentApplication), launch-intent своего пакета и ставим будильник AlarmManager
+   на MEM_RESTART_DELAY_MS вперёд (он живёт в system_server и переживёт смерть процесса), потом убиваем себя. Если ЛЮБОЙ шаг не удался —
+   процесс НЕ убивается, в чат и журнал уходит причина. Индексы функций JNI — стандартные (JNINativeInterface: FindClass 6, ExceptionClear 17,
+   DeleteLocalRef 23, GetMethodID 33, CallObjectMethodA 36, CallVoidMethodA 63, GetStaticMethodID 113, CallStaticObjectMethodA 116,
+   CallStaticLongMethodA 134, NewStringUTF 167, ExceptionCheck 228; JavaVM: AttachCurrentThread 4, DetachCurrentThread 5, GetEnv 6). */
+extern int kill(int, int);
+extern int getpid(void);
+typedef union { void* l; int i; long long j; double d; } MemJv;                       /* jvalue: 8 байт на любой разрядности */
+typedef void* (*mj_find_t)(void*, const char*);
+typedef void* (*mj_mid_t)(void*, void*, const char*, const char*);
+typedef void* (*mj_callo_t)(void*, void*, void*, const MemJv*);                       /* CallObjectMethodA / CallStaticObjectMethodA */
+typedef long long (*mj_calll_t)(void*, void*, void*, const MemJv*);
+typedef void (*mj_callv_t)(void*, void*, void*, const MemJv*);
+typedef void* (*mj_str_t)(void*, const char*);
+typedef unsigned char (*mj_exc_t)(void*);
+typedef void (*mj_clr_t)(void*);
+typedef int (*mj_getvms_t)(void**, int, int*);
+typedef int (*mj_getenv_t)(void*, void**, int);
+typedef int (*mj_attach_t)(void*, void**, void*);
+typedef int (*mj_detach_t)(void*);
+#define MJ(env, T, idx) ((T)((*(void***)(env))[idx]))
+#define MJV(vm, T, idx) ((T)((*(void***)(vm))[idx]))
+static int mj_clean(void* env) {                  /* 1 — исключения нет; если было, оно сброшено и вернётся 0 */
+    if (MJ(env, mj_exc_t, 228)(env)) { MJ(env, mj_clr_t, 17)(env); return 0; }
+    return 1;
+}
+static void* mem_get_vm(void) {
+    mj_getvms_t f = NULL; void *vm = NULL, *h; int n = 0;
+    h = dlopen(NULL, RTLD_NOW_); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs");
+    if (!f) { h = dlopen("libnativehelper.so", RTLD_NOW_ | 4); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs"); }
+    if (!f) { h = dlopen("libart.so", RTLD_NOW_ | 4); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs"); }
+    if (!f) return NULL;
+    if (f(&vm, 1, &n) != 0 || n < 1) return NULL;
+    return vm;
+}
+/* 1 — будильник поставлен (можно убивать процесс); 0 — не вышло, err — причина */
+static int mem_restart_arm(char* err, int cap) {
+    void *vm, *env = NULL, *cAct, *cCtx, *cPm, *cInt, *cPi, *cAlm, *cSys, *app, *pkg, *pm, *intent, *pi, *am, *str;
+    void *mApp, *mPkg, *mPm, *mLaunch, *mFlags, *mGet, *mSvc, *mNow, *mSet;
+    MemJv a[4]; int attached = 0, ok = 0, rc, k; long long now;
+    mem_copy(err, "", (unsigned)cap);
+#define MJ_FAIL(msg) do { mem_copy(err, msg, (unsigned)cap); goto out; } while (0)
+    for (k = 0; k < 4; k++) a[k].j = 0;
+    vm = mem_get_vm(); if (!vm) MJ_FAIL("нет JavaVM (JNI_GetCreatedJavaVMs не найдена)");
+    rc = MJV(vm, mj_getenv_t, 6)(vm, &env, 0x00010006);
+    if (rc == -2) { if (MJV(vm, mj_attach_t, 4)(vm, &env, NULL) != 0 || !env) MJ_FAIL("AttachCurrentThread не удался"); attached = 1; }
+    else if (rc != 0 || !env) MJ_FAIL("GetEnv не удался");
+    cAct = MJ(env, mj_find_t, 6)(env, "android/app/ActivityThread"); if (!cAct || !mj_clean(env)) MJ_FAIL("нет класса ActivityThread");
+    mApp = MJ(env, mj_mid_t, 113)(env, cAct, "currentApplication", "()Landroid/app/Application;"); if (!mApp || !mj_clean(env)) MJ_FAIL("нет ActivityThread.currentApplication");
+    app = MJ(env, mj_callo_t, 116)(env, cAct, mApp, a); if (!app || !mj_clean(env)) MJ_FAIL("currentApplication вернул null");
+    cCtx = MJ(env, mj_find_t, 6)(env, "android/content/Context"); if (!cCtx || !mj_clean(env)) MJ_FAIL("нет класса Context");
+    mPkg = MJ(env, mj_mid_t, 33)(env, cCtx, "getPackageName", "()Ljava/lang/String;"); if (!mPkg || !mj_clean(env)) MJ_FAIL("нет Context.getPackageName");
+    pkg = MJ(env, mj_callo_t, 36)(env, app, mPkg, a); if (!pkg || !mj_clean(env)) MJ_FAIL("getPackageName вернул null");
+    mPm = MJ(env, mj_mid_t, 33)(env, cCtx, "getPackageManager", "()Landroid/content/pm/PackageManager;"); if (!mPm || !mj_clean(env)) MJ_FAIL("нет Context.getPackageManager");
+    pm = MJ(env, mj_callo_t, 36)(env, app, mPm, a); if (!pm || !mj_clean(env)) MJ_FAIL("getPackageManager вернул null");
+    cPm = MJ(env, mj_find_t, 6)(env, "android/content/pm/PackageManager"); if (!cPm || !mj_clean(env)) MJ_FAIL("нет класса PackageManager");
+    mLaunch = MJ(env, mj_mid_t, 33)(env, cPm, "getLaunchIntentForPackage", "(Ljava/lang/String;)Landroid/content/Intent;"); if (!mLaunch || !mj_clean(env)) MJ_FAIL("нет getLaunchIntentForPackage");
+    a[0].l = pkg; intent = MJ(env, mj_callo_t, 36)(env, pm, mLaunch, a); if (!intent || !mj_clean(env)) MJ_FAIL("у пакета нет launch-intent");
+    cInt = MJ(env, mj_find_t, 6)(env, "android/content/Intent"); if (!cInt || !mj_clean(env)) MJ_FAIL("нет класса Intent");
+    mFlags = MJ(env, mj_mid_t, 33)(env, cInt, "addFlags", "(I)Landroid/content/Intent;"); if (!mFlags || !mj_clean(env)) MJ_FAIL("нет Intent.addFlags");
+    a[0].j = 0; a[0].i = 0x10008000;                                                        /* FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK */
+    MJ(env, mj_callo_t, 36)(env, intent, mFlags, a); if (!mj_clean(env)) MJ_FAIL("Intent.addFlags бросил исключение");
+    cPi = MJ(env, mj_find_t, 6)(env, "android/app/PendingIntent"); if (!cPi || !mj_clean(env)) MJ_FAIL("нет класса PendingIntent");
+    mGet = MJ(env, mj_mid_t, 113)(env, cPi, "getActivity", "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;"); if (!mGet || !mj_clean(env)) MJ_FAIL("нет PendingIntent.getActivity");
+    for (k = 0; k < 4; k++) a[k].j = 0;
+    a[0].l = app; a[1].i = 0; a[2].l = intent; a[3].i = 0x14000000;                         /* FLAG_CANCEL_CURRENT | FLAG_IMMUTABLE */
+    pi = MJ(env, mj_callo_t, 116)(env, cPi, mGet, a); if (!pi || !mj_clean(env)) MJ_FAIL("PendingIntent.getActivity не удался");
+    mSvc = MJ(env, mj_mid_t, 33)(env, cCtx, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"); if (!mSvc || !mj_clean(env)) MJ_FAIL("нет Context.getSystemService");
+    str = MJ(env, mj_str_t, 167)(env, "alarm"); if (!str) MJ_FAIL("NewStringUTF не удался");
+    for (k = 0; k < 4; k++) a[k].j = 0;
+    a[0].l = str; am = MJ(env, mj_callo_t, 36)(env, app, mSvc, a); if (!am || !mj_clean(env)) MJ_FAIL("AlarmManager недоступен");
+    cSys = MJ(env, mj_find_t, 6)(env, "java/lang/System"); if (!cSys || !mj_clean(env)) MJ_FAIL("нет класса System");
+    mNow = MJ(env, mj_mid_t, 113)(env, cSys, "currentTimeMillis", "()J"); if (!mNow || !mj_clean(env)) MJ_FAIL("нет System.currentTimeMillis");
+    for (k = 0; k < 4; k++) a[k].j = 0;
+    now = MJ(env, mj_calll_t, 134)(env, cSys, mNow, a); if (!mj_clean(env)) MJ_FAIL("System.currentTimeMillis бросил исключение");
+    cAlm = MJ(env, mj_find_t, 6)(env, "android/app/AlarmManager"); if (!cAlm || !mj_clean(env)) MJ_FAIL("нет класса AlarmManager");
+    for (k = 0; k < 4; k++) a[k].j = 0;
+    a[0].i = 0; a[1].j = now + MEM_RESTART_DELAY_MS; a[2].l = pi;                           /* RTC_WAKEUP */
+    mSet = MJ(env, mj_mid_t, 33)(env, cAlm, "setExact", "(IJLandroid/app/PendingIntent;)V");
+    if (mSet && mj_clean(env)) {
+        MJ(env, mj_callv_t, 63)(env, am, mSet, a);
+        if (mj_clean(env)) ok = 1;                                                           /* на Android 12+ без разрешения точных будильников бросит SecurityException — тогда ниже обычный set */
+    } else mj_clean(env);
+    if (!ok) {
+        mSet = MJ(env, mj_mid_t, 33)(env, cAlm, "set", "(IJLandroid/app/PendingIntent;)V");
+        if (!mSet || !mj_clean(env)) MJ_FAIL("нет AlarmManager.set");
+        MJ(env, mj_callv_t, 63)(env, am, mSet, a);
+        if (!mj_clean(env)) MJ_FAIL("AlarmManager.set бросил исключение");
+        ok = 1;
+    }
+out:
+#undef MJ_FAIL
+    if (attached && vm) MJV(vm, mj_detach_t, 5)(vm);
+    return ok;
+}
+static void mem_do_restart(void) {
+    char err[200], m[260]; Buf b;
+    mem_log("ПЕРЕЗАПУСК по команде /mem restart yes: ставлю будильник и закрываю игру");
+    if (!mem_restart_arm(err, sizeof err)) {
+        b_init(&b, m, sizeof m); b_s(&b, "Память: перезапуск не удался, игра осталась открытой. Причина: "); b_s(&b, err);
+        mem_log2("ПЕРЕЗАПУСК отменён, процесс НЕ убит: ", err);
+        chat_say(m);
+        return;
+    }
+    mem_log_i("ПЕРЕЗАПУСК: будильник поставлен, запуск через мс: ", MEM_RESTART_DELAY_MS);
+    chat_say("Память: будильник поставлен, игра закроется и запустится сама. Потом войдите на сервер заново");
+    usleep(1000000);                                                                         /* дать журналу и чату сброситься */
+    kill(getpid(), 9);
 }
 
 /* ───────────── файл-переключатель ───────────── */
@@ -725,7 +895,7 @@ static void mem_idle_tick(long now) {
 /* ───────────── политика ───────────── */
 static void mem_policy(const MemSample* s, long now, long idle) {
     int flags = 0; char why[120]; Buf w; long gap;
-    if (!g_mem_auto || (g_mem_cfg & MEM_C_MONITOR) || !g_ready || g_mem_busy) return;
+    if (!g_mem_auto || (g_mem_cfg & MEM_C_MONITOR) || !g_ready || g_mem_busy || g_mem_deferred) return;
     if (now - g_mem_readyAt < MEM_WARMUP_S) return;
     if (now - g_mem_lastJobS < MEM_GAP_S) return;
     b_init(&w, why, sizeof why);
@@ -837,8 +1007,15 @@ static void* mem_main(void* arg) {
         if (g_ready && !apiLogged && mem_api()) { apiLogged = 1; mem_log_api(); }
         if (g_ready && !g_mem_ctxTries && g_tplState == 1) mem_grab_ctx();     /* контекст главного потока заранее, а не в момент нужды */
         mem_idle_tick(now);
+        mem_rep_tick();
+        if (g_mem_deferred && g_mem_jobDone) {                                 /* игра вернулась на экран: главный поток выполнил отложенный заказ */
+            g_mem_deferred = 0; g_mem_jobKind = 0;
+            mem_log_i("отложенная очистка выполнена главным потоком, прошло с заказа, с: ", now - g_mem_deferOrderS);
+            mem_rep_start(g_mem_jobs, &g_mem_deferBefore);
+        }
         if (g_mem_cmdReq) {                                                    /* заказ из чата */
             int r = g_mem_cmdReq; g_mem_cmdReq = 0;
+            if (r & MEM_J_RESTART) { r &= ~MEM_J_RESTART; mem_do_restart(); }
             if (r & MEM_J_MAPS) mem_log_maps("по команде");
             if (r & ~MEM_J_MAPS) mem_run_job(r & ~MEM_J_MAPS, "команда /mem");
         }
@@ -866,6 +1043,8 @@ static void* mem_main(void* arg) {
 #define MEM_W_ON 32
 #define MEM_W_OFF 64
 #define MEM_W_MAPS 128
+#define MEM_W_RESTART 256
+#define MEM_W_YES 512
 static int mem_parse(void* arr, int* num) {
     long len; int i, w = 0; char* data;
     *num = -1;
@@ -888,6 +1067,7 @@ static int mem_parse(void* arr, int* num) {
             if (seq(tok, "gc")) w |= MEM_W_GC; else if (seq(tok, "full")) w |= MEM_W_FULL; else if (seq(tok, "purge")) w |= MEM_W_PURGE;
             else if (seq(tok, "tex")) w |= MEM_W_TEX; else if (seq(tok, "auto")) w |= MEM_W_AUTO; else if (seq(tok, "on") || seq(tok, "1")) w |= MEM_W_ON;
             else if (seq(tok, "off") || seq(tok, "0")) w |= MEM_W_OFF; else if (seq(tok, "maps")) w |= MEM_W_MAPS;
+            else if (seq(tok, "restart")) w |= MEM_W_RESTART; else if (seq(tok, "yes") || seq(tok, "y")) w |= MEM_W_YES;
             else if (tok[0] >= '0' && tok[0] <= '9' && *num < 0) { int v = 0, k = 0; while (tok[k] >= '0' && tok[k] <= '9' && v < 1000) v = v * 10 + (tok[k++] - '0'); *num = v; }
         }
     }
@@ -902,7 +1082,7 @@ static void mem_say_status(void) {
     b_init(&b, m, sizeof m);
     b_s(&b, "Авто-очистка: "); b_s(&b, g_mem_auto ? (g_mem_cfg & MEM_C_MONITOR ? "выкл (файл monitor)" : "вкл") : "выкл");
     b_s(&b, "; очисток "); b_int(&b, g_mem_jobs); b_s(&b, ", освобождено ≈ "); b_int(&b, (long)(g_mem_freedKB / 1024)); b_s(&b, " МБ; текстуры: ограничение "); b_int(&b, g_mem_texLimit);
-    b_s(&b, "; главный поток: "); b_s(&b, (g_mt_ctx && g_mt_postM) ? "найден" : "не найден"); b_s(&b, "; журнал: HLOG/konstt_mem.log");
+    b_s(&b, "; главный поток: "); b_s(&b, (g_mt_ctx && g_mt_postM) ? "найден" : "не найден"); b_s(&b, "; журнал: HLOG/konstt_mem.log"); if (g_mem_deferred) b_s(&b, "; выгрузка ассетов ждёт возврата игры на экран");
     chat_say(m);
     if (g_mem_lastSummary[0]) { b_init(&b, m, sizeof m); b_s(&b, "Последняя очистка: "); b_s(&b, g_mem_lastSummary); chat_say(m); }
 }
@@ -911,6 +1091,11 @@ static void native_mem_cmd(void* self, void* args, void* mi) {
     if (args && seq(A.class_get_name(A.object_get_class(args)), "String")) { mem_main_job(); return; }   /* Post из потока мода (state — строка), а не чат (string[]) */
     mt_capture_ctx();                                                   /* мы в главном потоке: заодно запомним его контекст (запасной путь) */
     w = mem_parse(args, &num);
+    if (w & MEM_W_RESTART) {
+        if (!(w & (MEM_W_YES | MEM_W_ON))) { chat_usage("Память: /mem restart yes - закрою игру и сам запущу её заново (около минуты, потом войти на сервер заново). Без yes ничего не делаю"); return; }
+        g_mem_cmdReq |= MEM_J_RESTART; chat_say("Память: перезапускаю игру, не закрывайте эмулятор (итог в HLOG/konstt_mem.log)");
+        return;
+    }
     if (w & MEM_W_AUTO) {
         if (w & MEM_W_OFF) { g_mem_auto = 0; chat_say("Память: авто-очистка выключена (замеры продолжаются). Включить: /mem auto on"); }
         else if (w & MEM_W_ON) { g_mem_auto = 1; chat_say("Память: авто-очистка включена"); }
