@@ -202,7 +202,7 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
     }
     if (t < 0) t = 5;                                   /* без аргумента — 5 секунд */
     if (t < REC_MIN_S || t > REC_MAX_S) {               /* допустимо 0–600 */
-        chat_say("Используйте: /rec [секунды (0-600]");
+        chat_usage("Используйте: /rec [секунды (0-600]");
         return;
     }
     do_reconnect(t, &r);

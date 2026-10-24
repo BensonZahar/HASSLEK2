@@ -922,7 +922,7 @@ static void native_mem_cmd(void* self, void* args, void* mi) {
         if (num < 0 || num > 3) {
             char m[200]; Buf b; b_init(&b, m, sizeof m);
             b_s(&b, "Память: /mem tex N — N от 0 (полное качество) до 3 (текстуры в 8 раз меньше). Сейчас: "); b_int(&b, g_mem_texLimit);
-            chat_say(m); return;
+            chat_usage(m); return;
         }
         g_mem_texWant = num; g_mem_cmdReq |= MEM_J_TEX;
         chat_say("Память: качество текстур меняю (подробности в HLOG/konstt_mem.log)");

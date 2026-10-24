@@ -817,16 +817,21 @@ static void tpl_cb(void* key, void* val, void* ctx) {
 }
 
 
-static void chat_say(const char* msg) {
+/* Чат Hud.js красит строку так: style="color:#" + color. Поэтому цвет — это HEX БЕЗ «#» («FFFFFF», можно 8 знаков RRGGBBAA).
+ * Слово вроде "white" даёт «#white» — это не цвет, браузер игнорирует стиль, и текст берёт цвет родителя (часто чёрный). */
+static void chat_say_c(const char* msg, const char* hex) {
     void *cw, *m, *exc = NULL, *args[2];
     if (!A.string_new || !g_img) return;
     cw = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
     if (!cw) return;
     m = A.class_get_method_from_name(cw, "AddChatMessage", 2);
     if (!m) return;
-    args[0] = A.string_new(msg); args[1] = A.string_new("white");
+    args[0] = A.string_new(msg); args[1] = A.string_new(hex && hex[0] ? hex : "FFFFFF");
     A.runtime_invoke(m, NULL, args, &exc);
 }
+static void chat_say(const char* msg) { chat_say_c(msg, "FFFFFF"); }
+/* Подсказка по вводу команды («Используйте: /cmd [арг]») — серая, как у серверных подсказок (0xCECECEFF) */
+static void chat_usage(const char* msg) { chat_say_c(msg, "CECECE"); }
 
 /* аргументы команды: string[]; число секунд — первый числовой элемент (не важно, входит ли сама команда в массив); «diag» — диагностика */
 static int parse_cmd_args(void* arr, int* diag) {

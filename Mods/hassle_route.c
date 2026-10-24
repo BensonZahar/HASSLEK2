@@ -1142,7 +1142,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
         chat_say(msg);
         return;
     }
-    chat_say("Маршрут: /route rec — запись, /route stop — стоп, /route play — повтор (/route play force — без проверки места), /route status, /route probe. Раздевалка: /route dress — запись пути к метке, у метки ещё раз /route dress, после переодевания /route dress — возврат назад (dress rec — заново, dress back — из файла)");
+    chat_usage("Маршрут: /route rec — запись, /route stop — стоп, /route play — повтор (/route play force — без проверки места), /route status, /route probe. Раздевалка: /route dress — запись пути к метке, у метки ещё раз /route dress, после переодевания /route dress — возврат назад (dress rec — заново, dress back — из файла)");
 }
 
 /* ───────────── самозапуск ───────────── */
