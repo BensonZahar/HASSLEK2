@@ -20,6 +20,8 @@
  *                         /route dress rec    всегда новая запись (если что-то пошло не так);
  *                         /route dress back   вернуться по записи из файла (после перезапуска игры или если /route dress не вернул);
  *                         /route dress back force   то же, но без проверки «вы стоите у метки»;
+ *                         Дожим: когда возврат по записи кончился, мод ждёт остановки персонажа (инерция) и сам подтягивает его к точке старта
+ *                         записи (до 5 с, не дальше 4 м; взялись за стик — уступает). Ход пишется в konstt.log («раздевалка: дожим …»), итог — в чат.
  *                         то же по-русски: /route раздевалка
  *   /route probe          найти экранный стик и показать его значение (диагностика)
  *
@@ -128,6 +130,15 @@ static long long g_rt_lastP;                                       /* когда
 static long long g_rt_lastDev, g_rt_lastDevLog;                    /* когда считали/писали в журнал отклонение (повтор) */
 static float g_rt_maxDev; static long long g_rt_maxDevT;           /* наибольшее отклонение от записи за повтор, и когда */
 static float g_rt_startDev[3];                                     /* на сколько вы стояли не там, где начинали запись (повтор) */
+/* дожим после возврата (раздевалка): запись кончилась — мод ждёт, пока персонаж остановится (инерция), и сам подтягивает его к точке старта записи */
+#define RT_FIX_MAXD 4.0f             /* дальше этого от точки старта — не дожимаем (что-то пошло не так, не уводим персонажа) */
+#define RT_FIX_TOL  0.20f            /* считаем, что дошли, если ближе (м) */
+#define RT_FIX_MS   5000             /* весь дожим не дольше (мс) */
+#define RT_FIX_LEGS 3                /* не больше столько заходов «пошёл–остановился» */
+static int g_rt_fix;                                               /* 1 — идёт дожим */
+static long long g_rt_fixT0, g_rt_fixLT, g_rt_fixStall, g_rt_fixLog;   /* старт дожима, предыдущий тик, сколько мс стик держим, а персонаж не движется, когда писали в журнал */
+static float g_rt_fixTgt[3], g_rt_fixPrev[3], g_rt_fixPD, g_rt_fixSp, g_rt_fixCl, g_rt_fixD0;   /* цель, прошлая позиция, прошлое расстояние, скорость и сближение (м/с), расстояние после остановки */
+static int g_rt_fixHave, g_rt_fixLegs;                            /* сколько замеров есть, сколько заходов «пошёл–остановился» было */
 static void* g_rt_mGT; static void* g_rt_mEA;                      /* Component.get_transform, Transform.get_eulerAngles (реальная камера) */
 static int rt_my_pos(float* me);
 static void b_pos(Buf* b, const float* p);
@@ -514,6 +525,7 @@ static void rt_rec_step(void) {
 
 static void rt_play_stop(int code) {
     __atomic_store_n(&g_rt_mode, 0, __ATOMIC_RELEASE);
+    g_rt_fix = 0;
     rt_release_stick();
     if (code == 1 && g_rt_rev && g_rt_dress) g_rt_dst = 0;          /* вернулись — раздевалка пройдена, следующий /route dress начнёт новую запись */
     if (code) rt_event(code);
@@ -526,6 +538,109 @@ static RtS* rt_rev_sample(long long a) {
     if (g_rt_pi < 0) g_rt_pi = 0;
     while (g_rt_pi > 0 && (long long)g_rt_s[g_rt_pi].t > a) g_rt_pi--;
     return &g_rt_s[g_rt_pi];
+}
+
+/* ───────────── дожим после возврата (раздевалка) ─────────────
+   Возврат подаёт ровно тот стик, что вы подавали по дороге туда, но персонаж инерционный: в конце записи он бежит на полной скорости и после
+   отпускания стика катится ещё около метра. Поэтому по окончании записи мод стик отпускает, ждёт остановки и, если до точки старта записи
+   (плюс смещение, с которым вы начинали возврат) ещё больше RT_FIX_TOL, короткими заходами подтягивает персонажа к ней: направление считается
+   из позиции и реальной камеры, скорость мала и падает по мере приближения, отпускание — с упреждением на накат. Не больше RT_FIX_MS и RT_FIX_LEGS
+   заходов; дальше RT_FIX_MAXD от точки не трогаем. Взялись за стик — уступаем (общая проверка в rt_play_step). */
+static float rt_sind(float d) {                                    /* sin в градусах без libm: приводим к [-90°, 90°] и считаем ряд Тейлора */
+    float x, x2;
+    while (d > 180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    if (d > 90.0f) d = 180.0f - d; else if (d < -90.0f) d = -180.0f - d;
+    x = d * 0.017453293f; x2 = x * x;
+    return x * (1.0f - x2 / 6.0f * (1.0f - x2 / 20.0f * (1.0f - x2 / 42.0f * (1.0f - x2 / 72.0f))));
+}
+static int rt_fix_put(int on, float x, float y) {                  /* on=1 — вести стиком (x, y), 0 — отпустить; запоминаем, что писали (проверка «взялись за стик») */
+    float wx = 0, wy = 0;
+    if (on) {
+        if (!g_rt_down) { if (!rt_stick_send(1, 0, 0)) return 0; g_rt_down = 1; }
+        if (!rt_stick_send(2, x, y)) return 0;
+        wx = x; wy = y;
+    } else if (g_rt_down) {
+        if (!rt_stick_send(3, 0, 0)) return 0;
+        g_rt_down = 0;
+    }
+    rt_btn_apply(0);
+    g_rt_wh[g_rt_whi & 3][0] = wx; g_rt_wh[g_rt_whi & 3][1] = wy; g_rt_whi++;
+    g_rt_wrote = 1;
+    return 1;
+}
+static void rt_fix_log(const char* tag, const float* me) {          /* журнал: позиция, до цели, скорость */
+    char t[300]; Buf b; double dx = me[0] - g_rt_fixTgt[0], dz = me[2] - g_rt_fixTgt[2];
+    b_init(&b, t, sizeof t);
+    b_s(&b, "раздевалка: "); b_s(&b, tag);
+    b_s(&b, ", поз "); b_pos(&b, me);
+    b_s(&b, ", до цели "); b_fix(&b, __builtin_sqrt(dx * dx + dz * dz), 2); b_s(&b, " м (Δ "); b_fix(&b, dx, 2); b_s(&b, ", "); b_fix(&b, dz, 2); b_ch(&b, ')');
+    if (g_rt_fixHave >= 2) { b_s(&b, ", скорость "); b_fix(&b, g_rt_fixSp, 2); b_s(&b, " м/с"); }
+    b_s(&b, g_rt_down ? ", стик держу" : ", стик отпущен");
+    dlog(t);
+}
+static void rt_fix_done(const char* why) {                         /* конец дожима: журнал и обычное завершение возврата (стик отпускается, в чат — итог) */
+    float me[3];
+    if (rt_my_pos(me)) rt_fix_log(why, me); else dlog2("раздевалка: дожим закончен: ", why);
+    rt_play_stop(1);
+}
+/* 1 — дожим начат (стик отпущен, дальше тики идут в rt_fix_step); 0 — дожимать нечего/нельзя, возврат можно завершать */
+static int rt_fix_begin(long long tnow) {
+    float me[3], dx, dz, d;
+    g_rt_fixLegs = 0; g_rt_fix = 0;
+    if (!g_rt_hasS || !rt_my_pos(me)) { dlog("раздевалка: возврат по записи закончен, позиция или точка старта неизвестны — дожима нет"); return 0; }
+    g_rt_fixTgt[0] = g_rt_S[0] + g_rt_startDev[0]; g_rt_fixTgt[1] = g_rt_S[1]; g_rt_fixTgt[2] = g_rt_S[2] + g_rt_startDev[2];
+    dx = g_rt_fixTgt[0] - me[0]; dz = g_rt_fixTgt[2] - me[2]; d = (float)__builtin_sqrt((double)dx * dx + (double)dz * dz);
+    g_rt_fixHave = 0; g_rt_fixSp = 0; g_rt_fixCl = 0;
+    rt_fix_log("возврат по записи закончен", me);
+    if (d > RT_FIX_MAXD) { dlog("раздевалка: дальше 4 м от точки старта — дожим не делаю"); return 0; }
+    g_rt_fixT0 = g_rt_fixLT = tnow; g_rt_fixLog = tnow; g_rt_fixStall = 0; g_rt_fixD0 = d;
+    g_rt_fixPrev[0] = me[0]; g_rt_fixPrev[1] = me[1]; g_rt_fixPrev[2] = me[2]; g_rt_fixPD = d;
+    if (!rt_fix_put(0, 0, 0)) return 0;
+    g_rt_fix = 1;
+    return 1;
+}
+static void rt_fix_step(long long tnow) {
+    float me[3], dx, dz, dist, dt, sp, cl, yaw = 0, pv = 0, s, c, ux, uz, r, f, mag; long long ldt = tnow - g_rt_fixLT; int have = g_rt_fixHave, drive = 0, moving;
+    if (!rt_my_pos(me)) { dlog("раздевалка: дожим: позиция не читается, останавливаюсь"); rt_play_stop(1); return; }
+    dx = g_rt_fixTgt[0] - me[0]; dz = g_rt_fixTgt[2] - me[2];
+    dist = (float)__builtin_sqrt((double)dx * dx + (double)dz * dz);
+    if (have >= 1 && ldt > 0) {                                    /* скорость и сближение по двум последним замерам */
+        float mx = me[0] - g_rt_fixPrev[0], mz = me[2] - g_rt_fixPrev[2];
+        dt = (float)ldt / 1000.0f;
+        sp = (float)__builtin_sqrt((double)mx * mx + (double)mz * mz) / dt;
+        cl = (g_rt_fixPD - dist) / dt;
+        if (have == 1) { g_rt_fixSp = sp; g_rt_fixCl = cl; }
+        else { g_rt_fixSp += (sp - g_rt_fixSp) * 0.5f; g_rt_fixCl += (cl - g_rt_fixCl) * 0.5f; }
+    }
+    g_rt_fixPrev[0] = me[0]; g_rt_fixPrev[1] = me[1]; g_rt_fixPrev[2] = me[2]; g_rt_fixPD = dist; g_rt_fixLT = tnow;
+    if (g_rt_fixHave < 1000) g_rt_fixHave++;
+    if (have < 1) return;                                          /* первый замер: только запомнили позицию (стик уже отпущен) */
+    if (tnow - g_rt_fixT0 > RT_FIX_MS) { rt_fix_done("дожим: время вышло"); return; }
+    moving = g_rt_fixSp > 0.3f;
+    if (dist > RT_FIX_TOL) {
+        if (g_rt_down) drive = !(g_rt_fixCl > 0.2f && dist <= g_rt_fixCl * 0.30f + 0.10f);   /* ведём; пора отпускать — докатится сам (накат ≈ 0.3 с скорости) */
+        else if (!moving) {                                        /* стоим и не дошли — новый заход */
+            if (g_rt_fixLegs >= RT_FIX_LEGS) { rt_fix_done("дожим: заходы кончились"); return; }
+            g_rt_fixLegs++; g_rt_fixStall = 0; drive = 1;
+            if (g_rt_fixLegs == 1) g_rt_fixD0 = dist;              /* сколько было после остановки — в итоговое сообщение */
+        }
+    } else if (!moving) { rt_fix_done("дожим: дошёл"); return; }
+    if (drive && g_rt_fixSp < 0.1f) {                              /* стик подан, а персонаж не движется: упёрся или мёртвая зона стика */
+        g_rt_fixStall += ldt;
+        if (g_rt_fixStall > 700) { rt_fix_done("дожим: стик подан, а персонаж не двигается — останавливаюсь"); return; }
+    } else g_rt_fixStall = 0;
+    if (drive) {
+        float ty = 0, tx = 0;
+        if (rt_cam_true(&ty, &tx)) yaw = ty;                       /* направление считаем от реальной камеры: стик «вперёд» идёт туда, куда она смотрит */
+        else if (!rt_cam_read(&yaw, &pv)) { rt_fix_done("дожим: камера не читается"); return; }
+        ux = dx / dist; uz = dz / dist;
+        s = rt_sind(yaw); c = rt_sind(90.0f - yaw);                /* мир (x, z) = вправо·(cos, −sin) + вперёд·(sin, cos) → обратно */
+        r = ux * c - uz * s; f = ux * s + uz * c;
+        mag = dist * 1.5f; if (mag < 0.8f) mag = 0.8f; if (mag > 1.5f) mag = 1.5f;
+        if (!rt_fix_put(1, r * mag, f * mag)) { rt_play_stop(4); return; }
+    } else if (!rt_fix_put(0, 0, 0)) { rt_play_stop(4); return; }
+    if (tnow - g_rt_fixLog >= 250) { g_rt_fixLog = tnow; rt_fix_log(drive ? "дожим: иду к точке" : "дожим: жду остановки", me); }
 }
 
 static void rt_play_step(void) {
@@ -570,14 +685,14 @@ static void rt_play_step(void) {
         }
         g_rt_bad = 0;
     }
-    if (g_rt_pn >= 2 && now - g_rt_lastDev >= 100) {              /* отклонение от записи: где вы сейчас против того, где были в записи в этот же момент */
+    if (g_rt_pn >= 2 && !g_rt_fix && now - g_rt_lastDev >= 100) {              /* отклонение от записи: где вы сейчас против того, где были в записи в этот же момент */
         float me[3], rp[3];
         g_rt_lastDev = now;
         if (rt_my_pos(me) && rt_pos_at(tl, rp)) {
             double dx = me[0] - rp[0], dy = me[1] - rp[1], dz = me[2] - rp[2];
             float dev = (float)__builtin_sqrt(dx * dx + dy * dy + dz * dz);
             if (dev > g_rt_maxDev) { g_rt_maxDev = dev; g_rt_maxDevT = now; }
-            if (now - g_rt_lastDevLog >= 1000) {
+            if (now - g_rt_lastDevLog >= (g_rt_rev ? 250 : 1000)) {   /* возврат короткий — пишем чаще */
                 char t[200]; Buf b; b_init(&b, t, sizeof t);
                 g_rt_lastDevLog = now;
                 b_s(&b, "маршрут: повтор t="); b_fix(&b, (double)now / 1000.0, 1); b_s(&b, " с, отклонение от записи "); b_fix(&b, dev, 2);
@@ -589,7 +704,9 @@ static void rt_play_step(void) {
         }
     }
     if (g_rt_rev) {
-        if (look <= (long long)(g_rt_dtEma * 0.5f)) {            /* дошли до начала записи (с точностью до полкадра): отпускаем стик */
+        if (g_rt_fix) { rt_fix_step(tnow); return; }             /* запись кончилась, идёт дожим до точки старта */
+        if (look <= (long long)(g_rt_dtEma * 0.5f)) {            /* дошли до начала записи (с точностью до полкадра): отпускаем стик, дальше — дожим */
+            if (rt_fix_begin(tnow)) return;
             rt_play_stop(1);
             return;
         }
@@ -796,7 +913,7 @@ static int rt_my_pos(float* me) {
     return read_pos(lp, me);
 }
 static void b_pos(Buf* b, const float* p) { b_fix(b, p[0], 1); b_s(b, ", "); b_fix(b, p[1], 1); b_s(b, ", "); b_fix(b, p[2], 1); }
-static double rt_dist2(const float* a, const float* c) { double dx = a[0] - c[0], dy = a[1] - c[1]; return __builtin_sqrt(dx * dx + dy * dy); }   /* по горизонтали, как d2 в /near */
+static double rt_dist2(const float* a, const float* c) { double dx = a[0] - c[0], dz = a[2] - c[2]; return __builtin_sqrt(dx * dx + dz * dz); }   /* по горизонтали: x и z (индекс 1 — высота, в записях раздевалки он почти не меняется) */
 
 static void rt_report(int code) {                                  /* главный поток */
     Buf b; char msg[520]; float me[3];
@@ -807,6 +924,7 @@ static void rt_report(int code) {                                  /* главн
             double dx = me[0] - g_rt_S[0], dy = me[1] - g_rt_S[1], dz = me[2] - g_rt_S[2];
             b_s(&b, ". До точки, где вы начали запись: "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 2); b_s(&b, " м (Δ "); b_fix(&b, dx, 2); b_s(&b, ", "); b_fix(&b, dy, 2); b_s(&b, ", "); b_fix(&b, dz, 2); b_ch(&b, ')');
         }
+        if (g_rt_fixLegs > 0) { b_s(&b, ". Дожим: после остановки было "); b_fix(&b, g_rt_fixD0, 2); b_s(&b, " м до точки, заходов "); b_int(&b, g_rt_fixLegs); }
         if (g_rt_pn >= 2) { b_s(&b, ". Макс. отклонение от записи "); b_fix(&b, g_rt_maxDev, 2); b_s(&b, " м"); }
     } else if (code == 1) {
         b_s(&b, "Маршрут пройден");
@@ -951,7 +1069,7 @@ static void native_route_cmd(void* self, void* args, void* mi) {
                     }
                 }
             }
-            g_rt_dress = 1; g_rt_rev = 1; g_rt_revT0 = t0;
+            g_rt_dress = 1; g_rt_rev = 1; g_rt_revT0 = t0; g_rt_fix = 0; g_rt_fixLegs = 0;
             g_rt_maxDev = 0; g_rt_maxDevT = 0; g_rt_ppi = 0; g_rt_lastDev = -1000; g_rt_lastDevLog = -1000;
             { int q; for (q = 0; q < 4; q++) { g_rt_wh[q][0] = 0; g_rt_wh[q][1] = 0; } }
             g_rt_whi = 0; g_rt_down = 0; g_rt_bdown = 0; g_rt_tickPending = 0; g_rt_lastTk = 0; g_rt_dtEma = 55.0f; g_rt_lead = 0;
