@@ -60,6 +60,7 @@ extern int usleep(unsigned);
 extern int open(const char*, int, ...);
 extern long read(int, void*, unsigned long);
 extern long time(long*);
+extern int clock_gettime(int, void*);
 extern void* memcpy(void*, const void*, unsigned long);
 extern int mkdir(const char*, unsigned);
 extern long write(int, const void*, unsigned long);
@@ -214,6 +215,56 @@ static void dlog2(const char* a, const char* b) {
 }
 static void dlog_i(const char* a, long v) {
     char t[512]; Buf x; b_init(&x, t, sizeof t); b_s(&x, a); b_int(&x, v); dlog(t);
+}
+
+/* ───────────── хронология запуска (для разбора, где уходит время) ─────────────
+   Каждая строка tl() несёт три отметки: «процесс +N мс» (сколько живёт процесс игры — видно, когда на самом деле стартовало ядро,
+   в том числе если загрузчик ждал сеть), «ядро +N мс» (от старта потока ядра) и «после libil2cpp +N мс» (от появления libil2cpp.so). */
+static long g_coreT0, g_procAge0 = -1, g_il2cppMs = -1;
+static long hm_mono_ms(void) {
+    struct { long s, n; } ts;
+    ts.s = 0; ts.n = 0;
+    clock_gettime(1, &ts);                                /* CLOCK_MONOTONIC */
+    return ts.s * 1000 + ts.n / 1000000;
+}
+/* Возраст процесса, мс: /proc/uptime минус starttime из /proc/self/stat (оба в сотых долях секунды). -1 — не вышло. */
+static long proc_age_ms(void) {
+    char b[700]; int fd; long n, i, f, st = 0, up = 0, frac = 0;
+    fd = open("/proc/self/stat", 0);
+    if (fd < 0) return -1;
+    n = read(fd, b, sizeof b - 1); close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    for (i = n - 1; i >= 0 && b[i] != ')'; i--) {}        /* имя процесса в скобках может содержать пробелы */
+    if (i < 0) return -1;
+    i++;
+    for (f = 3; f < 22 && i < n; f++) { while (b[i] == ' ') i++; while (i < n && b[i] != ' ') i++; }
+    while (b[i] == ' ') i++;
+    while (b[i] >= '0' && b[i] <= '9') st = st * 10 + (b[i++] - '0');
+    fd = open("/proc/uptime", 0);
+    if (fd < 0) return -1;
+    n = read(fd, b, sizeof b - 1); close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    for (i = 0; b[i] >= '0' && b[i] <= '9'; i++) up = up * 10 + (b[i] - '0');
+    if (b[i] == '.') { i++; if (b[i] >= '0' && b[i] <= '9') frac = (b[i] - '0') * 10; i++; if (b[i] >= '0' && b[i] <= '9') frac += b[i] - '0'; }
+    up = up * 100 + frac;
+    return (up - st) * 10;                                /* CLK_TCK на Android = 100 */
+}
+static void tl(const char* what) {
+    char t[520]; Buf b; long now = hm_mono_ms() - g_coreT0;
+    b_init(&b, t, sizeof t);
+    b_s(&b, "[ядро +"); b_int(&b, now); b_s(&b, " мс");
+    if (g_procAge0 >= 0) { b_s(&b, ", процесс +"); b_int(&b, g_procAge0 + now); b_s(&b, " мс"); }
+    if (g_il2cppMs >= 0) { b_s(&b, ", после libil2cpp "); b_int(&b, now - g_il2cppMs); b_s(&b, " мс"); }
+    b_s(&b, "] "); b_s(&b, what);
+    dlog(t);
+}
+static void tl2(const char* a, const char* c) {
+    char t[400]; Buf x; b_init(&x, t, sizeof t); b_s(&x, a); b_s(&x, c); tl(t);
+}
+static void tl_i(const char* a, long v) {
+    char t[400]; Buf x; b_init(&x, t, sizeof t); b_s(&x, a); b_int(&x, v); tl(t);
 }
 
 /* ───────────── IL2CPP API ───────────── */
@@ -461,6 +512,117 @@ static int lib_mapped(void) {
     close(fd);
     return found;
 }
+/* ───────────── пассивный разведчик: /proc/self/maps и /proc/self/status ─────────────
+   Только чтение файлов, к IL2CPP не прикасается — безопасно в любой момент запуска. Делает две вещи:
+   1) пишет в журнал, КОГДА в память подгружается каждый новый файл (кроме системных) и как растёт число потоков/память: по этой хронологии
+      видно, что происходит, пока идёт il2cpp_init, и какой файл появляется ПОСЛЕ неё;
+   2) необязательный маркер готовности: если рядом с konstt.log лежит konstt_marker.txt (одна строка — кусок пути файла, например имя
+      .so/.dat), ядро начинает работу, как только такой файл ПОЯВИТСЯ в карте памяти после libil2cpp.so, не дожидаясь таймера.
+      Файла нет — ведёт себя как раньше (ждёт KONSTT_SETTLE_S / konstt_delay.txt). Маркер, который так и не появился, не вешает запуск:
+      работает прежний таймер. */
+#define SC_SLOTS 1024
+static unsigned g_scSeen[SC_SLOTS];
+static int g_scFirst = 1, g_scLogged, g_scIl2cpp, g_scThr = -1, g_scThrLogs;
+static char g_marker[120];
+static int g_markerLen, g_markerHit;
+
+static unsigned sc_fnv(const char* t) { unsigned h = 2166136261u; while (*t) { h ^= (unsigned char)*t++; h *= 16777619u; } return h ? h : 1; }
+static int sc_new(unsigned h) {                          /* 1 — путь раньше не встречался */
+    unsigned i = h % SC_SLOTS, k;
+    for (k = 0; k < SC_SLOTS; k++, i = (i + 1) % SC_SLOTS) {
+        if (g_scSeen[i] == h) return 0;
+        if (!g_scSeen[i]) { g_scSeen[i] = h; return 1; }
+    }
+    return 0;
+}
+static int sc_has(const char* s, const char* sub, int sl) {
+    int i;
+    if (sl <= 0) return 0;
+    for (; *s; s++) { for (i = 0; i < sl && s[i] == sub[i]; i++) {} if (i == sl) return 1; }
+    return 0;
+}
+static int sc_system_path(const char* p) {
+    return sprefix(p, "/system/") || sprefix(p, "/apex/") || sprefix(p, "/vendor/") || sprefix(p, "/product/") || sprefix(p, "/odm/") ||
+           sprefix(p, "/system_ext/") || sprefix(p, "/dev/") || sprefix(p, "/proc/") || sprefix(p, "/memfd:");
+}
+static void sc_line(char* ln) {
+    char* p = ln; int f, isnew; char t[400]; Buf b;
+    for (f = 0; f < 5; f++) { while (*p && *p != ' ') p++; while (*p == ' ') p++; }   /* адрес, права, смещение, устройство, inode */
+    if (*p != '/') return;                                /* анонимные области и [heap]/[stack] не интересны */
+    isnew = sc_new(sc_fnv(p));
+    if (!g_scIl2cpp && sc_has(p, "libil2cpp.so", 12)) {
+        g_scIl2cpp = 1; g_il2cppMs = hm_mono_ms() - g_coreT0;
+        tl(g_scFirst ? "libil2cpp.so УЖЕ была в карте памяти к старту ядра (время ожидания уже частично прошло)" : "libil2cpp.so появилась в карте памяти");
+    }
+    if (isnew && g_markerLen && !g_markerHit && g_scIl2cpp && !g_scFirst && sc_has(p, g_marker, g_markerLen)) {
+        g_markerHit = 1; tl2("МАРКЕР появился в карте памяти: ", p);
+    }
+    if (isnew && !sc_system_path(p) && g_scLogged < 160) {
+        g_scLogged++;
+        b_init(&b, t, sizeof t); b_s(&b, g_scFirst ? "файл в памяти (был к старту ядра): " : "в память подгружен файл: "); b_s(&b, p);
+        tl(t);
+    }
+}
+/* Один проход по maps. Возвращает: -1 — maps прочитать нельзя, иначе 1, если libil2cpp.so уже в памяти. */
+static int maps_scan(void) {
+    static char buf[8192]; char *s, *nl; int fd, keep = 0, i; long n;
+    fd = open("/proc/self/maps", 0);
+    if (fd < 0) return -1;
+    for (;;) {
+        n = read(fd, buf + keep, sizeof buf - 1 - keep);
+        if (n <= 0) break;
+        n += keep; buf[n] = 0; s = buf;
+        for (;;) {
+            for (nl = s; *nl && *nl != '\n'; nl++) {}
+            if (!*nl) break;
+            *nl = 0; sc_line(s); s = nl + 1;
+        }
+        keep = (int)(buf + n - s);
+        if (keep >= (int)sizeof buf - 1) keep = 0;        /* неправдоподобно длинная строка — выбросить */
+        for (i = 0; i < keep; i++) buf[i] = s[i];
+    }
+    if (keep > 0) { buf[keep] = 0; sc_line(buf); }
+    close(fd);
+    g_scFirst = 0;
+    return g_scIl2cpp;
+}
+/* Число потоков и память процесса; пишем только когда число потоков изменилось */
+static void status_scan(void) {
+    char b[2048]; int fd; long n, i, thr = -1, rss = -1;
+    fd = open("/proc/self/status", 0);
+    if (fd < 0) return;
+    n = read(fd, b, sizeof b - 1); close(fd);
+    if (n <= 0) return;
+    b[n] = 0;
+    for (i = 0; i < n; i++) {
+        if (i && b[i - 1] != '\n') continue;
+        if (sprefix(b + i, "Threads:")) { long j = i + 8, v = 0; while (b[j] == ' ' || b[j] == '\t') j++; while (b[j] >= '0' && b[j] <= '9') v = v * 10 + (b[j++] - '0'); thr = v; }
+        else if (sprefix(b + i, "VmRSS:")) { long j = i + 6, v = 0; while (b[j] == ' ' || b[j] == '\t') j++; while (b[j] >= '0' && b[j] <= '9') v = v * 10 + (b[j++] - '0'); rss = v; }
+    }
+    if (thr >= 0 && thr != g_scThr && g_scThrLogs < 120) {
+        char t[120]; Buf x; g_scThr = (int)thr; g_scThrLogs++;
+        b_init(&x, t, sizeof t); b_s(&x, "потоков: "); b_int(&x, thr);
+        if (rss >= 0) { b_s(&x, ", память (RSS) МБ: "); b_int(&x, rss / 1024); }
+        tl(t);
+    }
+}
+/* konstt_marker.txt рядом с konstt.log */
+static void load_marker(void) {
+    char p[330], tmp[sizeof g_marker]; unsigned L = slen(g_flog); int i, k, fd; long r;
+    g_markerLen = 0; g_marker[0] = 0;
+    if (!(L > HM_LOGNAME_LEN + 1 && L < 300)) return;
+    for (i = 0; i < (int)(L - HM_LOGNAME_LEN); i++) p[i] = g_flog[i];
+    { const char* nm = "konstt_marker.txt"; for (k = 0; nm[k]; k++) p[i + k] = nm[k]; p[i + k] = 0; }
+    fd = open(p, 0);
+    if (fd < 0) return;
+    r = read(fd, tmp, sizeof tmp - 1); close(fd);
+    if (r <= 0) return;
+    tmp[r] = 0;
+    for (i = 0; tmp[i] == ' ' || tmp[i] == '\t'; i++) {}
+    for (k = 0; tmp[i] && tmp[i] != '\n' && tmp[i] != '\r' && k < (int)sizeof g_marker - 1; i++) g_marker[k++] = tmp[i];
+    while (k > 0 && (g_marker[k - 1] == ' ' || g_marker[k - 1] == '\t')) k--;
+    g_marker[k] = 0; g_markerLen = k;
+}
 /* Лёгкая проверка: libil2cpp загружена, домен создан, Assembly-CSharp виден. Классов не трогает, поток не присоединяет.
    Вызывать только после g_safe: ранние вызовы il2cpp_domain_get/…_get_assemblies (до конца il2cpp_init) роняют игру.
    Шаги пишутся в журнал ДО вызова — если игра всё же упадёт, последняя строка покажет, на каком вызове. */
@@ -472,13 +634,13 @@ static int il2cpp_light(void) {
     if (!g_domain) {
         if (!l2) { l2 = 1; dlog("probe: il2cpp_domain_get"); }
         g_domain = A.domain_get();
-        if (g_domain) dlog("probe: домен получен");
+        if (g_domain) tl("probe: домен получен");
     }
     if (!g_domain) return 0;
     if (!g_img) {
         if (!l3) { l3 = 1; dlog("probe: il2cpp_domain_get_assemblies + поиск Assembly-CSharp"); }
         g_img = find_image();
-        if (g_img) dlog("probe: Assembly-CSharp найден");
+        if (g_img) tl("probe: Assembly-CSharp найден");
     }
     return g_img != NULL;
 }
@@ -970,29 +1132,40 @@ static void mt_capture_ctx(void) {
 /* ───────────── поток ядра: ожидание игры ───────────── */
 static void* core_main(void* arg) {
     int w, sec, polls = 0, m;
+    long tEnd; const char* why = "таймер";
     (void)arg;
+    g_coreT0 = hm_mono_ms(); g_procAge0 = proc_age_ms();
     dlog("core: старт");
+    tl("поток ядра запущен (бандл загружен загрузчиком)");
+    load_marker();
+    if (g_markerLen) dlog2("core: маркер готовности из konstt_marker.txt: ", g_marker);
     set_stage("ждём загрузку libil2cpp.so");
-    for (;;) {                                           /* только чтение /proc/self/maps, никаких вызовов dlopen/IL2CPP */
-        m = lib_mapped();
+    for (;;) {                                           /* только чтение файлов /proc/self, никаких вызовов dlopen/IL2CPP */
+        m = maps_scan(); status_scan();
         if (m > 0) break;
-        if (m < 0 && polls > 60) { dlog("core: /proc/self/maps недоступен, продолжаю по таймеру"); break; }
+        if (m < 0 && polls > 300) { dlog("core: /proc/self/maps недоступен, продолжаю по таймеру"); break; }
         polls++;
-        if (polls % 4 == 0) dlog_i("core: libil2cpp.so ещё не загружена, опросов ", polls);
-        usleep(500000);
+        if (polls % 40 == 0) dlog_i("core: libil2cpp.so ещё не загружена, опросов ", polls);
+        usleep(100000);
     }
     sec = settle_seconds();
-    dlog_i("core: libil2cpp.so загружена; функции IL2CPP не трогаю, жду секунд ", sec);
+    tl_i("libil2cpp.so загружена; функции IL2CPP не трогаю, максимум секунд ", sec);
     set_stage("IL2CPP инициализируется (мод ждёт)");
-    for (w = 0; w < sec; w++) usleep(1000000);
+    tEnd = hm_mono_ms() + (long)sec * 1000;
+    while (hm_mono_ms() < tEnd) {                        /* таймер, но маркер (если задан) может закончить ожидание раньше */
+        usleep(100000);
+        maps_scan(); status_scan();
+        if (g_markerHit) { why = "маркер"; break; }
+    }
     g_safe = 1;
-    dlog("core: пауза прошла, начинаю опрос IL2CPP");
+    tl2("пауза закончена, причина: ", why);
     set_stage("ждём Assembly-CSharp / Game.Instance");
     for (w = 0; !game_ready(); w++) {
         if (w % 20 == 0) dlog_i("core: игра ещё не готова, опросов ", w);
+        if (w % 4 == 0) { maps_scan(); status_scan(); }
         usleep(POLL_US);
     }
-    dlog("core: игра готова (Game.Instance создан)");
+    tl("игра готова (Hassle.Game.Instance создан)");
     for (w = 0; w < KONSTT_EXTRA_DELAY_S; w++) usleep(1000000);
     set_stage("игра готова");
     __atomic_store_n(&g_ready, 1, __ATOMIC_RELEASE);
@@ -1002,7 +1175,7 @@ static void* core_main(void* arg) {
         if (g_poolSrcField && g_tplState) break;
         usleep(TICK_US);
     }
-    dlog("core: пул игроков и реестр команд найдены, поток ядра завершён");
+    tl("core: пул игроков и реестр команд найдены, поток ядра завершён");
     return NULL;
 }
 
@@ -1024,7 +1197,7 @@ static int hm_cmd_install(const char* name, native_cmd_fn fn) {
     if (g_tplState != 1) { dlog2("реестр команд недоступен, команды не будет: /", name); return 0; }
     for (i = 0; i < 120; i++) {
         r = cmd_register(name, fn);
-        if (r) return r > 0;
+        if (r) { if (r > 0) tl2("команда зарегистрирована: /", name); return r > 0; }
         usleep(500000);                                  /* реестра пока нет — повторяем */
     }
     dlog2("реестр команд так и не появился, команды не будет: /", name);
