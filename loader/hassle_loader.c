@@ -329,6 +329,103 @@ fail:
     return NULL;
 }
 
+/* ───────────── статус для экрана загрузки игры ─────────────
+   Экран «Загрузка.» в APK (assets/WebView, Vue-компонент Loading) раз в ~0,7 с спрашивает http://127.0.0.1:17760/hmstatus и пишет
+   ответ второй строкой под «Загрузка». Сервер живёт в загрузчике: он стартует раньше всего, поэтому знает все этапы — от «качаем
+   manifest» до «бандл не загрузился». Когда бандл загружен, счётчик «запущено N из M» берётся у него через hm_bundle_counts().
+   Порты 17760..17762 (мод «рядом» занимает 17771+, не пересекаются). Только loopback, ответ — простой текст, ничего не пишет на диск. */
+extern int socket(int, int, int);
+extern int setsockopt(int, int, int, const void*, unsigned);
+extern int bind(int, const void*, unsigned);
+extern int listen(int, int);
+extern int accept(int, void*, void*);
+extern long recv(int, void*, unsigned long, int);
+extern long send(int, const void*, unsigned long, int);
+
+#define HM_ST_PORT 17760
+#define HM_ST_PORTS 3
+enum { ST_CHECK = 1, ST_DOWNLOAD, ST_LOADED, ST_FAILED, ST_OFF };
+static volatile int g_stPhase = ST_CHECK;
+static const char* volatile g_stWhy;                       /* причина, если мод не загрузился (строка-литерал) */
+typedef int (*counts_fn)(int*, int*);
+static counts_fn volatile g_stCounts;                      /* hm_bundle_counts из бандла (после dlopen) */
+
+static void st_text(char* out, unsigned cap) {
+    int ph = g_stPhase; int r = 0, t = 0;
+    out[0] = 0;
+    if (ph == ST_DOWNLOAD) sapp(out, cap, "Скачиваем обновление модов...");
+    else if (ph == ST_LOADED) {
+        counts_fn f = g_stCounts;
+        if (f && f(&r, &t) && t > 0) {
+            sapp(out, cap, r >= t ? "Моды запущены " : "Запускаем моды ");
+            sapp_i(out, cap, r); sapp(out, cap, "/"); sapp_i(out, cap, t);
+        } else sapp(out, cap, "Запускаем моды...");
+    } else if (ph == ST_FAILED) {
+        const char* w = g_stWhy;
+        sapp(out, cap, "Моды не загружены");
+        if (w && w[0]) { sapp(out, cap, ": "); sapp(out, cap, w); }
+    } else if (ph == ST_OFF) sapp(out, cap, "Моды отключены");
+    else sapp(out, cap, "Загружаются моды...");
+}
+/* смена этапа; why — причина для ST_FAILED. Пишется в loader.log (без счётчика — он меняется сам) */
+static void st_set(int ph, const char* why) {
+    char t[160];
+    if (why) g_stWhy = why;
+    g_stPhase = ph;
+    if (ph == ST_LOADED) lg("экран загрузки: Запускаем моды", "");
+    else { st_text(t, sizeof t); lg("экран загрузки: ", t); }
+}
+
+struct st_sa4 { u16 family; u16 port; u32 addr; u8 zero[8]; };
+struct st_tv { long sec; long usec; };
+static int st_send_all(int fd, const char* p, unsigned n) {
+    while (n) { long w = send(fd, p, n, 0x4000); if (w <= 0) return 0; p += w; n -= (unsigned)w; }   /* 0x4000 = MSG_NOSIGNAL */
+    return 1;
+}
+static void st_respond(int fd, const char* status, const char* body) {
+    char h[300]; unsigned bl = slen(body);
+    h[0] = 0;
+    sapp(h, sizeof h, "HTTP/1.1 "); sapp(h, sizeof h, status);
+    sapp(h, sizeof h, "\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ");
+    sapp_i(h, sizeof h, (long)bl); sapp(h, sizeof h, "\r\n\r\n");
+    if (st_send_all(fd, h, slen(h)) && bl) st_send_all(fd, body, bl);
+}
+static void* st_server_thread(void* arg) {
+    int fd = -1, i, tries, one = 1; (void)arg;
+    for (tries = 0; tries < 10 && fd < 0; tries++) {
+        for (i = 0; i < HM_ST_PORTS && fd < 0; i++) {
+            struct st_sa4 sa; int s = socket(2, 1, 0), z;
+            if (s < 0) break;
+            setsockopt(s, 1, 2, &one, sizeof one);          /* SOL_SOCKET, SO_REUSEADDR */
+            sa.family = 2; sa.port = (u16)(((HM_ST_PORT + i) >> 8) | (((HM_ST_PORT + i) & 255) << 8)); sa.addr = 0x0100007F;   /* 127.0.0.1 */
+            for (z = 0; z < 8; z++) sa.zero[z] = 0;
+            if (bind(s, &sa, sizeof sa) == 0 && listen(s, 8) == 0) { fd = s; lgi("статус для экрана загрузки: порт ", HM_ST_PORT + i); }
+            else close(s);
+        }
+        if (fd < 0) usleep(3000000);
+    }
+    if (fd < 0) { lg("статус для экрана загрузки: не удалось занять ни один порт", ""); return NULL; }
+    for (;;) {
+        int c = accept(fd, NULL, NULL); char rq[256]; long n; struct st_tv t;
+        if (c < 0) { usleep(100000); continue; }
+        t.sec = 2; t.usec = 0;
+        setsockopt(c, 1, 20, &t, sizeof t); setsockopt(c, 1, 21, &t, sizeof t);   /* SO_RCVTIMEO, SO_SNDTIMEO */
+        n = recv(c, rq, sizeof rq - 1, 0);
+        if (n > 0) {
+            rq[n] = 0;
+            if (sprefix(rq, "OPTIONS ")) st_respond(c, "204 No Content", "");
+            else if (sprefix(rq, "GET /hmstatus")) { char txt[160]; st_text(txt, sizeof txt); st_respond(c, "200 OK", txt); }
+            else st_respond(c, "404 Not Found", "no");
+        }
+        close(c);
+    }
+    return NULL;
+}
+static void st_start(void) {
+    unsigned long t = 0;
+    if (pthread_create(&t, NULL, st_server_thread, NULL) != 0) lg("не удалось создать поток статуса для экрана загрузки", "");
+}
+
 /* ───────────── основная работа ───────────── */
 static char g_dir[300];
 #ifdef HM_TEST
@@ -431,24 +528,29 @@ typedef const char* (*idfn_t)(void);
 static int try_use(void* env, const Manifest* m, int from_net) {
     char p[340]; void* h; idfn_t idf;
     if (!m->ok) return 0;
-    if (m->loader_min > HM_LOADER_VER) { lgi("бандлу нужен загрузчик версии ", m->loader_min); lg("обновите APK (пересоберите .so загрузчика)", ""); return 0; }
+    if (m->loader_min > HM_LOADER_VER) { lgi("бандлу нужен загрузчик версии ", m->loader_min); lg("обновите APK (пересоберите .so загрузчика)", ""); g_stWhy = "нужен новый APK"; return 0; }
     if (!cache_matches(m)) {
-        if (!from_net || !env || !download_bundle(env, m)) return 0;
+        if (!from_net || !env) { g_stWhy = "нет бандла в кеше"; return 0; }
+        st_set(ST_DOWNLOAD, NULL);
+        if (!download_bundle(env, m)) { g_stWhy = "бандл не скачался"; g_stPhase = ST_CHECK; return 0; }
     } else lg("кеш актуален, качать не нужно", "");
     { int sn; long st; long now = (long)time(NULL);
       strikes_get(m->sha, &sn, &st);
       if (sn >= HM_MAX_STRIKES && now - st < HM_QUARANTINE_S) {
           lgi("бандл не дожил до конца прошлых запусков (подряд): ", sn);
           lg("пропускаю его на время карантина (до новой сборки или ~часа)", "");
+          g_stWhy = "карантин после вылетов";
           return 0;
       }
       strikes_set(m->sha, sn + 1, now); }
     path_of(p, sizeof p, "bundle.so");
     h = dlopen(p, RTLD_NOW_);
-    if (!h) { const char* de = dlerror(); lg("dlopen бандла не удался: ", de ? de : "(нет)"); return 0; }
+    if (!h) { const char* de = dlerror(); lg("dlopen бандла не удался: ", de ? de : "(нет)"); g_stWhy = "бандл не открылся"; return 0; }
     { int k; for (k = 0; k < 65; k++) g_loadedSha[k] = m->sha[k]; }
     *(void**)&idf = dlsym(h, "hm_bundle_id");
     lg("бандл загружен, сборка: ", idf ? idf() : "?");
+    { counts_fn cf = NULL; *(void**)&cf = dlsym(h, "hm_bundle_counts"); g_stCounts = cf; }   /* у старых бандлов функции нет — тогда на экране просто «Запускаем моды...» */
+    st_set(ST_LOADED, NULL);
     return 1;
 }
 
@@ -497,7 +599,7 @@ static void wipe_cache(void) {
 static void run_loader(void* env) {
     char url[400], p[340]; u8* mf = NULL; unsigned long mn = 0; Manifest net, cache; int have_cache = 0, done = 0, force = 0;
     net.ok = 0; cache.ok = 0;
-    if (!setup_dir()) { lg("нет папки для кеша (не определён пакет)", ""); return; }
+    if (!setup_dir()) { lg("нет папки для кеша (не определён пакет)", ""); st_set(ST_FAILED, "нет папки для кеша"); return; }
     force = rv_wants_reinstall();
     /* 1) manifest из сети */
     net.ok = 0;
@@ -533,7 +635,10 @@ static void run_loader(void* env) {
         }
     }
     if (!done && have_cache) { lg("использую бандл из кеша, сборка: ", cache.build); done = try_use(env, &cache, 0); }
-    if (!done) lg("бандл не загружен — игра работает без мода", "");
+    if (!done) {
+        lg("бандл не загружен — игра работает без мода", "");
+        st_set(ST_FAILED, g_stWhy ? g_stWhy : (net.ok ? "ошибка загрузки" : "нет сети"));
+    }
 }
 
 static void* loader_thread(void* arg) {
@@ -556,6 +661,9 @@ static void* loader_thread(void* arg) {
 #ifdef HM_TEST
 EXPORT void hm_test_run(void* vm) { g_vm = vm; loader_thread(NULL); }
 EXPORT void hm_test_sha(const u8* p, unsigned long n, char* out) { sha256_hex(p, n, out); }
+EXPORT void hm_test_st_start(void) { st_start(); }
+EXPORT void hm_test_st_set(int ph, const char* why) { st_set(ph, why); }
+EXPORT void hm_test_st_counts(counts_fn f) { g_stCounts = f; }
 EXPORT int hm_test_manifest(const char* txt, unsigned long n, unsigned long* size, char* sha, char* file, int* lmin) {
     Manifest m; parse_manifest((const u8*)txt, n, &m);
     if (m.ok) { *size = m.size; *lmin = m.loader_min; { int i; for (i = 0; i < 65; i++) sha[i] = m.sha[i]; for (i = 0; i < 100; i++) file[i] = m.file[i]; } }
@@ -585,7 +693,8 @@ EXPORT int JNI_OnLoad(void* vm, void* reserved) {
         const char* de = dlerror();
         lg("оригинал НЕ загрузился: ", de ? de : "(нет)");
     }
-    if (off_switch()) lg("konstt_off найден: мод отключён, работает только оригинал", "");
+    st_start();                                             /* статус для экрана «Загрузка.» — сервер нужен в любом случае, в том числе при konstt_off */
+    if (off_switch()) { lg("konstt_off найден: мод отключён, работает только оригинал", ""); st_set(ST_OFF, NULL); }
     else {
         unsigned long t = 0;
         if (pthread_create(&t, NULL, loader_thread, NULL) != 0) lg("не удалось создать поток загрузчика", "");

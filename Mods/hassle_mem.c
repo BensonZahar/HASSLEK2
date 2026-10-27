@@ -1119,9 +1119,11 @@ static void native_mem_cmd(void* self, void* args, void* mi) {
     if (w & MEM_W_PURGE) { g_mem_cmdReq |= MEM_J_PURGE; chat_say("Память: возврат памяти ОС запущен. Итог — HLOG/konstt_mem.log"); return; }
     mem_say_status();
 }
+static int g_mem_modId = -1;                             /* номер в реестре модов (экран загрузки) */
 static void* mem_cmd_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("mem", native_mem_cmd)) return NULL;
+    hm_mod_ready(g_mem_modId);
     mem_log("команда /mem зарегистрирована");
     return NULL;
 }
@@ -1129,6 +1131,7 @@ static void* mem_cmd_main(void* arg) {
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void mem_ctor(void) {      /* только создаёт потоки-ждуны; до готовности игры они в IL2CPP ничего не трогают */
     unsigned long t = 0, t2 = 0;
+    g_mem_modId = hm_mod_register("mem");
     pthread_create(&t, NULL, mem_main, NULL);
     pthread_create(&t2, NULL, mem_cmd_main, NULL);
 }

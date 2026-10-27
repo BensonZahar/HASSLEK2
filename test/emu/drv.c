@@ -21,12 +21,15 @@ int main(void) {
     H = dlopen("./bundle_test.so", RTLD_NOW);
     if (!H) { puts(dlerror()); return 1; }
     const char* (*diag)(void) = dlsym(H, "hm_test_diag");
+    int (*counts)(int*, int*) = dlsym(H, "hm_bundle_counts");
+    { int r = -1, t = -1; if (counts) counts(&r, &t); printf("mods right after dlopen: ready %d of %d\n", r, t); }
     const char* cmds[] = {"rec", "nearlog", "nocol", "route"};
     for (int w = 0; w < 8; w++) {
         int all = 1; for (int i = 0; i < 4; i++) if (!has(cmds[i])) all = 0;
         if (all) break; sleep(1);
     }
     for (int i = 0; i < 4; i++) printf("registered %-8s %d\n", cmds[i], has(cmds[i]));
+    { int r = -1, t = -1; if (counts) counts(&r, &t); printf("mods after commands registered: ready %d of %d\n", r, t); }
     clr();
     printf("call rec 5 -> %d\n", call("rec", "5", NULL));
     sleep(1);

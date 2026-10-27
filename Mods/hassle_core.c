@@ -1084,6 +1084,27 @@ static int hm_cmd_install(const char* name, native_cmd_fn fn) {
     return 0;
 }
 
+/* ───────────── реестр модов (для строки статуса на экране загрузки игры) ─────────────
+   Мод в конструкторе зовёт hm_mod_register("имя") и запоминает номер, а когда по-настоящему заработал (команда зарегистрирована,
+   игра готова) — hm_mod_ready(номер). Загрузчик читает счётчик через hm_bundle_counts() и пишет на экране «Запускаем моды 2/5».
+   Мод, который не позвал hm_mod_ready, на экране так и останется «незапущенным» — по этому видно, что он завис. Максимум 32 мода. */
+#define HM_MAX_MODS 32
+static const char* g_hm_modName[HM_MAX_MODS];
+static volatile int g_hm_modTotal;
+static volatile unsigned g_hm_modReadyMask;
+static int hm_mod_register(const char* name) {
+    int id = __atomic_fetch_add(&g_hm_modTotal, 1, __ATOMIC_ACQ_REL);
+    if (id >= HM_MAX_MODS) { __atomic_fetch_sub(&g_hm_modTotal, 1, __ATOMIC_ACQ_REL); return -1; }
+    g_hm_modName[id] = name;
+    return id;
+}
+static void hm_mod_ready(int id) {
+    if (id < 0 || id >= HM_MAX_MODS) return;
+    __atomic_fetch_or(&g_hm_modReadyMask, 1u << id, __ATOMIC_ACQ_REL);
+    dlog2("мод запущен: ", g_hm_modName[id] ? g_hm_modName[id] : "?");
+}
+static int hm_mods_ready_count(void) { return __builtin_popcount(__atomic_load_n(&g_hm_modReadyMask, __ATOMIC_ACQUIRE)); }
+
 /* ───────────── запуск ───────────── */
 static void start_threads(void) {
     unsigned long t1 = 0;
@@ -1106,6 +1127,13 @@ __attribute__((constructor)) static void core_ctor(void) {
     start_threads();
 }
 EXPORT const char* hm_bundle_id(void) { return HM_BUILD_ID; }
+/* Загрузчик (hassle_loader.c) зовёт это из своего HTTP-потока: сколько модов запущено и сколько всего в бандле. Только чтение счётчиков. */
+EXPORT int hm_bundle_counts(int* ready, int* total) {
+    int t = __atomic_load_n(&g_hm_modTotal, __ATOMIC_ACQUIRE);
+    if (ready) *ready = hm_mods_ready_count();
+    if (total) *total = t > HM_MAX_MODS ? HM_MAX_MODS : t;
+    return 1;
+}
 #elif !defined(KONSTT_TEST)
 __attribute__((constructor)) static void core_ctor(void) {
     init_log();

@@ -402,6 +402,7 @@ static void near_try_register(void) {
 }
 
 /* ───────────── сборщик игроков ───────────── */
+static int g_near_modId = -1;                            /* номер в реестре модов (экран загрузки) */
 static void* near_collector_main(void* arg) {
     (void)arg;
     if (!hm_wait_started()) return NULL;                 /* konstt_off — мод выключен целиком */
@@ -412,6 +413,7 @@ static void* near_collector_main(void* arg) {
         usleep(POLL_US);
     }
     dlog("near: игра готова, начинаю опрос игроков");
+    hm_mod_ready(g_near_modId);
     for (;;) {
         near_try_register();
         collect_tick();
@@ -520,6 +522,7 @@ static void* near_server_thread(void* arg) {
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void near_mod_ctor(void) {   /* только создаёт потоки-ждуны; IL2CPP они трогают после готовности игры */
     unsigned long t1 = 0, t2 = 0;
+    g_near_modId = hm_mod_register("near");
     pthread_create(&t1, NULL, near_server_thread, NULL);
     pthread_create(&t2, NULL, near_collector_main, NULL);
 }

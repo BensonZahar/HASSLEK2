@@ -1147,16 +1147,19 @@ static void native_route_cmd(void* self, void* args, void* mi) {
 
 /* ───────────── самозапуск ───────────── */
 /* Ждёт ядро, готовность игры и образец делегата, регистрирует /route (hm_cmd_install), потом запускает поток-«тикер». */
+static int g_route_modId = -1;                           /* номер в реестре модов (экран загрузки) */
 static void* rt_main(void* arg) {
     unsigned long t = 0;
     (void)arg;
     if (!hm_cmd_install("route", native_route_cmd)) return NULL;
+    hm_mod_ready(g_route_modId);
     pthread_create(&t, NULL, rt_worker, NULL);
     return NULL;
 }
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void route_ctor(void) {
     unsigned long t = 0;
+    g_route_modId = hm_mod_register("route");
     pthread_create(&t, NULL, rt_main, NULL);
 }
 #endif

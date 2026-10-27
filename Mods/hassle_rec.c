@@ -213,14 +213,17 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
 
 
 /* ───────────── самозапуск ───────────── */
+static int g_rec_modId = -1;                             /* номер в реестре модов (экран загрузки) */
 static void* rec_main(void* arg) {
     (void)arg;
     g_recReg = hm_cmd_install("rec", native_rec_cmd) ? 1 : -1;     /* ждёт ядро, готовность игры и реестр команд; регистрирует /rec */
+    if (g_recReg == 1) hm_mod_ready(g_rec_modId);
     return NULL;
 }
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void rec_ctor(void) {          /* только создаёт поток-ждуна; до готовности игры он ничего в IL2CPP не трогает */
     unsigned long t = 0;
+    g_rec_modId = hm_mod_register("rec");
     pthread_create(&t, NULL, rec_main, NULL);
 }
 #endif

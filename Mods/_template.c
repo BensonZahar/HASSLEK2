@@ -23,15 +23,18 @@ static void native_hello_cmd(void* self, void* args, void* mi) {
     (void)self; (void)args; (void)mi;
     chat_say("hello: мод работает");
 }
+static int g_hello_modId = -1;                           /* номер в реестре модов: по нему на экране загрузки считается «Запускаем моды N/M» */
 static void* hello_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("hello", native_hello_cmd)) return NULL;     /* konstt_off — мод выключен целиком; иначе ждём игру и регистрируем /hello */
+    hm_mod_ready(g_hello_modId);                                     /* мод по-настоящему заработал (до этого на экране он «не запущен») */
     dlog("hello: новый мод загружен и работает");
     return NULL;
 }
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void hello_ctor(void) {
     unsigned long t = 0;
+    g_hello_modId = hm_mod_register("hello");                        /* учесть мод в счётчике — только в конструкторе */
     pthread_create(&t, NULL, hello_main, NULL);
 }
 #endif

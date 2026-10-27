@@ -416,15 +416,18 @@ static void native_nocol_cmd(void* self, void* args, void* mi) {
 /* ───────────── самозапуск ───────────── */
 /* Ждёт ядро, готовность игры и образец делегата чат-команды, регистрирует /nocol (всё это делает hm_cmd_install). Потом в том же потоке
    каждые 300 мс зовёт слежку за новыми игроками/NPC. Пул игроков находит ядро; Near и /rec для этого не нужны. */
+static int g_nocol_modId = -1;                           /* номер в реестре модов (экран загрузки) */
 static void* nocol_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("nocol", native_nocol_cmd)) return NULL;
+    hm_mod_ready(g_nocol_modId);
     for (;;) { nocol_bg_tick(); usleep(TICK_US); }
     return NULL;
 }
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void nocol_ctor(void) {   /* только создаёт поток-ждуна; до готовности игры он ничего в IL2CPP не трогает */
     unsigned long t = 0;
+    g_nocol_modId = hm_mod_register("nocol");
     pthread_create(&t, NULL, nocol_main, NULL);
 }
 #endif
