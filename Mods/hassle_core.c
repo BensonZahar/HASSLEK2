@@ -761,6 +761,7 @@ static int g_dictCount, g_keyHasSlash;
 static void* g_cmdKls;                                   /* класс делегата чат-команды */
 static int g_cmdSize, g_cmdOffMp, g_cmdOffIi;            /* размер делегата, смещения method_ptr и invoke_impl (0 — нет) */
 static volatile int g_cmdLock;
+static volatile int g_cmdTrace;                          /* 1 — первые проходы поиска пишут каждый шаг в журнал (где именно встаёт) */
 static volatile int g_cmdStep, g_coreBeat;                /* шаг поиска образца и «пульс» потока ядра — для сторожа (см. cmd_watchdog_main) */
 typedef void (*native_cmd_fn)(void* self, void* args, void* mi);
 
@@ -780,8 +781,11 @@ typedef void (*kv_cb)(void* key, void* val, void* ctx);
 static void dict_each(void* dict, kv_cb cb, void* ctx) {
     void *arr, *ac, *ec, *fk, *fv, *fh; int esz, i, shift, cnt, offk, offv, offh = 0; char* data; long len;
     if (!dict) return;
+    if (g_cmdTrace) dlog("реестр: dict_each вход");
+    if (!hm_obj_ok(dict)) { if (g_cmdTrace) dlog("реестр: словарь нечитаем"); return; }
     arr = ref_field(dict, "_entries"); if (!arr) arr = ref_field(dict, "entries");
-    if (!arr) return;
+    if (!arr) { if (g_cmdTrace) dlog("реестр: у словаря нет _entries"); return; }
+    if (!hm_obj_ok(arr)) { if (g_cmdTrace) dlog("реестр: массив записей нечитаем"); return; }
     ac = A.object_get_class(arr); ec = A.class_get_element_class(ac); esz = A.class_array_element_size(ac);
     if (!ec || esz <= 0) return;
     fk = find_field(ec, "key"); fv = find_field(ec, "value"); fh = find_field(ec, "hashCode");
@@ -791,18 +795,26 @@ static void dict_each(void* dict, kv_cb cb, void* ctx) {
     if (fh) offh = A.field_get_offset(fh) - shift;
     cnt = int_field(dict, "_count", "count", NULL, -1);
     len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (g_cmdTrace) { dlog_i("реестр: размер записи ", esz); dlog_i("реестр: _count ", cnt); dlog_i("реестр: длина массива ", len); dlog_i("реестр: смещения key/value ", offk * 1000 + offv); }
     if (len < 0 || len > 100000) return;
     if (cnt < 0 || cnt > len) cnt = (int)len;
     data = (char*)arr + 4 * sizeof(void*);
     for (i = 0; i < cnt; i++) {
         char* e = data + (uptr)i * (uptr)esz;
-        if (fh && *(int*)(e + offh) < 0) continue;        /* свободная запись словаря */
-        cb(*(void**)(e + offk), *(void**)(e + offv), ctx);
+        void *k, *v;
+        if (!hm_range_ok(e, esz)) { if (g_cmdTrace) dlog_i("реестр: запись нечитаема, i=", i); break; }
+        if (fh && *(int*)(e + offh) < 0) { if (g_cmdTrace) dlog_i("реестр: свободная запись, i=", i); continue; }   /* свободная запись словаря */
+        k = *(void**)(e + offk); v = *(void**)(e + offv);
+        if (g_cmdTrace) dlog_i("реестр: запись i=", i);
+        cb(k, v, ctx);
+        if (g_cmdTrace) dlog_i("реестр: запись обработана i=", i);
     }
 }
 static void tpl_cb(void* key, void* val, void* ctx) {
     (void)ctx;
     g_dictCount++;
+    if (key && !hm_obj_ok(key)) { if (g_cmdTrace) dlog("реестр: ключ нечитаем, пропуск"); key = NULL; }
+    if (val && !hm_obj_ok(val)) { if (g_cmdTrace) dlog("реестр: значение нечитаемо, пропуск"); val = NULL; }
     if (key) {
         int n = A.string_length(key); const u16* ch = A.string_chars(key);
         if (n > 0 && ch && ch[0] == '/') g_keyHasSlash = 1;
@@ -812,7 +824,12 @@ static void tpl_cb(void* key, void* val, void* ctx) {
         }
     }
     if (val && !g_tplDelegate) {
-        void* tgt = ref_field(val, "m_target"); void* dels = ref_field(val, "delegates");
+        void *tgt, *dels;
+        if (g_cmdTrace) dlog("реестр: читаю m_target");
+        tgt = ref_field(val, "m_target");
+        if (g_cmdTrace) dlog("реестр: читаю delegates");
+        dels = ref_field(val, "delegates");
+        if (g_cmdTrace) dlog_i("реестр: m_target/delegates ненулевые: ", (tgt ? 10 : 0) + (dels ? 1 : 0));
         if (tgt && !dels) g_tplDelegate = val;           /* обычный (не multicast) делегат с целью — годится как образец */
     }
 }
@@ -899,8 +916,11 @@ static void cmd_find_template(void) {
     if (!dict) return;                                   /* реестр ещё не создан */
     g_dictCount = 0; g_tplDelegate = NULL; g_keyHasSlash = 0;
     g_cmdStep = 5;
+    g_cmdTrace = (g_cmdTries <= 3);
     dict_each(dict, tpl_cb, NULL);
+    g_cmdTrace = 0;
     g_cmdStep = 6;
+    if (g_cmdTries <= 3) { dlog_i("реестр: проход закончен, записей ", g_dictCount); dlog_i("реестр: образец найден (1/0) ", g_tplDelegate ? 1 : 0); }
     if (!g_tplDelegate) return;                          /* игра ещё не зарегистрировала ни одной команды — образца нет, ждём */
 
     g_cmdStep = 7;
@@ -1026,11 +1046,11 @@ static int hm_wait_started(void);
 static void* cmd_watchdog_main(void* arg) {
     int i, last = -1, same = 0; (void)arg;
     if (!hm_wait_started()) return NULL;
-    while (!__atomic_load_n(&g_ready, __ATOMIC_ACQUIRE)) usleep(500000);
-    for (i = 0; i < 20; i++) usleep(1000000);
+    for (i = 0; i < 35; i++) usleep(1000000);              /* 12 с пауза IL2CPP + запас; от g_ready не зависим — он мог так и не выставиться */
     for (i = 0; i < 12 && !g_tplState; i++) {
         int beat = g_coreBeat;
         same = (beat == last) ? same + 1 : 0; last = beat;
+        dlog_i("сторож: g_ready ", g_ready);
         dlog_i("сторож: образца команды всё нет; шаг поиска ", g_cmdStep);
         dlog_i("сторож: пульс потока ядра ", beat);
         if (same >= 1) dlog("сторож: пульс не меняется — поток ядра ЗАВИС на шаге выше (1 вход, 2 class_from_name, 3 поле, 4 чтение static, 5 перебор словаря, 7-8 разбор делегата)");
