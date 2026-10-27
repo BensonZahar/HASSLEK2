@@ -17,12 +17,17 @@
  *     синхронизации (m_LastOnFootSyncData), переводит его в строковый ID через WeaponConvertTable.ToID и, если он не совпал с тем,
  *     что в руках, зовёт Items.Has / Items.Add / Items.SetActiveWeapon. Разовая подмена не держится: уже на следующем кадре игра вернёт
  *     серверное оружие (а новый пакет вернул бы его и после записи в поле).
- *   • Поэтому подменяем сам ЧТЕНИЕ байта: в RemotePlayer.Update одна инструкция «LDRB w1,[xN,#CurrentWeapon]» заменяется на переход
- *     в маленькую заглушку (в анонимной странице рядом с кодом игры). Заглушка читает байт как раньше, зовёт нашу функцию wp_hook(игрок, байт)
- *     и кладёт в w1 то, что она вернула. Если у игрока (Actor.m_ID) есть подмена — вернётся наш байт, иначе серверный.
+ *   • Поэтому в НАЧАЛО RemotePlayer.Update ставится перехват: 16 байт пролога заменяются на «LDR x16,=адрес; BR x16» (абсолютный прыжок,
+ *     дальность не ограничена — рядом с кодом игры свободная память не нужна). Прыжок ведёт в маленькую заглушку в анонимной странице
+ *     (где угодно в памяти): она сохраняет x0/x1/x30, зовёт wp_hook(игрок), возвращает регистры, выполняет те 4 инструкции пролога,
+ *     что были затёрты, и прыгает на 5-ю инструкцию функции. wp_hook, если у игрока (Actor.m_ID) есть подмена, ПЕРЕД чтением игры кладёт
+ *     наш байт в m_LastOnFootSyncData.CurrentWeapon (серверный байт запоминает); при снятии подмены на ближайшем кадре возвращает серверный.
  *     Всё остальное (создание префаба, анимация стойки, загрузка ресурсов) игра делает сама, в главном потоке, своим обычным путём.
- *   • Место патча не зашито адресом: функцию находим по имени (il2cpp_class_get_method_from_name), смещение CurrentWeapon берём из метаданных,
- *     а саму инструкцию ищем по узору LDRB + LDR + BL. Нашлось не ровно одно место — ничего не трогаем.
+ *   • Место патча не зашито адресом: функцию находим по имени (il2cpp_class_get_method_from_name), смещение CurrentWeapon берём из метаданных.
+ *     Перед патчем проверяется, что в Update есть чтение CurrentWeapon (узор LDRB + LDR + BL) и что 4 затираемые инструкции не зависят от
+ *     адреса (нет ADR/ADRP/B/BL/LDR literal/CBZ/TBZ) — иначе ничего не трогаем.
+ *   • Список оружия берётся из WeaponConvertTable.ToID (в этой сборке 17 записей: 0,1,3,4,5,8,22-25,27,29-31,33,34,43). Словарь читается
+ *     двумя способами: перебором записей и опросом ключей 0..63 через get_Item самой игры; результаты объединяются.
  *   • Только arm64. На arm32 команда отвечает, что не поддерживается (библиотека игры там другая).
  *   • Если «/proc»-защита или SELinux не дадут записать в код — перехват не ставится, игра работает как обычно (см. konstt.log).
  *   • Подмена привязана к ID, а не к человеку: если игрок вышел и его ID занял другой — подмена перейдёт к нему. /vgun off снимает всё.
@@ -39,27 +44,42 @@ extern int mprotect(void*, unsigned long, int);
 extern long pwrite(int, const void*, unsigned long, long);
 #endif
 
-/* ───────────── таблица подмен: ID игрока → байт оружия (читается из главного потока внутри заглушки, пишется командой) ───────────── */
+/* ───────────── таблица подмен: ID игрока → байт оружия (читается из главного потока внутри хука, пишется командой) ───────────── */
 #define WP_MAX 64
 static volatile int g_wp_id[WP_MAX];                      /* -1 — ячейка свободна (до установки перехвата заполняется в wp_table_reset) */
-static volatile int g_wp_byte[WP_MAX];
-static volatile unsigned g_wp_hits;                       /* сколько раз перехват подменил байт — по нему видно, что он живой */
+static volatile int g_wp_byte[WP_MAX];                    /* какой байт оружия показываем */
+static volatile int g_wp_srv[WP_MAX];                     /* последний серверный байт этого игрока, который хук видел (-1 — ещё не видел) */
+static volatile int g_wp_mode[WP_MAX];                    /* 1 — подмена действует; 2 — снята: на ближайшем кадре вернуть серверный байт и освободить ячейку */
+static volatile int g_wp_active;                          /* сколько ячеек занято: хук выходит сразу, если 0 */
+static volatile unsigned g_wp_hits;                       /* сколько раз хук записал наш байт — по нему видно, что перехват живой */
 static int g_wp_offId = 0x40;                             /* смещение Actor.m_ID; при установке берём из метаданных */
-static void wp_table_reset(void) { int i; for (i = 0; i < WP_MAX; i++) __atomic_store_n(&g_wp_id[i], -1, __ATOMIC_RELEASE); }
+static int g_wp_offWeapon = -1;                           /* смещение m_LastOnFootSyncData.CurrentWeapon внутри RemotePlayer; -1 — перехват не настроен */
+static void wp_refresh_active(void) { int i, n = 0; for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) >= 0) n++; __atomic_store_n(&g_wp_active, n, __ATOMIC_RELEASE); }
+static void wp_table_reset(void) { int i; for (i = 0; i < WP_MAX; i++) { __atomic_store_n(&g_wp_id[i], -1, __ATOMIC_RELEASE); g_wp_srv[i] = -1; g_wp_mode[i] = 0; } __atomic_store_n(&g_wp_active, 0, __ATOMIC_RELEASE); }
 
-/* Зовётся из заглушки (главный поток, внутри RemotePlayer.Update). Никаких вызовов IL2CPP и выделения памяти — только чтение таблицы. */
+/* Зовётся из заглушки в начале RemotePlayer.Update (главный поток). Никаких вызовов IL2CPP и выделения памяти — только таблица и один байт игрока. */
 __attribute__((noinline, used))
-static unsigned wp_hook(void* player, unsigned server_byte) {
+static void wp_hook(void* player) {
     int i, id;
-    if (!player) return server_byte;
+    if (!player || g_wp_offWeapon < 0 || !__atomic_load_n(&g_wp_active, __ATOMIC_ACQUIRE)) return;
     id = (int)*(volatile u16*)((char*)player + g_wp_offId);
     for (i = 0; i < WP_MAX; i++) {
-        if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) == id) {
+        volatile u8* wb; int mine;
+        if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) != id) continue;
+        wb = (volatile u8*)((char*)player + g_wp_offWeapon);
+        mine = __atomic_load_n(&g_wp_byte[i], __ATOMIC_RELAXED) & 0xFF;
+        if (__atomic_load_n(&g_wp_mode[i], __ATOMIC_ACQUIRE) == 2) {          /* подмена снята: вернуть серверный байт, ячейку освободить */
+            int srv = __atomic_load_n(&g_wp_srv[i], __ATOMIC_RELAXED);
+            if (srv >= 0 && *wb == (u8)mine) *wb = (u8)srv;
+            __atomic_store_n(&g_wp_id[i], -1, __ATOMIC_RELEASE);
+            wp_refresh_active();
+        } else if (*wb != (u8)mine) {                                         /* пришёл серверный байт: запомнить и перекрыть нашим */
+            __atomic_store_n(&g_wp_srv[i], (int)*wb, __ATOMIC_RELAXED);
+            *wb = (u8)mine;
             __atomic_fetch_add(&g_wp_hits, 1, __ATOMIC_RELAXED);
-            return (unsigned)__atomic_load_n(&g_wp_byte[i], __ATOMIC_RELAXED) & 0xFFu;
         }
+        return;
     }
-    return server_byte;
 }
 
 /* ───────────── чистые помощники (без обращения к памяти игры; проверяются отдельно на настоящем коде libil2cpp) ───────────── */
@@ -70,7 +90,7 @@ static int wp_is_ldrb(u32 w, unsigned off, int* rn) {
     return 1;
 }
 /* Узор: LDRB w1,[xN,#off]; LDR x?,[x?,#imm]; BL — загрузка байта и сразу вызов Dictionary.get_Item(ToID, байт). Возврат: индекс слова,
-   -1 — не найдено, -2 — найдено больше одного места (патчить нельзя). */
+   -1 — не найдено, -2 — найдено больше одного места. Нужен как проверка, что это та самая функция и смещение верное. */
 static int wp_scan(const u32* c, int n, unsigned off, int* rn) {
     int i, hit = -1, r = 0;
     for (i = 0; i + 2 < n; i++) {
@@ -82,40 +102,54 @@ static int wp_scan(const u32* c, int n, unsigned off, int* rn) {
     }
     return hit;
 }
-static u32 wp_b(uptr from, uptr to) { return 0x14000000u | ((u32)(((long)to - (long)from) >> 2) & 0x03FFFFFFu); }
-static int wp_in_range(uptr a, uptr b) { long d = (long)b - (long)a; return d > -0x7E00000L && d < 0x7E00000L; }   /* B достаёт на ±128 МБ, берём с запасом */
+/* Инструкция зависит от своего адреса (при переносе в заглушку сломается)? */
+static int wp_pc_rel(u32 w) {
+    if ((w & 0x1F000000u) == 0x10000000u) return 1;              /* ADR, ADRP */
+    if ((w & 0x3B000000u) == 0x18000000u) return 1;              /* LDR / LDRSW / PRFM (literal) */
+    if ((w & 0x7C000000u) == 0x14000000u) return 1;              /* B, BL */
+    if ((w & 0xFF000010u) == 0x54000000u) return 1;              /* B.cond */
+    if ((w & 0x7E000000u) == 0x34000000u) return 1;              /* CBZ, CBNZ */
+    if ((w & 0x7E000000u) == 0x36000000u) return 1;              /* TBZ, TBNZ */
+    return 0;
+}
 
-#define WP_VENEER_WORDS 14
-/* Заглушка (arm64). Сохраняет x0 и x8 (они живы до следующего BL), читает байт как исходная инструкция, зовёт wp_hook(xN, байт),
-   результат кладёт в w1, возвращает x0/x8 и прыгает на инструкцию после места патча.
-     0  stp x0, x8, [sp, #-32]!        1  str x30, [sp, #16]
-     2  <исходная LDRB w1,[xN,#off]>   3  mov x0, xN
-     4  ldr x16, =wp_hook (слово 12)   5  blr x16
-     6  mov w1, w0                     7  ldr x30, [sp, #16]
-     8  ldp x0, x8, [sp], #32          9  b site+4
-    10-11 nop                          12-13 адрес wp_hook */
-static void wp_make_veneer(u32* v, uptr vaddr, uptr site, u32 orig, int rn, uptr hook) {
-    v[0] = 0xA9BE23E0u;
-    v[1] = 0xF9000BFEu;
-    v[2] = orig;
-    v[3] = 0xAA0003E0u | ((u32)rn << 16);
-    v[4] = 0x58000110u;
-    v[5] = 0xD63F0200u;
-    v[6] = 0x2A0003E1u;
-    v[7] = 0xF9400BFEu;
-    v[8] = 0xA8C223E0u;
-    v[9] = wp_b(vaddr + 9 * 4, site + 4);
-    v[10] = 0xD503201Fu;
-    v[11] = 0xD503201Fu;
-    v[12] = (u32)(hook & 0xFFFFFFFFu);
-    v[13] = (u32)(((unsigned long long)hook) >> 32);
+#define WP_TRAMP_WORDS 16
+/* Заглушка (arm64), 64 байта. Вход — абсолютным прыжком из начала Update, регистры как при входе в функцию (x0 — игрок, x1 — MethodInfo).
+     0  stp x0, x1, [sp, #-32]!        1  str x30, [sp, #16]
+     2  ldr x16, =wp_hook (слово 12)   3  blr x16
+     4  ldr x30, [sp, #16]             5  ldp x0, x1, [sp], #32
+     6-9 четыре затёртые инструкции пролога (позиционно независимые — проверено wp_pc_rel)
+    10  ldr x16, =Update+16 (слово 14) 11 br x16
+    12-13 адрес wp_hook                14-15 адрес Update+16 */
+static void wp_make_tramp(u32* t, const u32* orig4, uptr hook, uptr resume) {
+    int i;
+    t[0] = 0xA9BE07E0u;
+    t[1] = 0xF9000BFEu;
+    t[2] = 0x58000150u;
+    t[3] = 0xD63F0200u;
+    t[4] = 0xF9400BFEu;
+    t[5] = 0xA8C207E0u;
+    for (i = 0; i < 4; i++) t[6 + i] = orig4[i];
+    t[10] = 0x58000090u;
+    t[11] = 0xD61F0200u;
+    t[12] = (u32)(hook & 0xFFFFFFFFu);
+    t[13] = (u32)(((unsigned long long)hook) >> 32);
+    t[14] = (u32)(resume & 0xFFFFFFFFu);
+    t[15] = (u32)(((unsigned long long)resume) >> 32);
+}
+/* 16 байт, которыми заменяется начало Update: ldr x16,[pc,#8]; br x16; .quad адрес заглушки */
+static void wp_make_entry(u32* e, uptr tramp) {
+    e[0] = 0x58000050u;
+    e[1] = 0xD61F0200u;
+    e[2] = (u32)(tramp & 0xFFFFFFFFu);
+    e[3] = (u32)(((unsigned long long)tramp) >> 32);
 }
 
 /* ───────────── установка перехвата (только arm64) ───────────── */
 #ifdef WP_ARM64
 static void* g_wp_veneer;                                  /* страница с заглушкой (после снятия перехвата остаётся — вдруг поток ещё внутри) */
-static uptr g_wp_site;                                     /* адрес пропатченной инструкции */
-static u32 g_wp_orig;                                      /* её исходное слово */
+static uptr g_wp_site;                                     /* адрес начала RemotePlayer.Update */
+static u32 g_wp_orig[4];                                   /* его исходные 4 слова */
 #endif
 static int g_wp_state;                                     /* 1 — перехват стоит */
 static char g_wp_err[160];
@@ -139,40 +173,27 @@ static void wp_flush(void* p, unsigned n) {                /* синхрониз
     for (a = (uptr)p & ~(il - 1); a < e; a += il) __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
     __asm__ volatile("dsb ish\n\tisb" ::: "memory");
 }
-/* Записать одно слово в код игры. Окно с правом записи короткое (одна инструкция), права на страницу возвращаются как были (r-x).
-   Запасной путь — запись в /proc/self/mem, если mprotect запрещён. */
-static int wp_write_code(uptr addr, u32 w) {
-    uptr page = addr & ~(uptr)4095;
-    if (mprotect((void*)page, 4096, 7) == 0) {              /* R|W|X: страница живая, другие потоки в ней исполняют код, снимать X нельзя */
-        *(volatile u32*)addr = w;
-        wp_flush((void*)addr, 4);
-        mprotect((void*)page, 4096, 5);                     /* R|X */
+/* Записать n слов в код игры. Окно с правом записи короткое, права на страницы возвращаются как были (r-x). Слова пишутся с конца к началу:
+   первым ложится адрес, последним — первая инструкция. Запасной путь — запись в /proc/self/mem, если mprotect запрещён. */
+static int wp_write_code(uptr addr, const u32* w, int n) {
+    uptr p0 = addr & ~(uptr)4095, p1 = (addr + (uptr)n * 4 - 1) & ~(uptr)4095;
+    unsigned long len = (unsigned long)(p1 - p0) + 4096;
+    int i;
+    if (mprotect((void*)p0, len, 7) == 0) {                 /* R|W|X: страница живая, другие потоки в ней исполняют код, снимать X нельзя */
+        for (i = n - 1; i >= 0; i--) ((volatile u32*)addr)[i] = w[i];
+        wp_flush((void*)addr, (unsigned)n * 4);
+        mprotect((void*)p0, len, 5);                        /* R|X */
         return 1;
     }
     {
         int fd = open("/proc/self/mem", 2); long r = -1;
-        if (fd >= 0) { r = pwrite(fd, &w, 4, (long)addr); close(fd); }
-        if (r == 4) { wp_flush((void*)addr, 4); return 1; }
+        if (fd >= 0) { r = pwrite(fd, w, (unsigned long)n * 4, (long)addr); close(fd); }
+        if (r == (long)n * 4) { wp_flush((void*)addr, (unsigned)n * 4); return 1; }
     }
     return 0;
 }
-/* Анонимная страница в пределах досягаемости перехода B от места патча. Подсказка-адрес идёт вокруг места патча с шагом 64 КБ. */
-static void* wp_alloc_near(uptr site) {
-    uptr base = site & ~(uptr)0xFFFF; long k;
-    for (k = 1; k <= 2000; k++) {
-        int dir;
-        for (dir = 0; dir < 2; dir++) {
-            uptr hint = dir ? base + (uptr)k * 0x10000u : base - (uptr)k * 0x10000u;
-            void* r = mmap((void*)hint, 4096, 3, 0x22, -1, 0);       /* R|W, MAP_PRIVATE|MAP_ANONYMOUS */
-            if (r == (void*)-1) continue;
-            if (wp_in_range(site, (uptr)r)) return r;
-            munmap(r, 4096);
-        }
-    }
-    return NULL;
-}
 static int wp_install(void) {
-    void *kls, *m, *sf, *sc, *cw, *idf; uptr fn, site; u32 code[256]; int off, shift, rn = 0, idx, i;
+    void *kls, *m, *sf, *sc, *cw, *idf; uptr fn; u32 code[256]; int off, shift, rn = 0, idx, i;
     if (g_wp_state == 1) return 1;
     if (!g_img) return wp_fail("игра ещё не готова");
     kls = A.class_from_name(g_img, "Hassle.Players", "RemotePlayer");
@@ -194,33 +215,39 @@ static int wp_install(void) {
     g_wp_offId = A.field_get_offset(idf);
     dlog_i("vgun: смещение Actor.m_ID: ", g_wp_offId);
     for (i = 0; i < 256; i++) code[i] = ((const u32*)fn)[i];
+    /* если функция уже пропатчена нами (после неудачного снятия) — исходные слова берём из сохранённых */
+    if (g_wp_veneer && g_wp_site == fn) for (i = 0; i < 4; i++) code[i] = g_wp_orig[i];
     idx = wp_scan(code, 256, (unsigned)off, &rn);
     if (idx == -2) return wp_fail("в Update несколько подходящих мест — не рискую");
     if (idx < 0) return wp_fail("в Update не нашёл чтение CurrentWeapon (другая сборка игры?)");
-    if (rn == 1 || rn >= 30) return wp_fail("неожиданный регистр с игроком");
-    site = fn + (uptr)idx * 4;
-    dlog_i("vgun: место патча, байт от начала Update: ", idx * 4);
-    if (g_wp_veneer && g_wp_site == site && g_wp_orig == code[idx]) {
-        /* повторная установка после /vgun unhook: заглушка уже стоит и осталась прежней */
-    } else {
-        u32 v[WP_VENEER_WORDS];
-        void* page = wp_alloc_near(site);
-        if (!page) return wp_fail("нет свободной страницы рядом с кодом игры");
-        wp_make_veneer(v, (uptr)page, site, code[idx], rn, (uptr)wp_hook);
-        for (i = 0; i < WP_VENEER_WORDS; i++) ((u32*)page)[i] = v[i];
+    dlog_i("vgun: чтение CurrentWeapon в Update, байт от начала: ", idx * 4);
+    if (idx < 4) return wp_fail("чтение CurrentWeapon слишком близко к началу Update");
+    for (i = 0; i < 4; i++) if (wp_pc_rel(code[i])) return wp_fail("пролог Update зависит от адреса — перенести нельзя");
+    if (!(g_wp_veneer && g_wp_site == fn)) {
+        u32 v[WP_TRAMP_WORDS];
+        void* page = mmap(NULL, 4096, 3, 0x22, -1, 0);       /* R|W, MAP_PRIVATE|MAP_ANONYMOUS; адрес любой — прыжок абсолютный */
+        if (page == (void*)-1 || !page) return wp_fail("не удалось выделить страницу под заглушку");
+        wp_make_tramp(v, code, (uptr)wp_hook, fn + 16);
+        for (i = 0; i < WP_TRAMP_WORDS; i++) ((u32*)page)[i] = v[i];
         wp_flush(page, sizeof v);
         if (mprotect(page, 4096, 5) != 0) { munmap(page, 4096); return wp_fail("не удалось сделать страницу заглушки исполняемой"); }
-        g_wp_veneer = page; g_wp_site = site; g_wp_orig = code[idx];
+        g_wp_veneer = page; g_wp_site = fn;
+        for (i = 0; i < 4; i++) g_wp_orig[i] = code[i];
     }
-    if (!wp_write_code(site, wp_b(site, (uptr)g_wp_veneer))) return wp_fail("запись в код игры запрещена системой");
+    {
+        u32 e[4];
+        wp_make_entry(e, (uptr)g_wp_veneer);
+        g_wp_offWeapon = off;                                /* до записи патча: хук с первого же вызова знает, куда писать */
+        if (!wp_write_code(fn, e, 4)) { g_wp_offWeapon = -1; return wp_fail("запись в код игры запрещена системой"); }
+    }
     g_wp_state = 1;
-    dlog("vgun: перехват RemotePlayer.Update установлен");
+    dlog("vgun: перехват RemotePlayer.Update установлен (вход функции, абсолютный прыжок)");
     return 1;
 }
 static void wp_unhook(void) {
     if (g_wp_state != 1) return;
-    if (wp_write_code(g_wp_site, g_wp_orig)) { g_wp_state = 0; dlog("vgun: перехват снят, код игры восстановлен"); }
-    else dlog("vgun: не удалось вернуть исходную инструкцию");
+    if (wp_write_code(g_wp_site, g_wp_orig, 4)) { g_wp_state = 0; dlog("vgun: перехват снят, код игры восстановлен"); }
+    else dlog("vgun: не удалось вернуть исходные инструкции");
 }
 #else
 static int wp_install(void) { return wp_fail("поддерживается только arm64"); }
@@ -231,26 +258,56 @@ static void wp_unhook(void) {}
 typedef struct { int key; char name[28]; } WpItem;
 static WpItem g_wp_items[64];
 static int g_wp_nitems;
-static void wp_item_cb(void* key, void* val, void* ctx) {
-    WpItem* it; int k, n;
-    (void)ctx;
-    if (g_wp_nitems >= 64 || !val || !hm_obj_ok(val)) return;
-    k = (int)((uptr)key & 0xFFFFFFFFu);                      /* ключ int лежит в младших 4 байтах прочитанного слова */
+static int g_wp_dropObj, g_wp_dropLen, g_wp_dropKey;       /* сколько записей перебор отбросил и почему (для журнала) */
+static int wp_have(int key) { int i; for (i = 0; i < g_wp_nitems; i++) if (g_wp_items[i].key == key) return 1; return 0; }
+static int wp_add_item(int k, void* val) {                  /* 1 — добавлено */
+    WpItem* it; int n;
+    if (g_wp_nitems >= 64 || !val) return 0;
+    if (!hm_obj_ok(val)) { g_wp_dropObj++; return 0; }
     n = A.string_length(val);
-    if (n <= 0 || n > 27 || k < 0 || k > 255) return;
+    if (n <= 0 || n > 27) { g_wp_dropLen++; return 0; }
+    if (k < 0 || k > 255) { g_wp_dropKey++; return 0; }
+    if (wp_have(k)) return 0;
     it = &g_wp_items[g_wp_nitems++];
     it->key = k;
     utf16_to_utf8(A.string_chars(val), n, it->name, sizeof it->name);
+    return 1;
+}
+static void wp_item_cb(void* key, void* val, void* ctx) {
+    (void)ctx;
+    wp_add_item((int)((uptr)key & 0xFFFFFFFFu), val);        /* ключ int лежит в младших 4 байтах прочитанного слова */
+}
+/* Опрос ключей через get_Item самой игры: не зависит от внутреннего устройства словаря. Нет ключа — игра бросает исключение, runtime_invoke его ловит. */
+static int wp_probe_items(void* dict) {
+    void *dk, *gi; int k, added = 0;
+    dk = A.object_get_class(dict);
+    gi = dk ? A.class_get_method_from_name(dk, "get_Item", 1) : NULL;
+    if (!gi) { dlog("vgun: у словаря оружия не нашёл get_Item"); return 0; }
+    for (k = 0; k < 64; k++) {
+        void* args[1]; void* r; void* exc = NULL; int key = k;
+        if (wp_have(k)) continue;
+        args[0] = &key;
+        r = A.runtime_invoke(gi, dict, args, &exc);
+        if (exc || !r) continue;
+        if (wp_add_item(k, r)) added++;
+    }
+    return added;
 }
 static int wp_load_items(void) {
-    void *kls, *f, *dict = NULL; int i, j;
-    g_wp_nitems = 0;
+    void *kls, *f, *dict = NULL; int i, j, byIter, byProbe;
+    g_wp_nitems = 0; g_wp_dropObj = g_wp_dropLen = g_wp_dropKey = 0;
     kls = A.class_from_name(g_img, "Hassle.Items", "WeaponConvertTable");
     f = kls ? A.class_get_field_from_name(kls, "ToID") : NULL;
-    if (!f) return 0;
+    if (!f) { dlog("vgun: нет WeaponConvertTable.ToID"); return 0; }
     A.field_static_get_value(f, &dict);
-    if (!dict) return 0;
+    if (!dict) { dlog("vgun: WeaponConvertTable.ToID пока пуст (null)"); return 0; }
+    dlog_i("vgun: ToID, Count по полю _count: ", int_field(dict, "_count", "count", NULL, -1));
     dict_each(dict, wp_item_cb, NULL);
+    byIter = g_wp_nitems;
+    byProbe = wp_probe_items(dict);
+    dlog_i("vgun: оружий найдено перебором записей: ", byIter);
+    dlog_i("vgun: оружий добавлено опросом get_Item: ", byProbe);
+    dlog_i("vgun: отброшено: объект нечитаем / длина имени / ключ вне диапазона: ", (long)g_wp_dropObj * 10000 + (long)g_wp_dropLen * 100 + g_wp_dropKey);
     for (i = 1; i < g_wp_nitems; i++) {                      /* по номеру */
         WpItem t = g_wp_items[i];
         for (j = i - 1; j >= 0 && g_wp_items[j].key > t.key; j--) g_wp_items[j + 1] = g_wp_items[j];
@@ -318,15 +375,24 @@ static int wp_my_id(void) {
     return ok ? (int)v : -1;
 }
 static int wp_slot(int id) { int i; for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) == id) return i; return -1; }
-static int wp_count(void) { int i, n = 0; for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) >= 0) n++; return n; }
-static void wp_clear_id(int id) { int s = wp_slot(id); if (s >= 0) __atomic_store_n(&g_wp_id[s], -1, __ATOMIC_RELEASE); }
-static void wp_clear_all(void) { wp_table_reset(); }
+static int wp_count(void) { int i, n = 0; for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) >= 0 && __atomic_load_n(&g_wp_mode[i], __ATOMIC_ACQUIRE) == 1) n++; return n; }
+static int wp_is_set(int id) { int s = wp_slot(id); return s >= 0 && __atomic_load_n(&g_wp_mode[s], __ATOMIC_ACQUIRE) == 1; }
+static void wp_clear_slot(int s) {                           /* вернуть серверное оружие: если хук уже видел серверный байт — вернёт его на ближайшем кадре, иначе просто освободить */
+    if (s < 0) return;
+    if (__atomic_load_n(&g_wp_srv[s], __ATOMIC_RELAXED) >= 0) __atomic_store_n(&g_wp_mode[s], 2, __ATOMIC_RELEASE);
+    else { __atomic_store_n(&g_wp_id[s], -1, __ATOMIC_RELEASE); wp_refresh_active(); }
+}
+static void wp_clear_id(int id) { wp_clear_slot(wp_slot(id)); }
+static void wp_clear_all(void) { int i; for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) >= 0) wp_clear_slot(i); }
 static int wp_set(int id, int key) {                         /* 1 — готово, 0 — таблица полна */
-    int s = wp_slot(id), i;
-    if (s < 0) { for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) < 0) { s = i; break; } }
+    int s = wp_slot(id), i, fresh = 0;
+    if (s < 0) { for (i = 0; i < WP_MAX; i++) if (__atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE) < 0) { s = i; fresh = 1; break; } }
     if (s < 0) return 0;
     __atomic_store_n(&g_wp_byte[s], key, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_wp_id[s], id, __ATOMIC_RELEASE);     /* ID публикуется последним: заглушка не увидит ячейку без байта */
+    if (fresh) __atomic_store_n(&g_wp_srv[s], -1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_wp_mode[s], 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wp_id[s], id, __ATOMIC_RELEASE);     /* ID публикуется последним: хук не увидит ячейку без байта */
+    wp_refresh_active();
     return 1;
 }
 
@@ -384,7 +450,7 @@ static void wp_say_status(void) {
     for (i = 0; i < WP_MAX; i++) {
         int id = __atomic_load_n(&g_wp_id[i], __ATOMIC_ACQUIRE);
         const char* nm;
-        if (id < 0) continue;
+        if (id < 0 || __atomic_load_n(&g_wp_mode[i], __ATOMIC_ACQUIRE) != 1) continue;
         nm = wp_name_of(__atomic_load_n(&g_wp_byte[i], __ATOMIC_RELAXED));
         if (b.n > 170) { chat_say(msg); b_init(&b, msg, sizeof msg); first = 1; }
         if (!first) b_s(&b, ";  ");
@@ -402,13 +468,13 @@ static void native_vgun_cmd(void* self, void* args, void* mi) {
     if (nt == 0) { wp_usage(); return; }
     if (wp_is(tok[0], "list", "l")) { wp_say_list(); return; }
     if (wp_is(tok[0], "status", "diag")) { wp_say_status(); return; }
-    if (wp_is(tok[0], "unhook", NULL)) { wp_clear_all(); wp_unhook(); chat_say(g_wp_state == 1 ? "vgun: не удалось снять перехват, см. konstt.log" : "vgun: перехват снят, подмены сброшены"); return; }
+    if (wp_is(tok[0], "unhook", NULL)) { wp_unhook(); if (g_wp_state != 1) wp_table_reset(); chat_say(g_wp_state == 1 ? "vgun: не удалось снять перехват, см. konstt.log" : "vgun: перехват снят, подмены сброшены (оружие у игроков вернётся с их следующим пакетом)"); return; }
     if (wp_is(tok[0], "off", "clear") || wp_is(tok[0], "reset", "stop")) { wp_clear_all(); chat_say("vgun: все подмены сняты, у игроков оружие как на сервере"); return; }
     if (wp_all_digits(tok[0])) {
         int id = wp_num(tok[0]), key, me; const char* nm = NULL;
         if (id > 65535) { chat_say("vgun: такой ID не бывает"); return; }
         if (nt == 1) {                                       /* что подменено у игрока */
-            int s = wp_slot(id);
+            int s = wp_is_set(id) ? wp_slot(id) : -1;
             b_init(&b, msg, sizeof msg);
             if (s < 0) { b_s(&b, "vgun: у игрока "); b_int(&b, id); b_s(&b, " подмены нет"); }
             else { wp_load_items(); nm = wp_name_of(__atomic_load_n(&g_wp_byte[s], __ATOMIC_RELAXED)); b_s(&b, "vgun: у игрока "); b_int(&b, id); b_s(&b, " подменено оружие: "); b_s(&b, nm ? nm : "?"); }
@@ -417,7 +483,7 @@ static void native_vgun_cmd(void* self, void* args, void* mi) {
         }
         if (wp_is(tok[1], "off", "clear") || wp_is(tok[1], "del", "none")) {
             b_init(&b, msg, sizeof msg);
-            if (wp_slot(id) < 0) { b_s(&b, "vgun: у игрока "); b_int(&b, id); b_s(&b, " подмены и не было"); }
+            if (!wp_is_set(id)) { b_s(&b, "vgun: у игрока "); b_int(&b, id); b_s(&b, " подмены и не было"); }
             else { wp_clear_id(id); b_s(&b, "vgun: игроку "); b_int(&b, id); b_s(&b, " возвращено оружие с сервера"); }
             chat_say(msg);
             return;
