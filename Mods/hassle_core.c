@@ -761,6 +761,7 @@ static int g_dictCount, g_keyHasSlash;
 static void* g_cmdKls;                                   /* класс делегата чат-команды */
 static int g_cmdSize, g_cmdOffMp, g_cmdOffIi;            /* размер делегата, смещения method_ptr и invoke_impl (0 — нет) */
 static volatile int g_cmdLock;
+static volatile int g_cmdStep, g_coreBeat;                /* шаг поиска образца и «пульс» потока ядра — для сторожа (см. cmd_watchdog_main) */
 typedef void (*native_cmd_fn)(void* self, void* args, void* mi);
 
 
@@ -883,18 +884,26 @@ static void* clone_cmd_delegate(void* kls, int size, int off_mp, int off_ii, upt
 static void cmd_find_template(void) {
     void *cw, *fd, *dict = NULL, *kls, *mset, *f_mp, *f_ii; int size, off_mp, off_ii;
     if (g_tplState) return;
+    g_cmdStep = 1;
     if (++g_cmdTries > 1500) { cmd_fail("реестр команд так и не заполнился (нет образца делегата)"); return; }
     if (!A.string_new || !A.object_new || !A.class_instance_size) { cmd_fail("нет il2cpp_string_new / object_new / class_instance_size"); return; }
+    ensure_attached();
+    g_cmdStep = 2;
     cw = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
     if (!cw) return;
+    g_cmdStep = 3;
     fd = A.class_get_field_from_name(cw, "m_ChatCommandEvents");
     if (!fd) { cmd_fail("поле WebViewSystem.m_ChatCommandEvents не найдено"); return; }
+    g_cmdStep = 4;
     A.field_static_get_value(fd, &dict);
     if (!dict) return;                                   /* реестр ещё не создан */
     g_dictCount = 0; g_tplDelegate = NULL; g_keyHasSlash = 0;
+    g_cmdStep = 5;
     dict_each(dict, tpl_cb, NULL);
+    g_cmdStep = 6;
     if (!g_tplDelegate) return;                          /* игра ещё не зарегистрировала ни одной команды — образца нет, ждём */
 
+    g_cmdStep = 7;
     kls = A.object_get_class(g_tplDelegate);
     size = A.class_instance_size(kls);
     if (size < 0x40 || size > 0x200) { cmd_fail("странный размер делегата"); return; }
@@ -903,6 +912,7 @@ static void cmd_find_template(void) {
     off_mp = A.field_get_offset(f_mp);
     f_ii = find_field(kls, "invoke_impl");
     off_ii = f_ii ? A.field_get_offset(f_ii) : 0;
+    g_cmdStep = 8;
     mset = find_method(A.object_get_class(dict), "set_Item", 2);
     if (!mset) { cmd_fail("у словаря нет set_Item"); return; }
     g_cmdKls = kls; g_cmdSize = size; g_cmdOffMp = off_mp; g_cmdOffIi = off_ii;
@@ -995,14 +1005,37 @@ static void* core_main(void* arg) {
     dlog("core: игра готова (Game.Instance создан)");
     for (w = 0; w < KONSTT_EXTRA_DELAY_S; w++) usleep(1000000);
     set_stage("игра готова");
+    /* ПЕРВЫЙ проход (поиск PlayerPool и образца команды) делаем ДО g_ready, пока моды ещё спят и не трогают IL2CPP: в журнале
+       «команды не работают» поток ядра замирал сразу после первой строки реестра — ровно в тот момент, когда Near и mem
+       просыпались по g_ready и лезли в IL2CPP (thread_attach, class_from_name, scan_for_pool) одновременно с ядром. */
+    g_coreBeat++; pool_ensure(); cmd_find_template(); g_coreBeat++;
     __atomic_store_n(&g_ready, 1, __ATOMIC_RELEASE);
     for (;;) {                                           /* пул игроков и образец делегата чат-команды: ждём, пока игра их создаст */
+        g_coreBeat++;
         pool_ensure();
         cmd_find_template();
         if (g_poolSrcField && g_tplState) break;
         usleep(TICK_US);
     }
     dlog("core: пул игроков и реестр команд найдены, поток ядра завершён");
+    return NULL;
+}
+
+static int hm_wait_started(void);
+/* Сторож: если образец команды не нашёлся за 20 с, пишет в журнал, на каком шаге стоит ядро и жив ли его поток (пульс растёт или нет). */
+static void* cmd_watchdog_main(void* arg) {
+    int i, last = -1, same = 0; (void)arg;
+    if (!hm_wait_started()) return NULL;
+    while (!__atomic_load_n(&g_ready, __ATOMIC_ACQUIRE)) usleep(500000);
+    for (i = 0; i < 20; i++) usleep(1000000);
+    for (i = 0; i < 12 && !g_tplState; i++) {
+        int beat = g_coreBeat;
+        same = (beat == last) ? same + 1 : 0; last = beat;
+        dlog_i("сторож: образца команды всё нет; шаг поиска ", g_cmdStep);
+        dlog_i("сторож: пульс потока ядра ", beat);
+        if (same >= 1) dlog("сторож: пульс не меняется — поток ядра ЗАВИС на шаге выше (1 вход, 2 class_from_name, 3 поле, 4 чтение static, 5 перебор словаря, 7-8 разбор делегата)");
+        for (int k = 0; k < 10; k++) usleep(1000000);
+    }
     return NULL;
 }
 
@@ -1041,6 +1074,7 @@ static void start_threads(void) {
     dlog("start_threads: konstt_off нет, мод включён");
     dlog("start_threads: запускаю поток ядра");
     pthread_create(&t1, NULL, core_main, NULL);
+    { unsigned long t2 = 0; pthread_create(&t2, NULL, cmd_watchdog_main, NULL); }
 }
 
 #if defined(KONSTT_BUNDLE)
