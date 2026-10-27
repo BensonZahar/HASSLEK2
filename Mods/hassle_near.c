@@ -294,14 +294,31 @@ static void on_pool_item(void* item, void* ctx) {
     }
 }
 static int walk_dict_values(void* coll, item_cb cb, void* ctx) {
-    void* k; const char* nm; void* arr;
-    if (!coll) return 0;
-    k = A.object_get_class(coll); nm = A.class_get_name(k);
-    if (!sprefix(nm, "Dictionary`2")) return 0;
+    void* arr;
+    if (!coll || !hm_obj_ok(coll)) return 0;
     arr = ref_field(coll, "_entries"); if (!arr) arr = ref_field(coll, "entries");
-    if (!arr) return 0;
+    if (!arr) return find_field(A.object_get_class(coll), "_count") ? 1 : 0;    /* у пустого Dictionary массив записей ещё не создан — это не ошибка */
+    if (!hm_obj_ok(arr)) return 0;
     walk_struct_array(arr, int_field(coll, "_count", "count", NULL, -1), "value", cb, ctx);
     return 1;
+}
+
+/* Диагностика пула в журнал (/neardiag, HLOG/konstt.log): раз в 5 с, первые 24 раза — чтобы по логу было видно, живой ли это пул */
+static void pool_diag(void* pool, void* stream, void* items) {
+    static int n; static unsigned last;
+    void* ent; Buf b; char t[200];
+    if (n >= 24 || (n && g_ticks_u() - last < 250)) return;
+    n++; last = g_ticks_u();
+    ent = items ? (ref_field(items, "_entries") ? ref_field(items, "_entries") : ref_field(items, "entries")) : NULL;
+    b_init(&b, t, sizeof t);
+    b_s(&b, "near-diag #"); b_int(&b, n);
+    b_s(&b, ": LocalPlayer "); b_s(&b, g_local ? "есть" : "НЕТ");
+    if (g_local) { b_s(&b, " id "); b_int(&b, int_field(g_local, "m_ID", NULL, NULL, -1)); }
+    b_s(&b, "; PlayersInStream size "); b_int(&b, stream ? int_field(stream, "_size", "size", NULL, -1) : -2);
+    b_s(&b, "; m_Items "); b_s(&b, items ? "есть" : "NULL");
+    if (items) { b_s(&b, " (класс "); b_s(&b, A.class_get_name(A.object_get_class(items))); b_s(&b, "), _count "); b_int(&b, int_field(items, "_count", "count", NULL, -1)); b_s(&b, ", _entries "); b_s(&b, ent ? "есть" : "null"); }
+    b_s(&b, "; обход: всего "); b_int(&b, g_poolAll); b_s(&b, ", по sync "); b_int(&b, g_nfb);
+    dlog(t); (void)pool;
 }
 
 /* ───────────── итоговый JSON ───────────── */
@@ -433,7 +450,8 @@ static void collect_tick(void) {
         void* items = ref_field(pool, "m_Items");
         g_nfbTmp = 0; g_poolAllTmp = 0;
         if (walk_dict_values(items, on_pool_item, NULL)) { g_nfb = g_nfbTmp; g_poolAll = g_poolAllTmp; g_fbAt = g_tickNow; }
-        else { static int w; if (!w) { w = 1; dlog("near: BasePool.m_Items — не Dictionary, запасной обход выключен"); } g_nfb = 0; }
+        else { static int w; if (!w) { w = 1; dlog("near: BasePool.m_Items нечитаем или NULL — обход пула не удался (подробности в near-diag)"); } g_nfb = 0; }
+        pool_diag(pool, stream, items);
     }
     {
         int i, j;
