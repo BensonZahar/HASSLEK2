@@ -122,7 +122,7 @@ static void trk_vel(const Trk* k, long long now, float* vx, float* vy, float* vz
 /* ───────────── чтение игроков ───────────── */
 typedef struct {
     int id; int hasPos; float x, y, z; double hp, ar, ping, score; int veh; int src; char label[96]; char nick[64]; int labelId;
-    float vx, vy, vz; int age;
+    float vx, vy, vz; int age; int ins;        /* ins: 1 — игрок в PlayersInStream, 0 — найден обходом всего пула (получаем его sync-пакеты) */
 } PInfo;
 #define MAXP 256
 static PInfo g_pl[MAXP];
@@ -132,6 +132,7 @@ static int g_meKind;                           /* какой пакет синх
 
 typedef struct {
     void* item; int id; unsigned seen;         /* seen — номер тика, когда игрок был в списке последний раз */
+    unsigned sTick;                            /* номер тика, когда игрок был именно в PlayersInStream */
     long long tSlow, tNick;
     double hp, ar, ping, score; int veh;
     char label[96]; char nick[64]; int labelId;
@@ -200,14 +201,10 @@ static void read_label(void* player, PInfo* p) {
     }
 }
 
-static void on_player(void* item, void* ctx) {
-    PInfo* p; PCache* c; float pos[3]; int ok, id;
-    (void)ctx;
-    if (g_np >= MAXP || !item) return;
-    if (item == g_local) return;
+static PCache* fill_player(void* item, PInfo* p) {      /* общая часть: позиция, скорость, HP/пинг/ник из кэша; возвращает кэш игрока */
+    PCache* c; float pos[3]; int ok, id;
     id = int_field(item, "m_ID", NULL, NULL, -1);
     c = pc_get(item, id);
-    p = &g_pl[g_np];
     p->id = id;
     p->hasPos = read_pos_k(item, pos, &p->src);                          /* каждый тик: это просто чтение полей */
     p->x = p->hasPos ? pos[0] : 0; p->y = p->hasPos ? pos[1] : 0; p->z = p->hasPos ? pos[2] : 0;
@@ -233,7 +230,78 @@ static void on_player(void* item, void* ctx) {
         p->labelId = c->labelId;
     }
     if (p->id < 0 && p->labelId >= 0) p->id = p->labelId;
+    return c;
+}
+
+static void on_player(void* item, void* ctx) {                 /* игрок из PlayersInStream */
+    PCache* c;
+    (void)ctx;
+    if (g_np >= MAXP || !item) return;
+    if (item == g_local) return;
+    c = fill_player(item, &g_pl[g_np]);
+    c->sTick = g_ticks_u();
+    g_pl[g_np].ins = 1;
     g_np++;
+}
+
+/* ───────────── запасной обход: ВСЕ игроки пула (BasePool.m_Items), которых нет в PlayersInStream ─────────────
+   PlayersInStream клиент ведёт по RPC сервера (WorldPlayerAdd / WorldPlayerRemove), сам он его при вашем спавне не чистит. Если сервер
+   вас «переставил» (спавн, виртуальный мир, интерьер) и стрим пуст, а sync-пакеты игрока всё равно приходят — его позиция в
+   m_LastOnFootSyncData меняется. Таких (позиция менялась ≤ NEAR_FB_AGE_MS назад) добавляем в список с ins=0. Обход — 10 раз в секунду. */
+#define NEAR_FB_EVERY   10                     /* раз в N тиков (≈5 Гц) */
+#define NEAR_FB_AGE_MS  3000                   /* позиция менялась не раньше, чем N мс назад */
+#define MAXFB 128
+/* лёгкий трекер для обхода пула: серверных игроков бывает больше MAXP, поэтому общий кэш PCache тут не используем —
+   только позиция и момент её последней смены; полный разбор (ник, HP, скорость) — лишь для тех, у кого пакеты идут */
+typedef struct { void* item; int id; float x, y, z; long long tChange; } FbT;
+#define FBT_N 1024
+static FbT g_ft[FBT_N];
+static PInfo g_fb[MAXFB];
+static int g_nfb, g_nfbTmp, g_poolAll, g_poolAllTmp, g_streamN;
+static long long g_fbAt;                       /* момент последнего обхода пула */
+static FbT* ft_get(void* item, int id) {
+    unsigned h = (unsigned)(((unsigned long)item >> 4) & (FBT_N - 1)), i, k, old = h;
+    for (i = 0; i < 8; i++) {
+        k = (h + i) & (FBT_N - 1);
+        if (g_ft[k].item == item) {
+            if (g_ft[k].id != id) { g_ft[k].id = id; g_ft[k].tChange = 0; g_ft[k].x = g_ft[k].y = g_ft[k].z = 0; }
+            return &g_ft[k];
+        }
+        if (!g_ft[k].item) { old = k; break; }
+        if (g_ft[k].tChange < g_ft[old].tChange) old = k;
+    }
+    g_ft[old].item = item; g_ft[old].id = id; g_ft[old].tChange = 0; g_ft[old].x = g_ft[old].y = g_ft[old].z = 0;
+    g_ft[old].tChange = -1;                    /* -1: позиция ещё ни разу не читалась */
+    return &g_ft[old];
+}
+static void on_pool_item(void* item, void* ctx) {
+    FbT* t; float pos[3]; int id, kind = 0;
+    (void)ctx;
+    g_poolAllTmp++;
+    if (!item || item == g_local) return;
+    id = int_field(item, "m_ID", NULL, NULL, -1);
+    if (!read_pos_k(item, pos, &kind)) return;
+    t = ft_get(item, id);
+    if (t->tChange == -1) { t->x = pos[0]; t->y = pos[1]; t->z = pos[2]; t->tChange = 0; return; }
+    if (t->x != pos[0] || t->y != pos[1] || t->z != pos[2]) { t->x = pos[0]; t->y = pos[1]; t->z = pos[2]; t->tChange = g_tickNow; }
+    if (!t->tChange || g_tickNow - t->tChange > NEAR_FB_AGE_MS) return;      /* пакеты не идут — не считаем «рядом» */
+    if (g_nfbTmp >= MAXFB) return;
+    {
+        PCache* c = fill_player(item, &g_fb[g_nfbTmp]);
+        if (c->sTick == g_ticks_u()) return;                                 /* уже в стриме в этом тике */
+        g_fb[g_nfbTmp].ins = 0;
+        g_nfbTmp++;
+    }
+}
+static int walk_dict_values(void* coll, item_cb cb, void* ctx) {
+    void* k; const char* nm; void* arr;
+    if (!coll) return 0;
+    k = A.object_get_class(coll); nm = A.class_get_name(k);
+    if (!sprefix(nm, "Dictionary`2")) return 0;
+    arr = ref_field(coll, "_entries"); if (!arr) arr = ref_field(coll, "entries");
+    if (!arr) return 0;
+    walk_struct_array(arr, int_field(coll, "_count", "count", NULL, -1), "value", cb, ctx);
+    return 1;
 }
 
 /* ───────────── итоговый JSON ───────────── */
@@ -249,6 +317,7 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
     b_s(&b, "{\"v\":2,\"ok\":"); b_int(&b, ok);
     b_s(&b, ",\"stage\":"); b_jstr(&b, why);
     b_s(&b, ",\"tick\":"); b_int(&b, (long)g_ticks);
+    b_s(&b, ",\"strm\":"); b_int(&b, g_streamN); b_s(&b, ",\"all\":"); b_int(&b, g_poolAll); b_s(&b, ",\"rx\":"); b_int(&b, g_np - g_streamN);   /* в PlayersInStream / всего в пуле / найдено обходом пула */
     b_s(&b, ",\"ago\":"); g_agoOff[next] = (int)b.n; b_s(&b, "       0");   /* 8 символов: при запросе сюда пишется «мс от тика до ответа» (пробелы перед числом в JSON допустимы) */
     g_tickAt[next] = g_tickNow;
     b_s(&b, ",\"me\":{\"id\":"); b_int(&b, meId); b_s(&b, ",\"src\":"); b_int(&b, g_meKind);
@@ -279,7 +348,7 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
         b_s(&b, ",\"ar\":"); b_fix(&b, p->ar, 0);
         b_s(&b, ",\"ping\":"); b_fix(&b, p->ping, 0);
         b_s(&b, ",\"score\":"); b_fix(&b, p->score, 0);
-        b_s(&b, ",\"veh\":"); b_int(&b, p->veh); b_s(&b, ",\"src\":"); b_int(&b, p->src);
+        b_s(&b, ",\"veh\":"); b_int(&b, p->veh); b_s(&b, ",\"src\":"); b_int(&b, p->src); b_s(&b, ",\"ins\":"); b_int(&b, p->ins);
         b_ch(&b, '}');
     }
     b_s(&b, "]}");
@@ -359,6 +428,24 @@ static void collect_tick(void) {
     if (!stream) { set_stage("PlayersInStream = null"); g_np = 0; publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
     g_np = 0;
     if (!walk_collection(stream, on_player, NULL)) { set_stage("неизвестный тип PlayersInStream — см. /diag"); publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
+    g_streamN = g_np;
+    if (g_ticks % NEAR_FB_EVERY == 0) {                  /* запасной обход всего пула: кто шлёт sync-пакеты, но не числится в PlayersInStream */
+        void* items = ref_field(pool, "m_Items");
+        g_nfbTmp = 0; g_poolAllTmp = 0;
+        if (walk_dict_values(items, on_pool_item, NULL)) { g_nfb = g_nfbTmp; g_poolAll = g_poolAllTmp; g_fbAt = g_tickNow; }
+        else { static int w; if (!w) { w = 1; dlog("near: BasePool.m_Items — не Dictionary, запасной обход выключен"); } g_nfb = 0; }
+    }
+    {
+        int i, j;
+        for (i = 0; i < g_nfb && g_np < MAXP; i++) {
+            int dup = 0;
+            for (j = 0; j < g_streamN; j++) if (g_pl[j].id == g_fb[i].id) { dup = 1; break; }
+            if (dup) continue;
+            g_pl[g_np] = g_fb[i];
+            g_pl[g_np].age += (int)(g_tickNow - g_fbAt);
+            g_np++;
+        }
+    }
     set_stage("работает");
     {   /* один раз покажем поля первого игрока — нужно, чтобы поправить код без пересборки догадок */
         static int once;
