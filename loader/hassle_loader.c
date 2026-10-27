@@ -452,10 +452,53 @@ static int try_use(void* env, const Manifest* m, int from_net) {
     return 1;
 }
 
+/* ───────────── переустановка мода по проверке файлов игры ─────────────
+   Игра при «проверке файлов» (и при ручном удалении resources_version.txt) заново качает ресурсы. Раз файл пропал — сбрасываем и кеш
+   мода: стираем bundle.so, manifest.txt, strikes.txt и качаем бандл с нуля (заодно снимается карантин).
+   Чтобы не угадывать путь вслепую: запоминаем маркером rv_seen.txt, что файл когда-то был найден. Пока маркера нет (файл ни разу не видели
+   по известным путям) — ничего не стираем, только пишем в loader.log, где искали. Стираем кеш только если удалось скачать manifest (иначе
+   без сети остались бы совсем без мода) — тогда попробуем при следующем запуске. */
+static int file_exists(const char* path) { int fd = open(path, 0); if (fd >= 0) { close(fd); return 1; } return 0; }
+static int find_rv(char* out, unsigned cap) {
+    static const char* const roots[] = { "/sdcard/Android/data/", "/storage/emulated/0/Android/data/", "/data/data/", 0 };
+    int i;
+    for (i = 0; roots[i]; i++) {
+        out[0] = 0; sapp(out, cap, roots[i]); sapp(out, cap, g_pkg); sapp(out, cap, "/files/resources_version.txt");
+        if (file_exists(out)) return 1;
+    }
+    out[0] = 0;
+    return 0;
+}
+/* 1 — надо переустановить мод (файл был, теперь нет) */
+static int rv_wants_reinstall(void) {
+    char rv[300], mk[340];
+    path_of(mk, sizeof mk, "rv_seen.txt");
+    if (find_rv(rv, sizeof rv)) {
+        if (!file_exists(mk)) {
+            int fd = open(mk, 0x241, 0600);
+            if (fd >= 0) { write(fd, "1\n", 2); close(fd); }
+            lg("resources_version.txt найден, слежу за ним: ", rv);
+        }
+        return 0;
+    }
+    if (file_exists(mk)) { lg("resources_version.txt пропал (проверка файлов игры) — мод будет установлен заново", ""); return 1; }
+    lg("resources_version.txt не найден по известным путям — слежение выключено", "");
+    return 0;
+}
+static void wipe_cache(void) {
+    char p[340];
+    path_of(p, sizeof p, "bundle.so"); unlink(p);
+    path_of(p, sizeof p, "manifest.txt"); unlink(p);
+    path_of(p, sizeof p, "strikes.txt"); unlink(p);
+    path_of(p, sizeof p, "rv_seen.txt"); unlink(p);
+    lg("кеш мода стёрт (bundle.so, manifest.txt, strikes.txt)", "");
+}
+
 static void run_loader(void* env) {
-    char url[400], p[340]; u8* mf = NULL; unsigned long mn = 0; Manifest net, cache; int have_cache = 0, done = 0;
+    char url[400], p[340]; u8* mf = NULL; unsigned long mn = 0; Manifest net, cache; int have_cache = 0, done = 0, force = 0;
     net.ok = 0; cache.ok = 0;
     if (!setup_dir()) { lg("нет папки для кеша (не определён пакет)", ""); return; }
+    force = rv_wants_reinstall();
     /* 1) manifest из сети */
     net.ok = 0;
     if (env) {
@@ -464,6 +507,10 @@ static void run_loader(void* env) {
         mf = http_get(env, url, HM_MAX_MANIFEST, &mn);
         if (mf) { parse_manifest(mf, mn, &net); if (!net.ok) lg("manifest скачан, но в нём нет записи для ", HM_ABI_KEY); free(mf); }
         else lg("manifest не скачался (нет сети?), попробую кеш", "");
+    }
+    if (force) {
+        if (net.ok) wipe_cache();
+        else lg("переустановка отложена: manifest не скачался, кеш оставляю до следующего запуска", "");
     }
     /* 2) manifest из кеша */
     path_of(p, sizeof p, "manifest.txt");
