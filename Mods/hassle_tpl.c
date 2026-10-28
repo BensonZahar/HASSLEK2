@@ -14,6 +14,9 @@
  *   /tpl pos             показать ваши координаты (и готовую команду «/tpl to …», чтобы вернуться сюда)
  *   /tpl to X Y Z        телепорт в точку по координатам, например «/tpl to 120.5 8 -340» (числа с минусом можно)
  *   /tpl to X Z          то же, но высота — по земле (игра сама найдёт поверхность в этой точке)
+ *   /tpl save дом        запомнить ТЕКУЩЕЕ место под именем «дом» (то же имя ещё раз — перезапись)
+ *   /tpl go дом          телепорт в сохранённую точку; короче: /tpl дом (если такая точка есть)
+ *   /tpl list [стр]      список точек с расстоянием от вас (по 10 на странице);  /tpl del дом — удалить точку
  *   /tpl alt             переключить способ телепорта (запасной — через движение персонажа); если /tpl «не двигает», попробуйте его.
  *                        «/tpl alt 3 назад» — переключить И сразу прыгнуть
  *   /tpl status          какой способ сейчас выбран;  /tpl help — подсказка
@@ -22,6 +25,12 @@
  * Как это работает
  *   • Координаты — это Transform.position игрока в мире Unity (та же система, в которой работает SetPosition). Если координаты из пакета
  *     синхронизации (то, что уходит на сервер) заметно отличаются от них, «/tpl pos» покажет и их отдельной строкой.
+ *   • Точки лежат в файле HLOG/tpl_points.txt (рядом с konstt.log, как route.txt), по строке «имя x y z», и переживают перезапуск игры.
+ *     Файл можно править руками. До 64 точек; имя — одно слово до 31 байта (≈15 русских букв), регистр не важен. Сохранение пишет
+ *     временный файл и переименовывает его, поэтому вылет посреди записи старый список не портит.
+ *     Точка — это те же координаты, что показывает «/tpl pos», а «/tpl go» = «/tpl to» с этими координатами (в машине не работает).
+ *   • Имя можно писать до слова-команды: «/tpl дом save». Если имя совпадает со словом-командой или числом («влево», «pos», «5»),
+ *     короткая форма «/tpl имя» не сработает — тогда «/tpl go имя» (мод сам предупредит при сохранении).
  *   • Стороны — относительно КАМЕРЫ (как вы видите экран): берём Transform.right у MainCamera, обнуляем высоту, нормализуем.
  *     «Вперёд» получаем поворотом «вправо» на 90° вокруг вертикали (камера может смотреть вниз — Transform.forward тогда вырожден).
  *     Если камеры нет — берём Transform.right самого игрока.
@@ -41,6 +50,11 @@
 #define TPL_MIN 0.3f
 #define TPL_MAX 100000.0f                                /* не «лимит», а страховка: больше — бесконечность/мусор для Unity (его собственный предел координат ~100000) */
 
+#define TPL_NAME 32                                      /* имя точки: до 31 байта + ноль */
+#define TPL_MAXP 64                                      /* точек всего */
+#define TPL_PAGE 10                                      /* строк на странице /tpl list */
+#define TPL_PTS_FILE "tpl_points.txt"
+
 enum { TPL_L = 0, TPL_R = 1, TPL_F = 2, TPL_B = 3 };
 static const char* const g_tpl_sideName[4] = { "влево", "вправо", "вперёд", "назад" };
 
@@ -50,6 +64,18 @@ static int g_tpl_modId = -1;                             /* номер в рее
 /* ───────────── мелкие помощники ───────────── */
 static int tpl_finite(const float* v) {
     return v[0] == v[0] && v[1] == v[1] && v[2] == v[2] && v[0] < 1e7f && v[0] > -1e7f && v[1] < 1e7f && v[1] > -1e7f && v[2] < 1e7f && v[2] > -1e7f;
+}
+/* копия токена в имя точки (до cap-1 байт). Обрезка не рвёт русскую букву пополам, управляющие символы (в т.ч. табуляция, ломающая файл) → «_» */
+static void tpl_copy_name(char* dst, const char* src, int cap) {
+    int i = 0, last = -1;
+    for (; src[i] && i < cap - 1; i++) dst[i] = ((u8)src[i] < 0x20 || (u8)src[i] == 0x7F) ? '_' : src[i];
+    dst[i] = 0;
+    for (i = 0; dst[i]; i++) if (((u8)dst[i] & 0xC0) != 0x80) last = i;      /* начало последнего символа */
+    if (last >= 0) {
+        u8 c = (u8)dst[last]; int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1, have = 0;
+        while (dst[last + have]) have++;
+        if (have < need) dst[last] = 0;
+    }
 }
 /* метод без аргументов, вернувший ссылочный объект (Transform, GameObject…) */
 static void* tpl_obj(void* obj, const char* name) {
@@ -129,19 +155,26 @@ static int tpl_call_set(void* obj, const float* pos, u8 flag, const char* what) 
 /* ───────────── общая часть: найти игрока и его компоненты (главный поток) ───────────── */
 typedef struct { void *me, *mv, *etr, *mtr; } TplCtx;
 /* needOnFoot=1 — для телепорта: в машине нельзя. Сама пишет в чат, почему не вышло. 1 — можно работать. */
-static int tpl_ctx(TplCtx* c, int needOnFoot) {
+static int tpl_ctx_q(TplCtx* c, int needOnFoot, int quiet) {          /* quiet=1 — ничего не писать в чат (для списка точек) */
     c->me = c->mv = c->etr = c->mtr = NULL;
-    if (!g_safe || !il2cpp_light()) { chat_say("Телепорт: игра ещё грузится, подождите"); return 0; }
+    if (!g_safe || !il2cpp_light()) { if (!quiet) chat_say("Телепорт: игра ещё грузится, подождите"); return 0; }
     ensure_attached();
     c->me = local_player();
-    if (!c->me || !hm_obj_ok(c->me)) { chat_say("Телепорт: вы не в игре (персонаж не создан)"); return 0; }
-    if (needOnFoot && ref_field_s(c->me, "Vehicle")) { chat_say("Телепорт: в машине не работает — сначала выйдите"); return 0; }
+    if (!c->me || !hm_obj_ok(c->me)) { if (!quiet) chat_say("Телепорт: вы не в игре (персонаж не создан)"); return 0; }
+    if (needOnFoot && ref_field_s(c->me, "Vehicle")) { if (!quiet) chat_say("Телепорт: в машине не работает — сначала выйдите"); return 0; }
     c->etr = tpl_obj(c->me, "get_Transform");                    /* Entity.Transform */
     if (!c->etr) c->etr = tpl_obj(c->me, "get_transform");       /* запасной вариант: Component.transform */
     c->mv = tpl_movement(c->me);
     if (c->mv && hm_obj_ok(c->mv)) c->mtr = tpl_obj(c->mv, "get_transform");
     else c->mv = NULL;
     return 1;
+}
+static int tpl_ctx(TplCtx* c, int needOnFoot) { return tpl_ctx_q(c, needOnFoot, 0); }
+/* Где я сейчас: 1 — Transform.position (основное), 2 — из пакета синхронизации (запасное), 0 — не прочиталось */
+static int tpl_cur_pos(const TplCtx* c, float* p) {
+    if (c->etr && tpl_vec(c->etr, "get_position", p)) return 1;
+    if (c->mtr && tpl_vec(c->mtr, "get_position", p)) return 1;
+    return read_pos(c->me, p) ? 2 : 0;
 }
 /* Поставить игрока в точку. npE — позиция в системе Entity.Transform (для Player.SetPosition), npM — в системе transform движения
    (для запасного способа); любой может быть NULL. findH — искать высоту по земле (только основной способ). Возврат: 1 основной, 2 запасной, 0 не вышло. */
@@ -187,12 +220,10 @@ static float tpl_fabs(float v) { return v < 0 ? -v : v; }
 
 /* «/tpl pos»: где я. Основное — Transform.position; из пакета синхронизации (read_pos ядра) — если заметно отличается */
 static void tpl_show(void) {
-    TplCtx c; float p[3], sp[3]; int have = 0, haveS; Buf b; char msg[260];
+    TplCtx c; float p[3], sp[3]; int have, haveS; Buf b; char msg[260];
     if (!tpl_ctx(&c, 0)) return;
-    if (c.etr && tpl_vec(c.etr, "get_position", p)) have = 1;
-    else if (c.mtr && tpl_vec(c.mtr, "get_position", p)) have = 1;
-    haveS = read_pos(c.me, sp);
-    if (!have && haveS) { p[0] = sp[0]; p[1] = sp[1]; p[2] = sp[2]; have = 1; haveS = 0; }
+    have = tpl_cur_pos(&c, p);
+    haveS = (have == 1) && read_pos(c.me, sp);                    /* пакет синхронизации — для сравнения, только если основное прочиталось */
     if (!have) { chat_say("Координаты: не удалось прочитать (подробности в konstt.log)"); dlog("/tpl pos: ни Transform.position, ни пакет синхронизации не прочитались"); return; }
     b_init(&b, msg, sizeof msg);
     b_s(&b, "Координаты: "); tpl_b_xyz(&b, p); b_s(&b, "  — вернуться сюда: /tpl to "); tpl_b_xyz(&b, p);
@@ -206,7 +237,7 @@ static void tpl_show(void) {
     }
 }
 /* «/tpl to X Y Z» (nc = 3) или «/tpl to X Z» (nc = 2, высота по земле) */
-static void tpl_goto(const float* v, int nc) {
+static void tpl_goto(const float* v, int nc, const char* label) {
     TplCtx c; float eb[3], mb[3], ne[3], nm[3]; int haveE, haveM, via, i; Buf b; char msg[240];
     for (i = 0; i < nc; i++) if (!(v[i] == v[i]) || v[i] > TPL_MAX || v[i] < -TPL_MAX) { chat_say("Телепорт: координаты вне допустимого диапазона (±100000)"); return; }
     if (!tpl_ctx(&c, 1)) return;
@@ -222,7 +253,9 @@ static void tpl_goto(const float* v, int nc) {
     via = tpl_place(&c, ne, nm, nc == 2 ? 1 : 0);
     if (!via) { tpl_fail(); return; }
     b_init(&b, msg, sizeof msg);
-    b_s(&b, "Телепорт на "); tpl_b_xyz(&b, ne);
+    b_s(&b, "Телепорт на ");
+    if (label) { b_s(&b, "точку «"); b_s(&b, label); b_s(&b, "»: "); }
+    tpl_b_xyz(&b, ne);
     if (nc == 2) b_s(&b, " (высота по земле)");
     if (haveE) {
         double dx = ne[0] - eb[0], dy = ne[1] - eb[1], dz = ne[2] - eb[2];
@@ -234,7 +267,9 @@ static void tpl_goto(const float* v, int nc) {
 }
 
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc; float dist; float c[3]; } TplArgs;   /* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z */
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN; float dist; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
+/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя.  name — имя точки (слово после save/go/del);
+   unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
 
 /* UTF-8 в нижний регистр для кириллицы (ASCII свёртывает вызывающий): А–П → а–п, Р–Я → р–я, Ё → ё */
 static void tpl_fold(char* s) {
@@ -250,7 +285,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -262,6 +297,10 @@ static int tpl_word(const char* t) {
     if (seq(t, "help") || seq(t, "?")) return 12;
     if (seq(t, "pos") || seq(t, "coords") || seq(t, "coord") || seq(t, "где") || seq(t, "коорд") || seq(t, "координаты")) return 13;
     if (seq(t, "to") || seq(t, "goto") || seq(t, "на") || seq(t, "xyz")) return 14;
+    if (seq(t, "save") || seq(t, "set") || seq(t, "add") || seq(t, "сохр") || seq(t, "сохранить") || seq(t, "запомни") || seq(t, "запомнить")) return 15;
+    if (seq(t, "go") || seq(t, "иди") || seq(t, "вернуться")) return 16;
+    if (seq(t, "list") || seq(t, "ls") || seq(t, "points") || seq(t, "список") || seq(t, "точки")) return 17;
+    if (seq(t, "del") || seq(t, "delete") || seq(t, "rm") || seq(t, "remove") || seq(t, "удали") || seq(t, "удалить")) return 18;
     return -1;
 }
 /* вся строка — число («2», «2.5», «2,5»)? */
@@ -294,10 +333,18 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 12) a->help = 1;
     else if (w == 13) a->mode = 1;
     else if (w == 14) a->mode = 2;
+    else if (w == 15) a->mode = 3;
+    else if (w == 16) a->mode = 4;
+    else if (w == 17) a->mode = 5;
+    else if (w == 18) a->mode = 6;
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
     if (!tok[0] || tok[0] == '/' || seq(tok, "tpl")) return;       /* сама команда может входить в массив */
+    if ((a->mode == 3 || a->mode == 4 || a->mode == 6) && !a->nameSet) {   /* слово сразу после save/go/del — имя точки, что бы оно ни значило */
+        tpl_copy_name(a->name, tok, TPL_NAME); a->nameSet = a->name[0] ? 1 : 0;
+        return;
+    }
     if (a->mode == 2 && tpl_snum(tok, &v)) {                       /* после «to» числа — это координаты (с минусом можно) */
         if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
         return;
@@ -319,13 +366,18 @@ static void tpl_token(const char* tok, TplArgs* a) {
             break;
         }
     }
+    if (!a->unkN) tpl_copy_name(a->unk, tok, TPL_NAME);            /* неизвестное слово: возможно, имя точки */
+    a->unkN++;
     a->bad = 1;
+}
+static void tpl_args_init(TplArgs* a) {
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = 0; a->dist = TPL_DEF;
+    a->c[0] = a->c[1] = a->c[2] = 0.0f; a->name[0] = a->unk[0] = 0;
 }
 /* аргументы: string[] */
 static void tpl_parse(void* arr, TplArgs* a) {
     long len; int i; char* data;
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = 0; a->dist = TPL_DEF;
-    a->c[0] = a->c[1] = a->c[2] = 0.0f;
+    tpl_args_init(a);
     if (!arr) return;
     len = *(long*)((char*)arr + 3 * sizeof(void*));
     if (len < 0 || len > 16) return;
@@ -350,16 +402,190 @@ static void tpl_parse(void* arr, TplArgs* a) {
     if (a->dist > TPL_MAX) { a->dist = TPL_MAX; a->clamped = 1; }
 }
 
+/* ───────────── сохранённые точки ───────────── */
+typedef struct { char name[TPL_NAME]; float p[3]; } TplPt;
+static TplPt g_tpl_pts[TPL_MAXP];
+static int g_tpl_np, g_tpl_loaded;
+
+/* путь к файлу: папка журнала (HLOG) + имя, как у route.txt. 0 — журнал ещё не открыт/папки нет */
+static int tpl_pts_path(char* out, int cap) {
+    int i, last = -1; Buf b;
+    if (!g_flog[0]) return 0;
+    for (i = 0; g_flog[i]; i++) if (g_flog[i] == '/') last = i;
+    if (last < 0 || last + (int)sizeof TPL_PTS_FILE + 8 > cap) return 0;
+    b_init(&b, out, (unsigned)cap);
+    for (i = 0; i <= last; i++) b_ch(&b, g_flog[i]);
+    b_s(&b, TPL_PTS_FILE);
+    return 1;
+}
+/* одна строка файла «имя x y z» → точка; 1 — разобрано (лишнее и мусор пропускаются) */
+static int tpl_pts_line(const char* line, TplPt* out) {
+    char tok[4][40]; int n = 0, i = 0; float v[3];
+    while (line[i] && n < 5) {
+        int q = 0;
+        while (line[i] == ' ' || line[i] == '\t' || line[i] == '\r') i++;
+        if (!line[i]) break;
+        if (n == 4) return 0;                                       /* пятое слово — не наша строка */
+        while (line[i] && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') { if (q < 39) tok[n][q++] = line[i]; i++; }
+        tok[n][q] = 0; n++;
+    }
+    if (n != 4) return 0;
+    if (!tpl_snum(tok[1], &v[0]) || !tpl_snum(tok[2], &v[1]) || !tpl_snum(tok[3], &v[2])) return 0;
+    if (!tpl_finite(v)) return 0;
+    tpl_copy_name(out->name, tok[0], TPL_NAME);
+    tpl_fold(out->name);                                            /* файл правят руками: «Дом» = «дом» */
+    out->p[0] = v[0]; out->p[1] = v[1]; out->p[2] = v[2];
+    return out->name[0] ? 1 : 0;
+}
+static void tpl_pts_load(void) {
+    static char buf[8192]; char path[320]; int fd; long tot = 0; char* p;
+    if (g_tpl_loaded) return;
+    g_tpl_loaded = 1; g_tpl_np = 0;
+    if (!tpl_pts_path(path, sizeof path)) { g_tpl_loaded = 0; return; }      /* папки пока нет — попробуем в следующий раз */
+    fd = open(path, 0);
+    if (fd < 0) return;                                             /* файла ещё нет — точек нет */
+    for (;;) { long r = read(fd, buf + tot, sizeof buf - 1 - (unsigned long)tot); if (r <= 0) break; tot += r; if (tot >= (long)sizeof buf - 1) break; }
+    close(fd);
+    buf[tot] = 0;
+    for (p = buf; *p && g_tpl_np < TPL_MAXP; ) {
+        char* e = p; char keep;
+        while (*e && *e != '\n') e++;
+        keep = *e; *e = 0;
+        if (tpl_pts_line(p, &g_tpl_pts[g_tpl_np])) g_tpl_np++;
+        if (!keep) break;
+        p = e + 1;
+    }
+    dlog_i("/tpl: точек загружено из файла: ", g_tpl_np);
+}
+/* записать файл целиком и убедиться, что записалось всё */
+static int tpl_write_all(const char* path, const char* data, unsigned n) {
+    int fd = open(path, 0x241, 0666);                               /* O_WRONLY|O_CREAT|O_TRUNC */
+    long w;
+    if (fd < 0) return 0;
+    w = n ? write(fd, data, n) : 0;
+    close(fd);
+    return w == (long)n;
+}
+/* сохранить список: во временный файл, затем rename — вылет посреди записи старый файл не портит. 0 — не вышло (точки остаются в памяти до перезапуска) */
+static int tpl_pts_save(void) {
+    static char buf[8192]; char path[320], tmp[336]; Buf b, t; int i;
+    if (!tpl_pts_path(path, sizeof path)) return 0;
+    b_init(&b, buf, sizeof buf);
+    for (i = 0; i < g_tpl_np; i++) {
+        b_s(&b, g_tpl_pts[i].name); b_ch(&b, ' ');
+        b_fix(&b, g_tpl_pts[i].p[0], 3); b_ch(&b, ' '); b_fix(&b, g_tpl_pts[i].p[1], 3); b_ch(&b, ' '); b_fix(&b, g_tpl_pts[i].p[2], 3);
+        b_ch(&b, '\n');
+    }
+    b_init(&t, tmp, sizeof tmp); b_s(&t, path); b_s(&t, ".tmp");
+    if (tpl_write_all(tmp, b.p, b.n) && rename(tmp, path) == 0) return 1;
+    return tpl_write_all(path, b.p, b.n);                          /* rename не получился — пишем прямо */
+}
+static int tpl_find(const char* name) {
+    int i;
+    for (i = 0; i < g_tpl_np; i++) if (seq(g_tpl_pts[i].name, name)) return i;
+    return -1;
+}
+/* слово разбирается как команда/число (не как «неизвестное слово») → короткая форма «/tpl имя» для него не сработает */
+static int tpl_name_shadowed(const char* name) {
+    TplArgs t; tpl_args_init(&t); tpl_token(name, &t);
+    return !(t.bad && t.unkN == 1);
+}
+
+static void tpl_cmd_save(const char* name) {
+    TplCtx c; float p[3]; int i, upd, saved, src; Buf b; char msg[300];
+    if (!tpl_ctx(&c, 0)) return;
+    src = tpl_cur_pos(&c, p);
+    if (!src) { chat_say("Точка: не удалось прочитать ваши координаты (подробности в konstt.log)"); return; }
+    tpl_pts_load();
+    i = tpl_find(name); upd = i >= 0;
+    if (!upd) {
+        if (g_tpl_np >= TPL_MAXP) { chat_say("Точка: уже 64 точки — удалите ненужные (/tpl del имя)"); return; }
+        i = g_tpl_np++;
+        tpl_copy_name(g_tpl_pts[i].name, name, TPL_NAME);
+    }
+    g_tpl_pts[i].p[0] = p[0]; g_tpl_pts[i].p[1] = p[1]; g_tpl_pts[i].p[2] = p[2];
+    saved = tpl_pts_save();
+    b_init(&b, msg, sizeof msg);
+    b_s(&b, "Точка «"); b_s(&b, g_tpl_pts[i].name); b_s(&b, upd ? "» обновлена: " : "» сохранена: "); tpl_b_xyz(&b, p);
+    b_s(&b, ". Вернуться: /tpl go "); b_s(&b, g_tpl_pts[i].name);
+    if (tpl_name_shadowed(g_tpl_pts[i].name)) b_s(&b, " (коротко «/tpl имя» для этого слова не сработает)");
+    if (!saved) b_s(&b, " — В ФАЙЛ ЗАПИСАТЬ НЕ УДАЛОСЬ, точка живёт до перезапуска игры");
+    chat_say(msg);
+    dlog2("/tpl: ", msg);
+    if (src == 2) dlog("/tpl save: позиция взята из пакета синхронизации (Transform не прочитался)");
+}
+static void tpl_cmd_go(const char* name) {
+    int i;
+    tpl_pts_load();
+    i = tpl_find(name);
+    if (i < 0) {
+        char msg[120]; Buf b; b_init(&b, msg, sizeof msg);
+        b_s(&b, "Точки «"); b_s(&b, name); b_s(&b, "» нет. Список: /tpl list");
+        chat_say(msg); return;
+    }
+    tpl_goto(g_tpl_pts[i].p, 3, g_tpl_pts[i].name);
+}
+static void tpl_cmd_del(const char* name) {
+    int i, saved; char msg[160]; Buf b;
+    tpl_pts_load();
+    i = tpl_find(name);
+    b_init(&b, msg, sizeof msg);
+    if (i < 0) { b_s(&b, "Точки «"); b_s(&b, name); b_s(&b, "» нет. Список: /tpl list"); chat_say(msg); return; }
+    b_s(&b, "Точка «"); b_s(&b, g_tpl_pts[i].name); b_s(&b, "» удалена");
+    for (; i + 1 < g_tpl_np; i++) g_tpl_pts[i] = g_tpl_pts[i + 1];
+    g_tpl_np--;
+    saved = tpl_pts_save();
+    if (!saved) b_s(&b, " (файл обновить не удалось)");
+    chat_say(msg);
+}
+static void tpl_cmd_list(int page) {
+    TplCtx c; float me[3]; int i, from, to, pages, haveMe = 0; char msg[220]; Buf b;
+    tpl_pts_load();
+    if (!g_tpl_np) { chat_say("Точек нет. Сохранить текущее место: /tpl save имя"); return; }
+    pages = (g_tpl_np + TPL_PAGE - 1) / TPL_PAGE;
+    if (page < 1) page = 1;
+    if (page > pages) page = pages;
+    from = (page - 1) * TPL_PAGE; to = from + TPL_PAGE; if (to > g_tpl_np) to = g_tpl_np;
+    if (tpl_ctx_q(&c, 0, 1)) haveMe = tpl_cur_pos(&c, me) == 1;     /* вне игры список всё равно показываем, только без расстояний */
+    b_init(&b, msg, sizeof msg); b_s(&b, "Точки: "); b_int(&b, g_tpl_np);
+    if (pages > 1) { b_s(&b, ", страница "); b_int(&b, page); b_s(&b, " из "); b_int(&b, pages); }
+    chat_say(msg);
+    for (i = from; i < to; i++) {
+        b_init(&b, msg, sizeof msg);
+        b_s(&b, "«"); b_s(&b, g_tpl_pts[i].name); b_s(&b, "»: "); tpl_b_xyz(&b, g_tpl_pts[i].p);
+        if (haveMe) {
+            double dx = g_tpl_pts[i].p[0] - me[0], dy = g_tpl_pts[i].p[1] - me[1], dz = g_tpl_pts[i].p[2] - me[2];
+            b_s(&b, " — в "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 0); b_s(&b, " м");
+        }
+        chat_say(msg);
+    }
+    if (page < pages) { b_init(&b, msg, sizeof msg); b_s(&b, "Дальше: /tpl list "); b_int(&b, page + 1); chat_usage(msg); }
+}
+
 /* ───────────── команда ───────────── */
 static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
+    chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
 static void native_tpl_cmd(void* self, void* args, void* mi) {
     TplArgs a;
     (void)self; (void)mi;
     tpl_parse(args, &a);
+    if (a.bad && a.unkN == 1) {                                     /* одно незнакомое слово — возможно, имя точки */
+        if ((a.mode == 3 || a.mode == 4 || a.mode == 6) && !a.nameSet) {            /* «/tpl дом save» — имя стоит перед командой */
+            tpl_copy_name(a.name, a.unk, TPL_NAME); a.nameSet = a.name[0] ? 1 : 0; a.bad = !a.nameSet;
+        } else if (!a.mode && !a.numSet && !a.sideSet && !a.status && !a.help) {   /* «/tpl дом» — сокращение от «/tpl go дом» */
+            tpl_pts_load();
+            if (tpl_find(a.unk) >= 0) { a.mode = 4; tpl_copy_name(a.name, a.unk, TPL_NAME); a.nameSet = 1; a.bad = 0; }
+            else {
+                char m[120]; Buf mb; b_init(&mb, m, sizeof m);
+                b_s(&mb, "«"); b_s(&mb, a.unk); b_s(&mb, "» — не команда и не сохранённая точка (список точек: /tpl list)");
+                chat_say(m); tpl_usage(); return;
+            }
+        }
+    }
     if (a.bad || a.help) { tpl_usage(); return; }
     if (a.alt) {
         g_tpl_alt = !g_tpl_alt;
@@ -373,7 +599,13 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
     if (a.mode == 1) { tpl_show(); return; }
     if (a.mode == 2) {
         if (a.nc != 2 && a.nc != 3) { chat_usage("Нужно 3 числа: /tpl to X Y Z (или 2 числа X Z — высота по земле). Числа с минусом можно, например /tpl to 120.5 8 -340"); return; }
-        tpl_goto(a.c, a.nc);
+        tpl_goto(a.c, a.nc, NULL);
+        return;
+    }
+    if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
+    if (a.mode == 3 || a.mode == 4 || a.mode == 6) {
+        if (!a.nameSet) { chat_usage(a.mode == 3 ? "Укажите имя точки: /tpl save дом" : a.mode == 4 ? "Укажите имя точки: /tpl go дом (список: /tpl list)" : "Укажите имя точки: /tpl del дом (список: /tpl list)"); return; }
+        if (a.mode == 3) tpl_cmd_save(a.name); else if (a.mode == 4) tpl_cmd_go(a.name); else tpl_cmd_del(a.name);
         return;
     }
     { char lg[80]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: вызвана, сторона "); b_s(&x, g_tpl_sideName[a.side]); b_s(&x, ", метров "); b_fix(&x, a.dist, 1); dlog(lg); }
@@ -385,7 +617,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя");
     return NULL;
 }
 #ifndef KONSTT_TEST
