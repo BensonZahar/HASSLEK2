@@ -11,12 +11,17 @@
  *   /tpl назад 2         назад на 2 м
  *   /tpl right 4         вправо на 4 м;  слитно тоже можно: /tpl вправо4, /tpl f3
  *   стороны:  влево | left | l   вправо | right | r   вперёд (вперед) | forward | fwd | f   назад | back | b
+ *   /tpl pos             показать ваши координаты (и готовую команду «/tpl to …», чтобы вернуться сюда)
+ *   /tpl to X Y Z        телепорт в точку по координатам, например «/tpl to 120.5 8 -340» (числа с минусом можно)
+ *   /tpl to X Z          то же, но высота — по земле (игра сама найдёт поверхность в этой точке)
  *   /tpl alt             переключить способ телепорта (запасной — через движение персонажа); если /tpl «не двигает», попробуйте его.
  *                        «/tpl alt 3 назад» — переключить И сразу прыгнуть
  *   /tpl status          какой способ сейчас выбран;  /tpl help — подсказка
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
  *
  * Как это работает
+ *   • Координаты — это Transform.position игрока в мире Unity (та же система, в которой работает SetPosition). Если координаты из пакета
+ *     синхронизации (то, что уходит на сервер) заметно отличаются от них, «/tpl pos» покажет и их отдельной строкой.
  *   • Стороны — относительно КАМЕРЫ (как вы видите экран): берём Transform.right у MainCamera, обнуляем высоту, нормализуем.
  *     «Вперёд» получаем поворотом «вправо» на 90° вокруг вертикали (камера может смотреть вниз — Transform.forward тогда вырожден).
  *     Если камеры нет — берём Transform.right самого игрока.
@@ -121,37 +126,48 @@ static int tpl_call_set(void* obj, const float* pos, u8 flag, const char* what) 
     return 1;
 }
 
-/* ───────────── сам телепорт (главный поток) ───────────── */
-static void tpl_go(int side, float dist, int clamped) {
-    void *me, *mv = NULL, *etr, *mtr = NULL; float R[3], dir[3], base[3], np[3]; int src = 0, ok = 0, via = 0; Buf b; char msg[240];
-    if (!g_safe || !il2cpp_light()) { chat_say("Телепорт: игра ещё грузится, подождите"); return; }
+/* ───────────── общая часть: найти игрока и его компоненты (главный поток) ───────────── */
+typedef struct { void *me, *mv, *etr, *mtr; } TplCtx;
+/* needOnFoot=1 — для телепорта: в машине нельзя. Сама пишет в чат, почему не вышло. 1 — можно работать. */
+static int tpl_ctx(TplCtx* c, int needOnFoot) {
+    c->me = c->mv = c->etr = c->mtr = NULL;
+    if (!g_safe || !il2cpp_light()) { chat_say("Телепорт: игра ещё грузится, подождите"); return 0; }
     ensure_attached();
-    me = local_player();
-    if (!me || !hm_obj_ok(me)) { chat_say("Телепорт: вы не в игре (персонаж не создан)"); return; }
-    if (ref_field_s(me, "Vehicle")) { chat_say("Телепорт: в машине не работает — сначала выйдите"); return; }
-    etr = tpl_obj(me, "get_Transform");                  /* Entity.Transform */
-    if (!etr) etr = tpl_obj(me, "get_transform");        /* запасной вариант: Component.transform */
-    mv = tpl_movement(me);
-    if (mv && hm_obj_ok(mv)) mtr = tpl_obj(mv, "get_transform");
-    if (!tpl_right_dir(etr ? etr : mtr, R, &src)) { chat_say("Телепорт: не удалось определить стороны (нет камеры и трансформа игрока)"); return; }
-    tpl_side_dir(R, side, dir);
+    c->me = local_player();
+    if (!c->me || !hm_obj_ok(c->me)) { chat_say("Телепорт: вы не в игре (персонаж не создан)"); return 0; }
+    if (needOnFoot && ref_field_s(c->me, "Vehicle")) { chat_say("Телепорт: в машине не работает — сначала выйдите"); return 0; }
+    c->etr = tpl_obj(c->me, "get_Transform");                    /* Entity.Transform */
+    if (!c->etr) c->etr = tpl_obj(c->me, "get_transform");       /* запасной вариант: Component.transform */
+    c->mv = tpl_movement(c->me);
+    if (c->mv && hm_obj_ok(c->mv)) c->mtr = tpl_obj(c->mv, "get_transform");
+    else c->mv = NULL;
+    return 1;
+}
+/* Поставить игрока в точку. npE — позиция в системе Entity.Transform (для Player.SetPosition), npM — в системе transform движения
+   (для запасного способа); любой может быть NULL. findH — искать высоту по земле (только основной способ). Возврат: 1 основной, 2 запасной, 0 не вышло. */
+static int tpl_place(const TplCtx* c, const float* npE, const float* npM, u8 findH) {
+    if (!g_tpl_alt && npE) {
+        if (tpl_call_set(c->me, npE, findH, "Player")) return 1;
+        dlog("/tpl: основной способ не вышел, пробую запасной (через движение)");
+    }
+    if (npM && c->mv && tpl_call_set(c->mv, npM, 1, "движению")) return 2;
+    return 0;
+}
+static void tpl_fail(void) { chat_say("Телепорт: не вышло — подробности в konstt.log. Попробуйте /tpl alt"); }
 
-    /* способ 1 (основной): Player.SetPosition, позиция — Entity.Transform */
-    if (!g_tpl_alt && etr && tpl_vec(etr, "get_position", base)) {
-        np[0] = base[0] + dir[0] * dist; np[1] = base[1]; np[2] = base[2] + dir[2] * dist;
-        if (tpl_call_set(me, np, 0, "Player")) { ok = 1; via = 1; }
-        else dlog("/tpl: основной способ не вышел, пробую запасной (через движение)");
-    }
-    /* способ 2 (запасной): ICharacterMovement.SetPosition, позиция — transform компонента движения */
-    if (!ok && mv && mtr && tpl_vec(mtr, "get_position", base)) {
-        np[0] = base[0] + dir[0] * dist; np[1] = base[1]; np[2] = base[2] + dir[2] * dist;
-        if (tpl_call_set(mv, np, 1, "движению")) { ok = 1; via = 2; }
-    }
+/* ───────────── сдвиг в сторону ───────────── */
+static void tpl_go(int side, float dist, int clamped) {
+    TplCtx c; float R[3], dir[3], eb[3], mb[3], ne[3], nm[3]; int src = 0, haveE, haveM, via; Buf b; char msg[240];
+    if (!tpl_ctx(&c, 1)) return;
+    if (!tpl_right_dir(c.etr ? c.etr : c.mtr, R, &src)) { chat_say("Телепорт: не удалось определить стороны (нет камеры и трансформа игрока)"); return; }
+    tpl_side_dir(R, side, dir);
+    haveE = c.etr && tpl_vec(c.etr, "get_position", eb);          /* Player.SetPosition: позиция — Entity.Transform */
+    haveM = c.mtr && tpl_vec(c.mtr, "get_position", mb);          /* запасной способ: позиция — transform компонента движения */
+    if (haveE) { ne[0] = eb[0] + dir[0] * dist; ne[1] = eb[1]; ne[2] = eb[2] + dir[2] * dist; }
+    if (haveM) { nm[0] = mb[0] + dir[0] * dist; nm[1] = mb[1]; nm[2] = mb[2] + dir[2] * dist; }
+    via = tpl_place(&c, haveE ? ne : NULL, haveM ? nm : NULL, 0);
+    if (!via) { tpl_fail(); return; }
     b_init(&b, msg, sizeof msg);
-    if (!ok) {
-        b_s(&b, "Телепорт: не вышло — подробности в konstt.log. Попробуйте /tpl alt");
-        chat_say(msg); return;
-    }
     b_s(&b, "Телепорт "); b_s(&b, g_tpl_sideName[side]); b_s(&b, " на "); b_fix(&b, dist, 1); b_s(&b, " м");
     if (clamped) b_s(&b, " (максимум)");
     b_s(&b, src == 1 ? " (по камере)" : " (по повороту персонажа, камера не найдена)");
@@ -165,8 +181,60 @@ static void tpl_go(int side, float dist, int clamped) {
     }
 }
 
+/* ───────────── координаты ───────────── */
+static void tpl_b_xyz(Buf* b, const float* p) { b_fix(b, p[0], 1); b_ch(b, ' '); b_fix(b, p[1], 1); b_ch(b, ' '); b_fix(b, p[2], 1); }
+static float tpl_fabs(float v) { return v < 0 ? -v : v; }
+
+/* «/tpl pos»: где я. Основное — Transform.position; из пакета синхронизации (read_pos ядра) — если заметно отличается */
+static void tpl_show(void) {
+    TplCtx c; float p[3], sp[3]; int have = 0, haveS; Buf b; char msg[260];
+    if (!tpl_ctx(&c, 0)) return;
+    if (c.etr && tpl_vec(c.etr, "get_position", p)) have = 1;
+    else if (c.mtr && tpl_vec(c.mtr, "get_position", p)) have = 1;
+    haveS = read_pos(c.me, sp);
+    if (!have && haveS) { p[0] = sp[0]; p[1] = sp[1]; p[2] = sp[2]; have = 1; haveS = 0; }
+    if (!have) { chat_say("Координаты: не удалось прочитать (подробности в konstt.log)"); dlog("/tpl pos: ни Transform.position, ни пакет синхронизации не прочитались"); return; }
+    b_init(&b, msg, sizeof msg);
+    b_s(&b, "Координаты: "); tpl_b_xyz(&b, p); b_s(&b, "  — вернуться сюда: /tpl to "); tpl_b_xyz(&b, p);
+    chat_say(msg);
+    dlog2("/tpl pos: ", msg);
+    if (haveS && (tpl_fabs(sp[0] - p[0]) > 0.5f || tpl_fabs(sp[1] - p[1]) > 0.5f || tpl_fabs(sp[2] - p[2]) > 0.5f)) {
+        b_init(&b, msg, sizeof msg);
+        b_s(&b, "По пакету синхронизации (как видит сервер): "); tpl_b_xyz(&b, sp);
+        chat_say(msg);
+        dlog2("/tpl pos: ", msg);
+    }
+}
+/* «/tpl to X Y Z» (nc = 3) или «/tpl to X Z» (nc = 2, высота по земле) */
+static void tpl_goto(const float* v, int nc) {
+    TplCtx c; float eb[3], mb[3], ne[3], nm[3]; int haveE, haveM, via, i; Buf b; char msg[240];
+    for (i = 0; i < nc; i++) if (!(v[i] == v[i]) || v[i] > TPL_MAX || v[i] < -TPL_MAX) { chat_say("Телепорт: координаты вне допустимого диапазона (±100000)"); return; }
+    if (!tpl_ctx(&c, 1)) return;
+    haveE = c.etr && tpl_vec(c.etr, "get_position", eb);
+    haveM = c.mtr && tpl_vec(c.mtr, "get_position", mb);
+    if (nc == 3) { ne[0] = v[0]; ne[1] = v[1]; ne[2] = v[2]; }
+    else {                                                         /* X Z: высоту берём текущую, а Player.SetPosition ищет землю */
+        if (!haveE && !haveM) { chat_say("Телепорт: не удалось прочитать вашу высоту — укажите все три числа: /tpl to X Y Z"); return; }
+        ne[0] = v[0]; ne[1] = haveE ? eb[1] : mb[1]; ne[2] = v[1];
+    }
+    nm[0] = ne[0]; nm[1] = ne[1]; nm[2] = ne[2];
+    if (haveE && haveM) { nm[0] += mb[0] - eb[0]; nm[1] += mb[1] - eb[1]; nm[2] += mb[2] - eb[2]; }   /* перевод в систему transform движения */
+    via = tpl_place(&c, ne, nm, nc == 2 ? 1 : 0);
+    if (!via) { tpl_fail(); return; }
+    b_init(&b, msg, sizeof msg);
+    b_s(&b, "Телепорт на "); tpl_b_xyz(&b, ne);
+    if (nc == 2) b_s(&b, " (высота по земле)");
+    if (haveE) {
+        double dx = ne[0] - eb[0], dy = ne[1] - eb[1], dz = ne[2] - eb[2];
+        b_s(&b, ", это в "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 1); b_s(&b, " м от вас");
+    }
+    if (via == 2) b_s(&b, " [через движение]");
+    chat_say(msg);
+    dlog2("/tpl: ", msg);
+}
+
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped; float dist; } TplArgs;
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc; float dist; float c[3]; } TplArgs;   /* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z */
 
 /* UTF-8 в нижний регистр для кириллицы (ASCII свёртывает вызывающий): А–П → а–п, Р–Я → р–я, Ё → ё */
 static void tpl_fold(char* s) {
@@ -182,7 +250,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -192,6 +260,8 @@ static int tpl_word(const char* t) {
     if (seq(t, "alt")) return 10;
     if (seq(t, "status") || seq(t, "diag")) return 11;
     if (seq(t, "help") || seq(t, "?")) return 12;
+    if (seq(t, "pos") || seq(t, "coords") || seq(t, "coord") || seq(t, "где") || seq(t, "коорд") || seq(t, "координаты")) return 13;
+    if (seq(t, "to") || seq(t, "goto") || seq(t, "на") || seq(t, "xyz")) return 14;
     return -1;
 }
 /* вся строка — число («2», «2.5», «2,5»)? */
@@ -209,15 +279,29 @@ static int tpl_num(const char* t, float* out) {
     *out = v;
     return 1;
 }
+/* число со знаком («-340», «+5», «12.5») — для координат */
+static int tpl_snum(const char* t, float* out) {
+    int neg = 0; float v;
+    if (*t == '-') { neg = 1; t++; } else if (*t == '+') t++;
+    if (!tpl_num(t, &v)) return 0;
+    *out = neg ? -v : v;
+    return 1;
+}
 static void tpl_apply_word(int w, TplArgs* a) {
     if (w >= 0 && w <= 3) { a->side = w; a->sideSet = 1; }
     else if (w == 10) a->alt = 1;
     else if (w == 11) a->status = 1;
     else if (w == 12) a->help = 1;
+    else if (w == 13) a->mode = 1;
+    else if (w == 14) a->mode = 2;
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
     if (!tok[0] || tok[0] == '/' || seq(tok, "tpl")) return;       /* сама команда может входить в массив */
+    if (a->mode == 2 && tpl_snum(tok, &v)) {                       /* после «to» числа — это координаты (с минусом можно) */
+        if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
+        return;
+    }
     if (tpl_num(tok, &v)) { if (!a->numSet) { a->dist = v; a->numSet = 1; } return; }
     w = tpl_word(tok);
     if (w >= 0) { tpl_apply_word(w, a); return; }
@@ -240,7 +324,8 @@ static void tpl_token(const char* tok, TplArgs* a) {
 /* аргументы: string[] */
 static void tpl_parse(void* arr, TplArgs* a) {
     long len; int i; char* data;
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = 0; a->dist = TPL_DEF;
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = 0; a->dist = TPL_DEF;
+    a->c[0] = a->c[1] = a->c[2] = 0.0f;
     if (!arr) return;
     len = *(long*)((char*)arr + 3 * sizeof(void*));
     if (len < 0 || len > 16) return;
@@ -267,7 +352,8 @@ static void tpl_parse(void* arr, TplArgs* a) {
 
 /* ───────────── команда ───────────── */
 static void tpl_usage(void) {
-    chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4». По умолчанию влево 1.5 м. /tpl alt — другой способ");
+    chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
+    chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
 static void native_tpl_cmd(void* self, void* args, void* mi) {
@@ -278,10 +364,16 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
     if (a.alt) {
         g_tpl_alt = !g_tpl_alt;
         chat_say(g_tpl_alt ? "Телепорт: способ — через движение персонажа (запасной)" : "Телепорт: способ — Player.SetPosition (основной)");
-        if (!a.status && !a.numSet && !a.sideSet) return;            /* «/tpl alt» без стороны и числа только переключает, без прыжка */
+        if (!a.status && !a.numSet && !a.sideSet && !a.mode) return;  /* «/tpl alt» без стороны, числа и pos/to только переключает, без прыжка */
     }
     if (a.status) {
         chat_say(g_tpl_alt ? "Телепорт: сейчас способ «через движение» (/tpl alt — вернуть основной)" : "Телепорт: сейчас основной способ Player.SetPosition (/tpl alt — запасной)");
+        return;
+    }
+    if (a.mode == 1) { tpl_show(); return; }
+    if (a.mode == 2) {
+        if (a.nc != 2 && a.nc != 3) { chat_usage("Нужно 3 числа: /tpl to X Y Z (или 2 числа X Z — высота по земле). Числа с минусом можно, например /tpl to 120.5 8 -340"); return; }
+        tpl_goto(a.c, a.nc);
         return;
     }
     { char lg[80]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: вызвана, сторона "); b_s(&x, g_tpl_sideName[a.side]); b_s(&x, ", метров "); b_fix(&x, a.dist, 1); dlog(lg); }
@@ -293,7 +385,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [влево|вправо|вперёд|назад] [метры]");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z");
     return NULL;
 }
 #ifndef KONSTT_TEST
