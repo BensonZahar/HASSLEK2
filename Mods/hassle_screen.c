@@ -24,13 +24,28 @@
  *                                 need_cmd — подписка на кадр ещё не сделана (первый раз после запуска игры): скрипт шлёт в чат «/screen 0».
  *       GET /screen/last          PNG последнего удачного снимка (image/png)
  *       GET /screen/tg?k=&c=&doc=&cap=  мод сам шлёт последний снимок в Telegram (JNI → HttpURLConnection): {"ok":true,"id":N}
- *       GET /screen/tgstatus      {"id","state":1 идёт|2 готово|3 ошибка,"code","msg"} — результат отправки
+ *                                 Live: + &m=<message_id> — заменить картинку в том сообщении (editMessageMedia) вместо нового фото,
+ *                                 + &kb=<reply_markup JSON, urlencoded, только ASCII> — кнопки под фото; /screen/shot?live=1 — кадр на холст SCR_LIVE_W x SCR_LIVE_H.
+ *       GET /screen/tgstatus      {"id","state":1 идёт|2 готово|3 ошибка,"mid" (message_id),"code","msg"} — результат отправки
  *                                 (в WebView игры XHR не умеет бинарные POST, поэтому отправка — на стороне мода)
  *   • Снимки по HTTP-заявке всегда пишутся в <HLOG>/shots/remote.png (перезаписывается), чтобы удалённый просмотр не копил файлы.
  *     Файл пишется во временный .tmp и переименовывается — читатель никогда не увидит недописанный PNG.
  */
 #pragma once
 #include "hassle_core.c"
+
+/* Единый размер снимка.
+ *   Размер кадра = размер ОКНА игры (Screen.width/height). В разделённом экране эмулятора (MEmu) окно узкое, и снимок раньше
+ *   получался таким же узким (например 633x720). Теперь любой кадр вписывается в холст SCR_OUT_W x SCR_OUT_H с сохранением пропорций:
+ *   кадр меньше холста — растягивается (билинейно), больше — сжимается (усреднением), свободное место — чёрные поля.
+ *   Раскладку интерфейса это не меняет: HUD игра рисует под текущую форму окна, «как в полноэкранном режиме» её не вернуть.
+ *   SCR_NORMALIZE 0 — вернуть прежнее поведение (снимок в размере окна). */
+#define SCR_NORMALIZE 1
+#define SCR_OUT_W 1280
+#define SCR_OUT_H 720
+/* Холст для Live-режима в Telegram: кадр меньше — PNG легче, загрузка и кодирование быстрее */
+#define SCR_LIVE_W 854
+#define SCR_LIVE_H 480
 
 #define SCR_DEF_DELAY_S 3
 #define SCR_MAX_DELAY_S 30
@@ -48,8 +63,10 @@ static volatile int g_scr_fails;             /* сколько снимков н
 static volatile int g_scr_doneSeq;           /* номер последнего удачного снимка (0 — ещё не было) */
 static volatile long g_scr_lastLen;          /* длина PNG последнего удачного снимка */
 static int g_scr_httpPort;
+static volatile int g_scr_remoteLive;        /* 1 — заявка по HTTP с live=1: снимаем на холст SCR_LIVE_W x SCR_LIVE_H */
 static void *g_scr_kTex, *g_scr_kRPM;
 static void *g_scr_mW, *g_scr_mH, *g_scr_mCtor, *g_scr_mRead, *g_scr_mPng, *g_scr_mDestroy;
+static void *g_scr_mGetPx, *g_scr_mSetPx;      /* GetPixels32() / SetPixels32(Color32[]) — для приведения к единому размеру (не обязательны) */
 
 static int scr_resolve(void) {
     void *core, *icm, *kScr, *kObj, *kIC;
@@ -69,6 +86,9 @@ static int scr_resolve(void) {
     g_scr_mRead = A.class_get_method_from_name(g_scr_kTex, "ReadPixels", 3);            /* ReadPixels(Rect, int, int) */
     g_scr_mPng = A.class_get_method_from_name(kIC, "EncodeToPNG", 1);
     g_scr_mDestroy = A.class_get_method_from_name(kObj, "Destroy", 1);
+    g_scr_mGetPx = A.class_get_method_from_name(g_scr_kTex, "GetPixels32", 0);
+    g_scr_mSetPx = A.class_get_method_from_name(g_scr_kTex, "SetPixels32", 1);
+    if (!g_scr_mGetPx || !g_scr_mSetPx) dlog("скрин: нет GetPixels32/SetPixels32 — снимок будет в размере окна");
     if (!g_scr_mW || !g_scr_mH || !g_scr_mCtor || !g_scr_mRead || !g_scr_mPng) {
         dlog("скрин: не найден один из методов Screen.get_width/height, Texture2D..ctor/ReadPixels, EncodeToPNG");
         g_scr_resolved = -1; return 0;
@@ -118,12 +138,74 @@ static void scr_stamp(long t, char* out) {
 /* снимок не вышел: считаем (скрипт по этому счётчику не ждёт таймаут) и пишем в чат игры */
 static void scr_fail(const char* m) { __atomic_add_fetch(&g_scr_fails, 1, __ATOMIC_RELEASE); chat_say(m); }
 
+/* Приводит снимок src (w x h) к холсту ow x oh (SCR_OUT_W x SCR_OUT_H или SCR_LIVE_W x SCR_LIVE_H): вписывает с сохранением пропорций, поля чёрные.
+   Возвращает новую текстуру (её надо уничтожить) или NULL — тогда используется исходная. */
+static void* scr_normalize(void* src, int w, int h, int ow, int oh) {
+    void *dst, *exc = NULL, *sa, *da; void* a[1]; int dw, dh, ox, oy, x, y; long i, sn, dn, hdr = 4 * (long)sizeof(void*);
+    float s, sw, sh; const u8* sp; u8* dp; void* ca[2];
+    if (!SCR_NORMALIZE || !g_scr_mGetPx || !g_scr_mSetPx) return NULL;
+    if (w == ow && h == oh) return NULL;
+    sa = A.runtime_invoke(g_scr_mGetPx, src, NULL, &exc);
+    if (exc || !sa) { dlog("скрин: GetPixels32 источника не вышел — оставляю размер окна"); return NULL; }
+    sn = *(long*)((char*)sa + 3 * sizeof(void*));
+    if (sn < (long)w * h) { dlog_i("скрин: странная длина Color32[] источника ", sn); return NULL; }
+    dst = A.object_new(g_scr_kTex);
+    ca[0] = &ow; ca[1] = &oh;
+    A.runtime_invoke(g_scr_mCtor, dst, ca, &exc);
+    if (exc) { dlog("скрин: Texture2D для холста не создалась — оставляю размер окна"); return NULL; }
+    da = A.runtime_invoke(g_scr_mGetPx, dst, NULL, &exc);
+    dn = da ? *(long*)((char*)da + 3 * sizeof(void*)) : 0;
+    if (exc || !da || dn < (long)ow * oh) { dlog("скрин: GetPixels32 холста не вышел — оставляю размер окна"); goto fail; }
+    sp = (const u8*)sa + hdr; dp = (u8*)da + hdr;
+    for (i = 0; i < (long)ow * oh; i++) { dp[4 * i] = 0; dp[4 * i + 1] = 0; dp[4 * i + 2] = 0; dp[4 * i + 3] = 255; }
+    sw = (float)ow / (float)w; sh = (float)oh / (float)h; s = sw < sh ? sw : sh;
+    dw = (int)((float)w * s + 0.5f); dh = (int)((float)h * s + 0.5f);
+    if (dw > ow) dw = ow; if (dh > oh) dh = oh; if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+    ox = (ow - dw) / 2; oy = (oh - dh) / 2;
+    for (y = 0; y < dh; y++) {
+        for (x = 0; x < dw; x++) {
+            u8* o = dp + 4 * ((long)(oy + y) * ow + (ox + x));
+            if (s < 1.0f) {                                  /* уменьшение — среднее по блоку исходных пикселей */
+                int x0 = (int)((long)x * w / dw), x1 = (int)((long)(x + 1) * w / dw), y0 = (int)((long)y * h / dh), y1 = (int)((long)(y + 1) * h / dh), xx, yy;
+                unsigned long r = 0, g = 0, b = 0, n = 0;
+                if (x1 <= x0) x1 = x0 + 1; if (y1 <= y0) y1 = y0 + 1; if (x1 > w) x1 = w; if (y1 > h) y1 = h;
+                for (yy = y0; yy < y1; yy++) for (xx = x0; xx < x1; xx++) { const u8* p = sp + 4 * ((long)yy * w + xx); r += p[0]; g += p[1]; b += p[2]; n++; }
+                if (!n) n = 1;
+                o[0] = (u8)(r / n); o[1] = (u8)(g / n); o[2] = (u8)(b / n);
+            } else {                                         /* увеличение — билинейная выборка */
+                float fx = ((float)x + 0.5f) * (float)w / (float)dw - 0.5f, fy = ((float)y + 0.5f) * (float)h / (float)dh - 0.5f, tx, ty;
+                int ix, iy, ix1, iy1, k;
+                if (fx < 0) fx = 0; if (fy < 0) fy = 0;
+                ix = (int)fx; iy = (int)fy; tx = fx - (float)ix; ty = fy - (float)iy;
+                ix1 = ix + 1 < w ? ix + 1 : w - 1; iy1 = iy + 1 < h ? iy + 1 : h - 1;
+                if (ix > w - 1) ix = w - 1; if (iy > h - 1) iy = h - 1;
+                for (k = 0; k < 3; k++) {
+                    float p00 = sp[4 * ((long)iy * w + ix) + k], p10 = sp[4 * ((long)iy * w + ix1) + k];
+                    float p01 = sp[4 * ((long)iy1 * w + ix) + k], p11 = sp[4 * ((long)iy1 * w + ix1) + k];
+                    float v = (p00 * (1 - tx) + p10 * tx) * (1 - ty) + (p01 * (1 - tx) + p11 * tx) * ty;
+                    o[k] = (u8)(v + 0.5f);
+                }
+            }
+        }
+    }
+    a[0] = da; exc = NULL;
+    A.runtime_invoke(g_scr_mSetPx, dst, a, &exc);
+    if (exc) { dlog("скрин: SetPixels32 холста бросил — оставляю размер окна"); goto fail; }
+    dlog_i("скрин: приведён к холсту, ширина окна была ", w); dlog_i("скрин: высота окна была ", h);
+    return dst;
+fail:
+    if (g_scr_mDestroy) { void* da2[1]; void* e2 = NULL; da2[0] = dst; A.runtime_invoke(g_scr_mDestroy, NULL, da2, &e2); }
+    return NULL;
+}
+
 /* Сам снимок. Вызывать из главного потока в момент отрисовки (или, как запасной путь, из команды). */
 static void scr_capture(void) {
-    void *tex = NULL, *exc = NULL, *png; void* a[3]; int w, h, zero = 0, remote, seq; float rect[4];
+    void *tex = NULL, *tex2 = NULL, *exc = NULL, *png; void* a[3]; int w, h, ww, wh, cw, ch, zero = 0, remote, live, seq; float rect[4];
     char et[256], msg[460], st[32], path[400], tmpath[420]; Buf b; long len, off = 0; const char* data; int fd;
     ensure_attached();
-    remote = __atomic_exchange_n(&g_scr_remote, 0, __ATOMIC_ACQ_REL);   /* заявка по HTTP? флаг гасим сразу, даже если снимок не выйдет */
+    remote = __atomic_exchange_n(&g_scr_remote, 0, __ATOMIC_ACQ_REL);
+    live = __atomic_exchange_n(&g_scr_remoteLive, 0, __ATOMIC_ACQ_REL);
+    cw = live ? SCR_LIVE_W : SCR_OUT_W; ch = live ? SCR_LIVE_H : SCR_OUT_H;   /* заявка по HTTP? флаг гасим сразу, даже если снимок не выйдет */
     if (!scr_resolve() || !scr_prepare_dir()) { scr_fail("Скрин: не вышло (нет классов Unity или папки), подробности в konstt.log"); return; }
     w = scr_get_int(g_scr_mW); h = scr_get_int(g_scr_mH);
     if (w < 16 || h < 16 || w > 8192 || h > 8192) { dlog_i("скрин: странный размер экрана, ширина ", w); scr_fail("Скрин: не вышло (размер экрана)"); return; }
@@ -135,7 +217,10 @@ static void scr_capture(void) {
     a[0] = rect; a[1] = &zero; a[2] = &zero;
     A.runtime_invoke(g_scr_mRead, tex, a, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("скрин: ReadPixels бросил: ", et); scr_fail("Скрин: не вышло (чтение экрана)"); goto done; }
-    a[0] = tex;
+    ww = w; wh = h;                                       /* размер окна игры */
+    tex2 = scr_normalize(tex, w, h, cw, ch);              /* единый размер: вписываем в холст cw x ch */
+    if (tex2) { w = cw; h = ch; }
+    a[0] = tex2 ? tex2 : tex;
     png = A.runtime_invoke(g_scr_mPng, NULL, a, &exc);
     if (exc || !png) { exc_text(exc, et, sizeof et); dlog2("скрин: EncodeToPNG: ", exc ? et : "вернул null"); scr_fail("Скрин: не вышло (кодирование PNG)"); goto done; }
     len = *(long*)((char*)png + 3 * sizeof(void*));
@@ -158,9 +243,10 @@ static void scr_capture(void) {
     g_scr_lastLen = len; g_scr_lastOk = 1;
     __atomic_store_n(&g_scr_doneSeq, seq, __ATOMIC_RELEASE);          /* последним: после этого HTTP может отдавать файл */
     dlog2("скрин: сохранён ", path); dlog_i("скрин: размер PNG, байт ", len);
-    b_init(&b, msg, sizeof msg); b_s(&b, "Скрин сохранён ("); b_int(&b, w); b_ch(&b, 'x'); b_int(&b, h); b_s(&b, ", "); b_int(&b, len / 1024); b_s(&b, " КБ): "); b_s(&b, path);
+    b_init(&b, msg, sizeof msg); b_s(&b, "Скрин сохранён ("); if (tex2) { b_s(&b, "окно "); b_int(&b, ww); b_ch(&b, 'x'); b_int(&b, wh); b_s(&b, " -> "); } b_int(&b, w); b_ch(&b, 'x'); b_int(&b, h); b_s(&b, ", "); b_int(&b, len / 1024); b_s(&b, " КБ): "); b_s(&b, path);
     if (!remote) chat_say(msg);                           /* по HTTP-заявке чат игры не засоряем */
 done:
+    if (tex2 && g_scr_mDestroy) { void* da[1]; void* e2 = NULL; da[0] = tex2; A.runtime_invoke(g_scr_mDestroy, NULL, da, &e2); }
     if (tex && g_scr_mDestroy) { void* da[1]; void* e2 = NULL; da[0] = tex; A.runtime_invoke(g_scr_mDestroy, NULL, da, &e2); }
 }
 
@@ -253,8 +339,10 @@ static volatile int g_scr_tgState;                         /* 0 — не зап�
 static volatile int g_scr_tgCode;                          /* HTTP-код Telegram (или 0) */
 static volatile int g_scr_tgId;                            /* номер задания: растёт на каждый запуск */
 static char g_scr_tgMsg[300];                              /* причина ошибки (description от Telegram или наш текст) */
-static char g_scr_tgTok[160], g_scr_tgChat[48], g_scr_tgCap[760], g_scr_tgPath[400];
+static char g_scr_tgTok[160], g_scr_tgChat[48], g_scr_tgCap[760], g_scr_tgPath[400], g_scr_tgKb[900];
 static int g_scr_tgDoc;
+static long g_scr_tgEditId;                                /* >0 — не слать новое фото, а заменить картинку в сообщении с этим message_id (Live) */
+static volatile long g_scr_tgMid;                          /* message_id из ответа Telegram (для Live: первое сообщение, потом редактируем его) */
 
 typedef int (*scj_getvms_t)(void**, int, int*);
 typedef int (*scj_getenv_t)(void*, void**, int);
@@ -303,20 +391,41 @@ static void scr_tg_desc(const char* r, unsigned n, char* out, unsigned cap) {
     out[k] = 0;
 }
 
-/* Собирает multipart в g_scr_upBuf: возвращает полную длину тела или 0 (причина в g_scr_tgMsg). */
+/* JSON-строка без кавычек вокруг: экранируем " и \, управляющие символы заменяем пробелом */
+static void scr_json_esc(Buf* b, const char* t) {
+    for (; *t; t++) {
+        if (*t == '"' || *t == '\\') { b_ch(b, '\\'); b_ch(b, *t); }
+        else if ((unsigned char)*t < 32) b_ch(b, ' ');
+        else b_ch(b, *t);
+    }
+}
+static void scr_mp_field(Buf* b, const char* boundary, const char* name) {
+    b_s(b, "--"); b_s(b, boundary); b_s(b, "\r\nContent-Disposition: form-data; name=\""); b_s(b, name); b_s(b, "\"\r\n\r\n");
+}
+
+/* Собирает multipart в g_scr_upBuf: возвращает полную длину тела или 0 (причина в g_scr_tgMsg).
+   Обычная отправка: sendPhoto/sendDocument (chat_id, caption, reply_markup, файл).
+   Правка (g_scr_tgEditId > 0): editMessageMedia (chat_id, message_id, media = {"type":"photo","media":"attach://scr",...}, reply_markup, файл «scr»). */
 static unsigned long scr_tg_build(const char* boundary, int asDoc) {
-    Buf b; int fd; long off, got = 0;
+    Buf b; int fd; long off, got = 0; int edit = g_scr_tgEditId > 0;
     fd = open(g_scr_tgPath, 0);
     if (fd < 0) { scr_tg_msg("не открыть файл снимка"); return 0; }
     b_init(&b, (char*)g_scr_upBuf, SCR_UP_HEAD);
-    b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n"); b_s(&b, g_scr_tgChat); b_s(&b, "\r\n");
-    if (g_scr_tgCap[0]) {
-        b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n"); b_s(&b, g_scr_tgCap); b_s(&b, "\r\n");
-        b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n");
+    scr_mp_field(&b, boundary, "chat_id"); b_s(&b, g_scr_tgChat); b_s(&b, "\r\n");
+    if (edit) {
+        scr_mp_field(&b, boundary, "message_id"); b_int(&b, g_scr_tgEditId); b_s(&b, "\r\n");
+        scr_mp_field(&b, boundary, "media");
+        b_s(&b, "{\"type\":\"photo\",\"media\":\"attach://scr\"");
+        if (g_scr_tgCap[0]) { b_s(&b, ",\"caption\":\""); scr_json_esc(&b, g_scr_tgCap); b_s(&b, "\",\"parse_mode\":\"HTML\""); }
+        b_s(&b, "}\r\n");
+    } else if (g_scr_tgCap[0]) {
+        scr_mp_field(&b, boundary, "caption"); b_s(&b, g_scr_tgCap); b_s(&b, "\r\n");
+        scr_mp_field(&b, boundary, "parse_mode"); b_s(&b, "HTML\r\n");
     }
+    if (g_scr_tgKb[0]) { scr_mp_field(&b, boundary, "reply_markup"); b_s(&b, g_scr_tgKb); b_s(&b, "\r\n"); }
     b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"");
-    b_s(&b, asDoc ? "document" : "photo"); b_s(&b, "\"; filename=\"screen.png\"\r\nContent-Type: image/png\r\n\r\n");
-    if (b.n + 8 >= SCR_UP_HEAD) { close(fd); scr_tg_msg("подпись слишком длинная"); return 0; }
+    b_s(&b, edit ? "scr" : (asDoc ? "document" : "photo")); b_s(&b, "\"; filename=\"screen.png\"\r\nContent-Type: image/png\r\n\r\n");
+    if (b.n + 8 >= SCR_UP_HEAD) { close(fd); scr_tg_msg("подпись или кнопки слишком длинные"); return 0; }
     off = (long)b.n;
     for (;;) {
         long room = (long)sizeof g_scr_upBuf - 256 - off, n;
@@ -404,6 +513,17 @@ static int scr_tg_post(const char* method, const char* boundary, unsigned long t
         CallVoid(env, in, mIClose); scj_clean(env);
     }
     resp[rn] = 0;
+    if (code == 200) {                                                 /* "message_id":N — понадобится Live, чтобы править то же сообщение */
+        static const char mk[] = "\"message_id\":"; unsigned q;
+        for (q = 0; q + sizeof mk < rn; q++) {
+            if (resp[q] == '"' && sprefix(resp + q, mk)) {
+                long v = 0; q += sizeof mk - 1;
+                while (q < rn && resp[q] >= '0' && resp[q] <= '9' && v < 2000000000L) { v = v * 10 + (resp[q] - '0'); q++; }
+                if (v > 0) g_scr_tgMid = v;
+                break;
+            }
+        }
+    }
     if (code != 200) { char d[260]; scr_tg_desc(resp, rn, d, sizeof d); scr_tg_msg(d[0] ? d : "пустой ответ"); }
     CallVoid(env, conn, mDisc); scj_clean(env);
 out:
@@ -415,17 +535,17 @@ out:
 static void* scr_tg_thread(void* arg) {
     char boundary[64]; Buf b; unsigned long total; int code, asDoc;
     (void)arg;
-    g_scr_tgMsg[0] = 0; g_scr_tgCode = 0;
+    g_scr_tgMsg[0] = 0; g_scr_tgCode = 0; g_scr_tgMid = g_scr_tgEditId > 0 ? g_scr_tgEditId : 0;
     b_init(&b, boundary, sizeof boundary); b_s(&b, "----hassle"); b_int(&b, time(NULL)); b_int(&b, g_scr_tgId);
-    asDoc = g_scr_tgDoc;
+    asDoc = g_scr_tgEditId > 0 ? 0 : g_scr_tgDoc;
     total = scr_tg_build(boundary, asDoc);
     if (!total) { dlog2("скрин: отправка в Telegram: ", g_scr_tgMsg); __atomic_store_n(&g_scr_tgState, 3, __ATOMIC_RELEASE); return NULL; }
     if (!asDoc && total > SCR_UP_PHOTO_MAX) {                   /* для sendPhoto слишком тяжёлый — пересоберём как документ */
         asDoc = 1; total = scr_tg_build(boundary, 1);
         if (!total) { dlog2("скрин: отправка в Telegram: ", g_scr_tgMsg); __atomic_store_n(&g_scr_tgState, 3, __ATOMIC_RELEASE); return NULL; }
     }
-    code = scr_tg_post(asDoc ? "sendDocument" : "sendPhoto", boundary, total);
-    if (code == 400 && !asDoc) {                                /* Telegram не принял как фото (размеры/пропорции) — файлом */
+    code = scr_tg_post(g_scr_tgEditId > 0 ? "editMessageMedia" : asDoc ? "sendDocument" : "sendPhoto", boundary, total);
+    if (code == 400 && !asDoc && g_scr_tgEditId <= 0) {                                /* Telegram не принял как фото (размеры/пропорции) — файлом */
         dlog2("скрин: sendPhoto 400: ", g_scr_tgMsg);
         total = scr_tg_build(boundary, 1);
         code = total ? scr_tg_post("sendDocument", boundary, total) : 0;
@@ -515,7 +635,7 @@ static void scr_http_status(int c) {
 
 /* /screen/shot?delay=N — заявка на снимок. Подписку на кадр (IL2CPP) отсюда не делаем: это только из команды в главном потоке. */
 static void scr_http_shot(int c, const char* rq) {
-    int delay = 0, i;
+    int delay = 0, i, live = 0;
     static const char okj[] = "{\"ok\":true}", busy[] = "{\"ok\":false,\"err\":\"busy\"}", need[] = "{\"ok\":false,\"err\":\"need_cmd\"}";
     for (i = 0; rq[i] && rq[i] != '\r' && rq[i] != '\n'; i++) {
         if (rq[i] == 'd' && sprefix(rq + i, "delay=")) {
@@ -525,6 +645,7 @@ static void scr_http_shot(int c, const char* rq) {
         }
     }
     if (delay > SCR_MAX_DELAY_S) delay = SCR_MAX_DELAY_S;
+    for (i = 0; rq[i] && rq[i] != '\r' && rq[i] != '\n'; i++) if (rq[i] == 'l' && sprefix(rq + i, "live=1")) { live = 1; break; }
     if (__atomic_load_n(&g_scr_pending, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_scr_busy, __ATOMIC_ACQUIRE)) {
         scr_respond(c, "200 OK", "application/json", busy, sizeof busy - 1); return;
     }
@@ -533,8 +654,9 @@ static void scr_http_shot(int c, const char* rq) {
     }
     g_scr_due = time(NULL) + delay;
     __atomic_store_n(&g_scr_remote, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_scr_remoteLive, live, __ATOMIC_RELEASE);
     __atomic_store_n(&g_scr_pending, 1, __ATOMIC_RELEASE);
-    dlog("скрин: заявка по HTTP");
+    dlog(live ? "скрин: заявка по HTTP (live)" : "скрин: заявка по HTTP");
     scr_respond(c, "200 OK", "application/json", okj, sizeof okj - 1);
 }
 
@@ -568,6 +690,12 @@ static void scr_http_tg(int c, const char* rq) {
         scr_respond(c, "200 OK", "application/json", bad, sizeof bad - 1); return;
     }
     scr_qparam(rq, "cap", g_scr_tgCap, sizeof g_scr_tgCap);
+    scr_qparam(rq, "kb", g_scr_tgKb, sizeof g_scr_tgKb);                /* reply_markup (JSON, только ASCII: не-ASCII как \uXXXX) */
+    {   char ms[16]; unsigned mi; long mv = 0;
+        scr_qparam(rq, "m", ms, sizeof ms);                             /* message_id для правки (Live); пусто — новое сообщение */
+        for (mi = 0; ms[mi] >= '0' && ms[mi] <= '9' && mv < 2000000000L; mi++) mv = mv * 10 + (ms[mi] - '0');
+        g_scr_tgEditId = mv;
+    }
     scr_qparam(rq, "doc", doc, sizeof doc); g_scr_tgDoc = doc[0] == '1';
     for (k = 0; k < (int)sizeof g_scr_tgPath - 1 && g_scr_lastPath[k]; k++) g_scr_tgPath[k] = g_scr_lastPath[k];
     g_scr_tgPath[k] = 0;
@@ -581,7 +709,7 @@ static void scr_http_tg(int c, const char* rq) {
     scr_respond(c, "200 OK", "application/json", js, b.n);
 }
 static void scr_http_tgstatus(int c) {
-    char js[520], m[300]; Buf b; unsigned i, k = 0;
+    char js[560], m[300]; Buf b; unsigned i, k = 0;
     for (i = 0; g_scr_tgMsg[i] && k + 2 < sizeof m; i++) {          /* для JSON: убираем кавычки/слэши/переводы строк */
         char ch = g_scr_tgMsg[i];
         m[k++] = (ch == '"' || ch == '\\' || (unsigned char)ch < 32) ? ' ' : ch;
@@ -589,7 +717,7 @@ static void scr_http_tgstatus(int c) {
     m[k] = 0;
     b_init(&b, js, sizeof js);
     b_s(&b, "{\"id\":"); b_int(&b, g_scr_tgId); b_s(&b, ",\"state\":"); b_int(&b, __atomic_load_n(&g_scr_tgState, __ATOMIC_ACQUIRE));
-    b_s(&b, ",\"code\":"); b_int(&b, g_scr_tgCode); b_s(&b, ",\"msg\":\""); b_s(&b, m); b_s(&b, "\"}");
+    b_s(&b, ",\"mid\":"); b_int(&b, g_scr_tgMid); b_s(&b, ",\"code\":"); b_int(&b, g_scr_tgCode); b_s(&b, ",\"msg\":\""); b_s(&b, m); b_s(&b, "\"}");
     scr_respond(c, "200 OK", "application/json", js, b.n);
 }
 
@@ -611,7 +739,7 @@ static void* scr_http_main(void* arg) {
         dlog_i("скрин: HTTP слушает порт ", g_scr_httpPort);
         for (;;) {
             int c = accept(fd, NULL, NULL);
-            char rq[1800]; long n; struct scr_tv t;
+            char rq[3600]; long n; struct scr_tv t;
             if (c < 0) { usleep(100000); continue; }
             t.sec = 5; t.usec = 0;
             setsockopt(c, 1, 20, &t, sizeof t);                   /* SO_RCVTIMEO */
@@ -648,6 +776,7 @@ static void* scr_main(void* arg) {
         if (__atomic_load_n(&g_scr_pending, __ATOMIC_ACQUIRE) && time(NULL) > g_scr_due + 5) {
             __atomic_store_n(&g_scr_pending, 0, __ATOMIC_RELEASE);
             __atomic_store_n(&g_scr_remote, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_scr_remoteLive, 0, __ATOMIC_RELEASE);
             __atomic_add_fetch(&g_scr_fails, 1, __ATOMIC_RELEASE);   /* скрипт перестаёт ждать этот снимок */
             g_scr_hookDead = 1;
             dlog("скрин: событие endFrameRendering не пришло за 5 с — отключаю его, дальше снимаю напрямую");
