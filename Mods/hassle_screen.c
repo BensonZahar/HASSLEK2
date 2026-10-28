@@ -23,6 +23,9 @@
  *       GET /screen/shot?delay=N  заявка на снимок (по умолчанию 0 с). {"ok":true} | {"ok":false,"err":"busy"|"need_cmd"}.
  *                                 need_cmd — подписка на кадр ещё не сделана (первый раз после запуска игры): скрипт шлёт в чат «/screen 0».
  *       GET /screen/last          PNG последнего удачного снимка (image/png)
+ *       GET /screen/tg?k=&c=&doc=&cap=  мод сам шлёт последний снимок в Telegram (JNI → HttpURLConnection): {"ok":true,"id":N}
+ *       GET /screen/tgstatus      {"id","state":1 идёт|2 готово|3 ошибка,"code","msg"} — результат отправки
+ *                                 (в WebView игры XHR не умеет бинарные POST, поэтому отправка — на стороне мода)
  *   • Снимки по HTTP-заявке всегда пишутся в <HLOG>/shots/remote.png (перезаписывается), чтобы удалённый просмотр не копил файлы.
  *     Файл пишется во временный .tmp и переименовывается — читатель никогда не увидит недописанный PNG.
  */
@@ -236,6 +239,231 @@ static void native_screen_cmd(void* self, void* args, void* mi) {
 }
 
 
+/* ───────────── отправка PNG в Telegram самим модом ─────────────
+   Почему так: WebView игры (Cohtml) не умеет отправлять бинарное тело в XHR (нет FormData/fetch, а Uint8Array/ArrayBuffer/Blob Telegram
+   принимает как 400 с пустым ответом). Поэтому скрипт только просит мод: GET /screen/tg?... — а мод сам делает multipart-POST на
+   api.telegram.org через java.net.HttpURLConnection (тот же путь, которым загрузчик качает бандл; своего TLS в C нет).
+   Работает в фоновом потоке, игровой поток и HTTP-сервер не блокирует. Результат скрипт читает из /screen/tgstatus.
+   Только JNI-вызовы по индексам из jni.h (как в загрузчике и hassle_mem.c); исключения Java сбрасываем и превращаем в текст ошибки. */
+#define SCR_UP_MAX (12 * 1024 * 1024)                      /* PNG больше — не шлём (лимит Telegram: sendPhoto 10 МБ, sendDocument 50 МБ) */
+#define SCR_UP_PHOTO_MAX (9 * 1024 * 1024)
+#define SCR_UP_HEAD 4096                                   /* место под заголовки multipart перед файлом */
+static u8 g_scr_upBuf[SCR_UP_HEAD + SCR_UP_MAX + 512];    /* тело multipart целиком; в .bss — память занимается только по факту записи */
+static volatile int g_scr_tgState;                         /* 0 — не запускали, 1 — идёт, 2 — готово, 3 — ошибка */
+static volatile int g_scr_tgCode;                          /* HTTP-код Telegram (или 0) */
+static volatile int g_scr_tgId;                            /* номер задания: растёт на каждый запуск */
+static char g_scr_tgMsg[300];                              /* причина ошибки (description от Telegram или наш текст) */
+static char g_scr_tgTok[160], g_scr_tgChat[48], g_scr_tgCap[760], g_scr_tgPath[400];
+static int g_scr_tgDoc;
+
+typedef int (*scj_getvms_t)(void**, int, int*);
+typedef int (*scj_getenv_t)(void*, void**, int);
+typedef int (*scj_attach_t)(void*, void**, void*);
+typedef int (*scj_detach_t)(void*);
+typedef void* (*scj_find_t)(void*, const char*);
+typedef void (*scj_clr_t)(void*);
+typedef void* (*scj_mid_t)(void*, void*, const char*, const char*);
+typedef void* (*scj_newobj_t)(void*, void*, void*, ...);
+typedef void* (*scj_callo_t)(void*, void*, void*, ...);
+typedef int (*scj_calli_t)(void*, void*, void*, ...);
+typedef void (*scj_callv_t)(void*, void*, void*, ...);
+typedef void* (*scj_str_t)(void*, const char*);
+typedef void* (*scj_newarr_t)(void*, int);
+typedef void (*scj_getreg_t)(void*, void*, int, int, signed char*);
+typedef void (*scj_setreg_t)(void*, void*, int, int, const signed char*);
+typedef unsigned char (*scj_exc_t)(void*);
+#define SCJ(env, T, idx) ((T)((*(void***)(env))[idx]))
+#define SCJV(vm, T, idx) ((T)((*(void***)(vm))[idx]))
+/* индексы JNINativeInterface: FindClass 6, ExceptionClear 17, GetMethodID 33, CallObjectMethod 34, CallIntMethod 49, CallVoidMethod 61,
+   NewObject 28, NewStringUTF 167, NewByteArray 176, GetByteArrayRegion 200, SetByteArrayRegion 208, ExceptionCheck 228;
+   JavaVM: AttachCurrentThread 4, DetachCurrentThread 5, GetEnv 6 */
+static int scj_clean(void* env) { if (SCJ(env, scj_exc_t, 228)(env)) { SCJ(env, scj_clr_t, 17)(env); return 0; } return 1; }
+static void* scj_get_vm(void) {
+    scj_getvms_t f = NULL; void *vm = NULL, *h; int n = 0;
+    h = dlopen(NULL, RTLD_NOW_); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs");
+    if (!f) { h = dlopen("libnativehelper.so", RTLD_NOW_ | 4); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs"); }
+    if (!f) { h = dlopen("libart.so", RTLD_NOW_ | 4); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs"); }
+    if (!f) return NULL;
+    if (f(&vm, 1, &n) != 0 || n < 1) return NULL;
+    return vm;
+}
+static void scr_tg_msg(const char* m) { unsigned i; for (i = 0; m && m[i] && i < sizeof g_scr_tgMsg - 1; i++) g_scr_tgMsg[i] = m[i]; g_scr_tgMsg[i] = 0; }
+/* ответ Telegram: достаём "description":"..." (без разбора экранирования — нам нужен только короткий текст для чата) */
+static void scr_tg_desc(const char* r, unsigned n, char* out, unsigned cap) {
+    static const char key[] = "\"description\":\""; unsigned i, k = 0;
+    out[0] = 0;
+    for (i = 0; i + sizeof key < n; i++) {
+        if (r[i] == '"' && sprefix(r + i, key)) {
+            i += sizeof key - 1;
+            while (i < n && r[i] != '"' && k + 1 < cap) { if (r[i] == '\\' && i + 1 < n) i++; out[k++] = r[i++]; }
+            out[k] = 0; return;
+        }
+    }
+    for (i = 0; i < n && k + 1 < cap; i++) out[k++] = (r[i] == '\r' || r[i] == '\n') ? ' ' : r[i];
+    out[k] = 0;
+}
+
+/* Собирает multipart в g_scr_upBuf: возвращает полную длину тела или 0 (причина в g_scr_tgMsg). */
+static unsigned long scr_tg_build(const char* boundary, int asDoc) {
+    Buf b; int fd; long off, got = 0;
+    fd = open(g_scr_tgPath, 0);
+    if (fd < 0) { scr_tg_msg("не открыть файл снимка"); return 0; }
+    b_init(&b, (char*)g_scr_upBuf, SCR_UP_HEAD);
+    b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n"); b_s(&b, g_scr_tgChat); b_s(&b, "\r\n");
+    if (g_scr_tgCap[0]) {
+        b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n"); b_s(&b, g_scr_tgCap); b_s(&b, "\r\n");
+        b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n");
+    }
+    b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"");
+    b_s(&b, asDoc ? "document" : "photo"); b_s(&b, "\"; filename=\"screen.png\"\r\nContent-Type: image/png\r\n\r\n");
+    if (b.n + 8 >= SCR_UP_HEAD) { close(fd); scr_tg_msg("подпись слишком длинная"); return 0; }
+    off = (long)b.n;
+    for (;;) {
+        long room = (long)sizeof g_scr_upBuf - 256 - off, n;
+        if (room <= 0) break;
+        n = read(fd, g_scr_upBuf + off, (unsigned long)room);
+        if (n <= 0) break;
+        off += n; got += n;
+    }
+    close(fd);
+    if (got < 8) { scr_tg_msg("файл снимка пустой"); return 0; }
+    if (got > SCR_UP_MAX) { scr_tg_msg("снимок слишком большой для отправки"); return 0; }
+    b_init(&b, (char*)g_scr_upBuf + off, 256);
+    b_s(&b, "\r\n--"); b_s(&b, boundary); b_s(&b, "--\r\n");
+    return (unsigned long)off + b.n;
+}
+
+/* Сам POST. Возвращает HTTP-код (200 — принят) или 0 при сбое до ответа (причина в g_scr_tgMsg). */
+static int scr_tg_post(const char* method, const char* boundary, unsigned long total) {
+    void *vm, *env = NULL, *cURL = NULL, *cConn = NULL, *cHttp = NULL, *cOS = NULL, *cIS = NULL;
+    void *jurl, *jstr, *conn, *os = NULL, *in = NULL, *arr = NULL, *jm, *jct, *jctv;
+    void *mNew, *mOpen, *mCT, *mRT, *mDoOut, *mProp, *mGetOut, *mMeth, *mFix, *mCode, *mErr, *mGetIn, *mDisc, *mWrite, *mFlush, *mClose, *mRead, *mIClose;
+    int attached = 0, rc, code = 0; unsigned long sent = 0; char url[300], ct[120]; Buf b;
+    char resp[2048]; unsigned rn = 0;
+    scj_find_t FindClass; scj_mid_t GetMid; scj_callo_t CallObj; scj_calli_t CallInt; scj_callv_t CallVoid;
+#define SCJ_FAIL(m) do { scr_tg_msg(m); code = 0; goto out; } while (0)
+    vm = scj_get_vm(); if (!vm) { scr_tg_msg("нет JavaVM (JNI_GetCreatedJavaVMs не найдена)"); return 0; }
+    rc = SCJV(vm, scj_getenv_t, 6)(vm, &env, 0x00010006);
+    if (rc == -2) { if (SCJV(vm, scj_attach_t, 4)(vm, &env, NULL) != 0 || !env) { scr_tg_msg("AttachCurrentThread не удался"); return 0; } attached = 1; }
+    else if (rc != 0 || !env) { scr_tg_msg("GetEnv не удался"); return 0; }
+    FindClass = SCJ(env, scj_find_t, 6); GetMid = SCJ(env, scj_mid_t, 33);
+    CallObj = SCJ(env, scj_callo_t, 34); CallInt = SCJ(env, scj_calli_t, 49); CallVoid = SCJ(env, scj_callv_t, 61);
+    cURL = FindClass(env, "java/net/URL"); cConn = FindClass(env, "java/net/URLConnection"); cHttp = FindClass(env, "java/net/HttpURLConnection");
+    cOS = FindClass(env, "java/io/OutputStream"); cIS = FindClass(env, "java/io/InputStream");
+    if (!cURL || !cConn || !cHttp || !cOS || !cIS || !scj_clean(env)) SCJ_FAIL("нет нужных классов java.net / java.io");
+    mNew = GetMid(env, cURL, "<init>", "(Ljava/lang/String;)V");
+    mOpen = GetMid(env, cURL, "openConnection", "()Ljava/net/URLConnection;");
+    mCT = GetMid(env, cConn, "setConnectTimeout", "(I)V");
+    mRT = GetMid(env, cConn, "setReadTimeout", "(I)V");
+    mDoOut = GetMid(env, cConn, "setDoOutput", "(Z)V");
+    mProp = GetMid(env, cConn, "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V");
+    mGetOut = GetMid(env, cConn, "getOutputStream", "()Ljava/io/OutputStream;");
+    mGetIn = GetMid(env, cConn, "getInputStream", "()Ljava/io/InputStream;");
+    mMeth = GetMid(env, cHttp, "setRequestMethod", "(Ljava/lang/String;)V");
+    mFix = GetMid(env, cHttp, "setFixedLengthStreamingMode", "(I)V");
+    mCode = GetMid(env, cHttp, "getResponseCode", "()I");
+    mErr = GetMid(env, cHttp, "getErrorStream", "()Ljava/io/InputStream;");
+    mDisc = GetMid(env, cHttp, "disconnect", "()V");
+    mWrite = GetMid(env, cOS, "write", "([BII)V"); mFlush = GetMid(env, cOS, "flush", "()V"); mClose = GetMid(env, cOS, "close", "()V");
+    mRead = GetMid(env, cIS, "read", "([B)I"); mIClose = GetMid(env, cIS, "close", "()V");
+    if (!scj_clean(env) || !mNew || !mOpen || !mCT || !mRT || !mDoOut || !mProp || !mGetOut || !mGetIn || !mMeth || !mFix || !mCode || !mErr || !mDisc || !mWrite || !mFlush || !mClose || !mRead || !mIClose)
+        SCJ_FAIL("не нашлись методы Java (HttpURLConnection)");
+    b_init(&b, url, sizeof url); b_s(&b, "https://api.telegram.org/bot"); b_s(&b, g_scr_tgTok); b_ch(&b, '/'); b_s(&b, method);
+    b_init(&b, ct, sizeof ct); b_s(&b, "multipart/form-data; boundary="); b_s(&b, boundary);
+    jstr = SCJ(env, scj_str_t, 167)(env, url); if (!jstr) SCJ_FAIL("NewStringUTF");
+    jurl = SCJ(env, scj_newobj_t, 28)(env, cURL, mNew, jstr); if (!jurl || !scj_clean(env)) SCJ_FAIL("new URL() не удался");
+    conn = CallObj(env, jurl, mOpen); if (!conn || !scj_clean(env)) SCJ_FAIL("openConnection не удался");
+    CallVoid(env, conn, mCT, 15000); CallVoid(env, conn, mRT, 60000); if (!scj_clean(env)) SCJ_FAIL("таймауты");
+    jm = SCJ(env, scj_str_t, 167)(env, "POST"); CallVoid(env, conn, mMeth, jm); if (!scj_clean(env)) SCJ_FAIL("setRequestMethod");
+    CallVoid(env, conn, mDoOut, 1); if (!scj_clean(env)) SCJ_FAIL("setDoOutput");
+    jct = SCJ(env, scj_str_t, 167)(env, "Content-Type"); jctv = SCJ(env, scj_str_t, 167)(env, ct);
+    CallVoid(env, conn, mProp, jct, jctv); if (!scj_clean(env)) SCJ_FAIL("setRequestProperty");
+    CallVoid(env, conn, mFix, (int)total); if (!scj_clean(env)) SCJ_FAIL("setFixedLengthStreamingMode");
+    os = CallObj(env, conn, mGetOut); if (!os || !scj_clean(env)) SCJ_FAIL("нет соединения с api.telegram.org (getOutputStream)");
+    arr = SCJ(env, scj_newarr_t, 176)(env, 65536); if (!arr) SCJ_FAIL("NewByteArray");
+    while (sent < total) {
+        unsigned long n = total - sent < 65536 ? total - sent : 65536;
+        SCJ(env, scj_setreg_t, 208)(env, arr, 0, (int)n, (const signed char*)(g_scr_upBuf + sent));
+        CallVoid(env, os, mWrite, arr, 0, (int)n);
+        if (!scj_clean(env)) SCJ_FAIL("обрыв при отправке данных");
+        sent += n;
+    }
+    CallVoid(env, os, mFlush); CallVoid(env, os, mClose); if (!scj_clean(env)) SCJ_FAIL("обрыв при завершении отправки");
+    code = CallInt(env, conn, mCode); if (!scj_clean(env)) SCJ_FAIL("нет ответа от Telegram (getResponseCode)");
+    in = CallObj(env, conn, code >= 400 ? mErr : mGetIn);
+    if (!scj_clean(env)) in = NULL;
+    if (in) {
+        for (;;) {
+            int r = CallInt(env, in, mRead, arr);
+            if (!scj_clean(env) || r < 0) break;
+            if (r == 0) continue;
+            if (rn + (unsigned)r > sizeof resp - 1) r = (int)(sizeof resp - 1 - rn);
+            if (r > 0) { SCJ(env, scj_getreg_t, 200)(env, arr, 0, r, (signed char*)(resp + rn)); rn += (unsigned)r; }
+            if (rn >= sizeof resp - 1) break;
+        }
+        CallVoid(env, in, mIClose); scj_clean(env);
+    }
+    resp[rn] = 0;
+    if (code != 200) { char d[260]; scr_tg_desc(resp, rn, d, sizeof d); scr_tg_msg(d[0] ? d : "пустой ответ"); }
+    CallVoid(env, conn, mDisc); scj_clean(env);
+out:
+    if (attached) SCJV(vm, scj_detach_t, 5)(vm);
+    return code;
+#undef SCJ_FAIL
+}
+
+static void* scr_tg_thread(void* arg) {
+    char boundary[64]; Buf b; unsigned long total; int code, asDoc;
+    (void)arg;
+    g_scr_tgMsg[0] = 0; g_scr_tgCode = 0;
+    b_init(&b, boundary, sizeof boundary); b_s(&b, "----hassle"); b_int(&b, time(NULL)); b_int(&b, g_scr_tgId);
+    asDoc = g_scr_tgDoc;
+    total = scr_tg_build(boundary, asDoc);
+    if (!total) { dlog2("скрин: отправка в Telegram: ", g_scr_tgMsg); __atomic_store_n(&g_scr_tgState, 3, __ATOMIC_RELEASE); return NULL; }
+    if (!asDoc && total > SCR_UP_PHOTO_MAX) {                   /* для sendPhoto слишком тяжёлый — пересоберём как документ */
+        asDoc = 1; total = scr_tg_build(boundary, 1);
+        if (!total) { dlog2("скрин: отправка в Telegram: ", g_scr_tgMsg); __atomic_store_n(&g_scr_tgState, 3, __ATOMIC_RELEASE); return NULL; }
+    }
+    code = scr_tg_post(asDoc ? "sendDocument" : "sendPhoto", boundary, total);
+    if (code == 400 && !asDoc) {                                /* Telegram не принял как фото (размеры/пропорции) — файлом */
+        dlog2("скрин: sendPhoto 400: ", g_scr_tgMsg);
+        total = scr_tg_build(boundary, 1);
+        code = total ? scr_tg_post("sendDocument", boundary, total) : 0;
+    }
+    g_scr_tgCode = code;
+    if (code == 200) { dlog_i("скрин: отправлено в Telegram, байт ", (long)total); __atomic_store_n(&g_scr_tgState, 2, __ATOMIC_RELEASE); }
+    else { dlog_i("скрин: Telegram не принял, код ", code); dlog2("скрин: причина: ", g_scr_tgMsg); __atomic_store_n(&g_scr_tgState, 3, __ATOMIC_RELEASE); }
+    return NULL;
+}
+
+/* значение параметра из строки запроса «GET /путь?a=1&b=2 HTTP/1.1» → копия значения (с %XX и '+' → пробел), cap включая 0 */
+static int scr_qparam(const char* rq, const char* name, char* out, unsigned cap) {
+    unsigned i = 0, nl = slen(name), k = 0;
+    while (rq[i] && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n') i++;          /* пропускаем «GET» */
+    if (rq[i] == ' ') i++;
+    while (rq[i] && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n' && rq[i] != '?') i++;   /* пропускаем путь */
+    if (rq[i] != '?') { out[0] = 0; return 0; }
+    i++;
+    while (rq[i] && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n') {
+        if ((rq[i - 1] == '?' || rq[i - 1] == '&') && sprefix(rq + i, name) && rq[i + nl] == '=') {
+            i += nl + 1;
+            while (rq[i] && rq[i] != '&' && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n' && k + 1 < cap) {
+                char c = rq[i];
+                if (c == '%' && rq[i + 1] && rq[i + 2]) {
+                    int hi = rq[i + 1], lo = rq[i + 2];
+                    hi = hi >= '0' && hi <= '9' ? hi - '0' : (hi | 32) >= 'a' && (hi | 32) <= 'f' ? (hi | 32) - 'a' + 10 : -1;
+                    lo = lo >= '0' && lo <= '9' ? lo - '0' : (lo | 32) >= 'a' && (lo | 32) <= 'f' ? (lo | 32) - 'a' + 10 : -1;
+                    if (hi >= 0 && lo >= 0) { out[k++] = (char)(hi * 16 + lo); i += 3; continue; }
+                }
+                out[k++] = c == '+' ? ' ' : c; i++;
+            }
+            out[k] = 0; return 1;
+        }
+        i++;
+    }
+    out[0] = 0; return 0;
+}
+
 /* ───────────── HTTP для кнопки «Скрин» в Telegram ───────────── */
 extern int socket(int, int, int);
 extern int setsockopt(int, int, int, const void*, unsigned);
@@ -330,6 +558,41 @@ static void scr_http_last(int c) {
     close(fd);
 }
 
+/* /screen/tg?k=ТОКЕН&c=ЧАТ&doc=0|1&cap=ПОДПИСЬ(urlencoded) — запуск отправки последнего снимка в Telegram: {"ok":true,"id":N}; результат — /screen/tgstatus */
+static void scr_http_tg(int c, const char* rq) {
+    static const char busy[] = "{\"ok\":false,\"err\":\"busy\"}", nosnap[] = "{\"ok\":false,\"err\":\"no_snapshot\"}", bad[] = "{\"ok\":false,\"err\":\"bad_args\"}";
+    char doc[8], js[64]; unsigned long t = 0; int k; Buf b;
+    if (__atomic_load_n(&g_scr_tgState, __ATOMIC_ACQUIRE) == 1) { scr_respond(c, "200 OK", "application/json", busy, sizeof busy - 1); return; }
+    if (__atomic_load_n(&g_scr_doneSeq, __ATOMIC_ACQUIRE) <= 0 || g_scr_lastLen <= 0) { scr_respond(c, "200 OK", "application/json", nosnap, sizeof nosnap - 1); return; }
+    if (!scr_qparam(rq, "k", g_scr_tgTok, sizeof g_scr_tgTok) || !scr_qparam(rq, "c", g_scr_tgChat, sizeof g_scr_tgChat) || !g_scr_tgTok[0] || !g_scr_tgChat[0]) {
+        scr_respond(c, "200 OK", "application/json", bad, sizeof bad - 1); return;
+    }
+    scr_qparam(rq, "cap", g_scr_tgCap, sizeof g_scr_tgCap);
+    scr_qparam(rq, "doc", doc, sizeof doc); g_scr_tgDoc = doc[0] == '1';
+    for (k = 0; k < (int)sizeof g_scr_tgPath - 1 && g_scr_lastPath[k]; k++) g_scr_tgPath[k] = g_scr_lastPath[k];
+    g_scr_tgPath[k] = 0;
+    g_scr_tgMsg[0] = 0; g_scr_tgCode = 0; g_scr_tgId++;
+    __atomic_store_n(&g_scr_tgState, 1, __ATOMIC_RELEASE);
+    dlog("скрин: заявка на отправку в Telegram");
+    if (pthread_create(&t, NULL, scr_tg_thread, NULL) != 0) {
+        scr_tg_msg("не создать поток отправки"); __atomic_store_n(&g_scr_tgState, 3, __ATOMIC_RELEASE);
+    }
+    b_init(&b, js, sizeof js); b_s(&b, "{\"ok\":true,\"id\":"); b_int(&b, g_scr_tgId); b_s(&b, "}");
+    scr_respond(c, "200 OK", "application/json", js, b.n);
+}
+static void scr_http_tgstatus(int c) {
+    char js[520], m[300]; Buf b; unsigned i, k = 0;
+    for (i = 0; g_scr_tgMsg[i] && k + 2 < sizeof m; i++) {          /* для JSON: убираем кавычки/слэши/переводы строк */
+        char ch = g_scr_tgMsg[i];
+        m[k++] = (ch == '"' || ch == '\\' || (unsigned char)ch < 32) ? ' ' : ch;
+    }
+    m[k] = 0;
+    b_init(&b, js, sizeof js);
+    b_s(&b, "{\"id\":"); b_int(&b, g_scr_tgId); b_s(&b, ",\"state\":"); b_int(&b, __atomic_load_n(&g_scr_tgState, __ATOMIC_ACQUIRE));
+    b_s(&b, ",\"code\":"); b_int(&b, g_scr_tgCode); b_s(&b, ",\"msg\":\""); b_s(&b, m); b_s(&b, "\"}");
+    scr_respond(c, "200 OK", "application/json", js, b.n);
+}
+
 static void* scr_http_main(void* arg) {
     int fd = -1, i, one = 1;
     (void)arg;
@@ -348,7 +611,7 @@ static void* scr_http_main(void* arg) {
         dlog_i("скрин: HTTP слушает порт ", g_scr_httpPort);
         for (;;) {
             int c = accept(fd, NULL, NULL);
-            char rq[512]; long n; struct scr_tv t;
+            char rq[1800]; long n; struct scr_tv t;
             if (c < 0) { usleep(100000); continue; }
             t.sec = 5; t.usec = 0;
             setsockopt(c, 1, 20, &t, sizeof t);                   /* SO_RCVTIMEO */
@@ -360,6 +623,8 @@ static void* scr_http_main(void* arg) {
                 else if (sprefix(rq, "GET /screen/status")) scr_http_status(c);
                 else if (sprefix(rq, "GET /screen/shot")) scr_http_shot(c, rq);
                 else if (sprefix(rq, "GET /screen/last")) scr_http_last(c);
+                else if (sprefix(rq, "GET /screen/tgstatus")) scr_http_tgstatus(c);
+                else if (sprefix(rq, "GET /screen/tg")) scr_http_tg(c, rq);
                 else scr_respond(c, "404 Not Found", "text/plain", "no", 2);
             }
             close(c);
