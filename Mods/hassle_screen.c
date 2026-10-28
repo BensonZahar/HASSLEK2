@@ -73,9 +73,11 @@ static int scr_prepare_dir(void) {
     if (!g_flog[0]) return 0;
     for (i = 0; g_flog[i] && i < sizeof g_scr_dir - 8; i++) { g_scr_dir[i] = g_flog[i]; if (g_flog[i] == '/') last = i; }
     g_scr_dir[last] = 0;
-    {
-        Buf b; b_init(&b, g_scr_dir, sizeof g_scr_dir);
-        b.n = last; b_s(&b, "/shots"); mkdir(g_scr_dir, 0777);
+    {   /* b_init обнуляет первый байт буфера и стирает путь, поэтому дописываем «/shots» вручную */
+        static const char tail[] = "/shots"; unsigned k;
+        for (k = 0; tail[k] && last + k + 1 < sizeof g_scr_dir; k++) g_scr_dir[last + k] = tail[k];
+        g_scr_dir[last + k] = 0;
+        mkdir(g_scr_dir, 0777);
     }
     return 1;
 }
