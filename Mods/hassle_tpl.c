@@ -20,6 +20,12 @@
  *   /tpl alt             переключить способ телепорта (запасной — через движение персонажа); если /tpl «не двигает», попробуйте его.
  *                        «/tpl alt 3 назад» — переключить И сразу прыгнуть
  *   /tpl status          какой способ сейчас выбран;  /tpl help — подсказка
+ *   /tpl ghost [on|off|back]   «призрак»: игра перестаёт слать серверу вашу позицию (и прицел), пока режим включён. Сервер и его NPC
+ *                        считают, что вы стоите там, где включили режим, а вы свободно ходите и телепортируетесь (/tpl …) в другом месте.
+ *                        Без аргумента — переключить. «off» — выключить (сервер получит настоящую позицию: вы «появитесь» на новом месте),
+ *                        «back» — вернуться на точку включения и выключить. «/tpl ghost unhook» — вернуть код игры в исходный вид.
+ *   /tpl int N           сменить интерьер на номер N (0..255, 0 — улица). Только номер, координаты не нужны и тело не двигается.
+ *                        «/tpl int» без номера — показать текущий (он же в строке «/tpl pos»).
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
  *
  * Как это работает
@@ -41,7 +47,26 @@
  *   • Обработчик команды вызывается игрой в ГЛАВНОМ потоке (как у /rec и /nocol), поэтому Post/SynchronizationContext не нужны.
  *   • В машине не работает (телепорт водителя/пассажира сломал бы синхронизацию). Лимита по дальности нет: большие прыжки сервер может откатить,
  *     а на далёкой точке карта может быть не загружена (можно провалиться) — это на ваше усмотрение.
- *   • Это не «клиентская» штука, как /nocol: позиция уходит на сервер как обычная, и другие игроки вас видят на новом месте.
+ *   • Это не «клиентская» штука, как /nocol: позиция уходит на сервер как обычная, и другие игроки вас видят на новом месте
+ *     (если не включён /tpl ghost — тогда позиция на сервер не уходит вовсе).
+ *
+ * «Призрак» (/tpl ghost)
+ *   • Позицию на сервер шлёт LocalPlayer.SendSyncData → SendOnFootFullSyncData (пакет «пешком», в нём Position), а камеру/прицел —
+ *     SendAimSyncData. В НАЧАЛО этих двух методов ставится перехват (тот же приём, что в hassle_weapon.c: 16 байт пролога заменяются на
+ *     абсолютный прыжок в заглушку; заглушка зовёт gh_hook и, если он вернул 1, сразу возвращается из метода — пакет не уходит;
+ *     если 0 — выполняет затёртые инструкции и продолжает метод как обычно). Пока режим выключен, хук всегда отвечает 0.
+ *   • Место патча не зашито адресом: методы находим по имени. Перед патчем проверяем, что пролог начинается с «sub sp, sp, #…» и
+ *     4 затираемые инструкции не зависят от адреса; иначе ничего не трогаем. Только arm64.
+ *   • Сервер при этом просто не получает пакеты: он помнит последнюю позицию (ту, где вы включили режим) и показывает вас там
+ *     всем (и NPC, и игрокам). Это РАССИНХРОН, а не невидимость: игроки видят вас стоящим на старом месте.
+ *   • Чего НЕ перехватываем: пакеты машины (Drive/Passenger) и выстрела (SendBulletSyncData). В машине и при стрельбе сервер
+ *     узнает настоящую позицию — в призраке не садитесь в машину и не стреляйте. Любая серверная проверка рассинхрона позиций
+ *     может кикнуть или забанить: режим на ваш риск.
+ *
+ * «Интерьер» (/tpl int N)
+ *   • Зовёт LocalPlayer.SetInterior(byte) — тот самый метод, которым игра сама меняет интерьер по приказу сервера. По коду игры он
+ *     запоминает номер, САМ отправляет серверу RPC об смене интерьера (NetworkClient.SendRPC) и вызывает Lighting.SetInterior
+ *     (освещение). Позиция не меняется: попасть внутрь — /tpl to … / /tpl go … (или стоять там, где уже находитесь).
  */
 #pragma once
 #include "hassle_core.c"
@@ -229,6 +254,14 @@ static void tpl_show(void) {
     b_s(&b, "Координаты: "); tpl_b_xyz(&b, p); b_s(&b, "  — вернуться сюда: /tpl to "); tpl_b_xyz(&b, p);
     chat_say(msg);
     dlog2("/tpl pos: ", msg);
+    {   /* интерьер: LocalPlayer.m_Interior — его ставит LocalPlayer.SetInterior (и приказ сервера SetPlayerInterior, и наш /tpl int) */
+        int in = int_field(c.me, "m_Interior", "m_Interior", NULL, -1);
+        if (in >= 0) {
+            b_init(&b, msg, sizeof msg);
+            b_s(&b, "Интерьер: "); b_int(&b, in); b_s(&b, in == 0 ? " (улица)" : "  — сменить: /tpl int N");
+            chat_say(msg);
+        }
+    }
     if (haveS && (tpl_fabs(sp[0] - p[0]) > 0.5f || tpl_fabs(sp[1] - p[1]) > 0.5f || tpl_fabs(sp[2] - p[2]) > 0.5f)) {
         b_init(&b, msg, sizeof msg);
         b_s(&b, "По пакету синхронизации (как видит сервер): "); tpl_b_xyz(&b, sp);
@@ -266,9 +299,263 @@ static void tpl_goto(const float* v, int nc, const char* label) {
     dlog2("/tpl: ", msg);
 }
 
+/* ───────────── призрак (/tpl ghost) и интерьер (/tpl int) ───────────── */
+#if defined(__aarch64__)
+#define GH_ARM64 1
+extern void* mmap(void*, unsigned long, int, int, int, long);
+extern int munmap(void*, unsigned long);
+extern int mprotect(void*, unsigned long, int);
+extern long pwrite(int, const void*, unsigned long, long);
+#endif
+
+#define GH_SITES 2
+static const char* const g_gh_siteName[GH_SITES] = { "SendOnFootFullSyncData", "SendAimSyncData" };
+static const int g_gh_siteArgc[GH_SITES] = { 1, 0 };     /* SendOnFootFullSyncData(bool force), SendAimSyncData() */
+
+static volatile int g_gh_on;                             /* 1 — пакеты позиции и прицела не уходят */
+static volatile unsigned g_gh_hits;                      /* сколько пакетов хук проглотил — по нему видно, что перехват живой */
+static float g_gh_pos[3];                                /* где вы были в момент включения (где сервер вас «помнит») */
+static int g_gh_havePos;
+static int g_gh_state;                                   /* 1 — перехваты стоят */
+static char g_gh_err[160];
+
+/* Зовётся из заглушки в начале SendOnFootFullSyncData / SendAimSyncData (главный поток). 1 — метод пропустить. Только атомики, без вызовов IL2CPP. */
+__attribute__((noinline, used))
+static int gh_hook(void* player, void* a1) {
+    (void)player; (void)a1;
+    if (!__atomic_load_n(&g_gh_on, __ATOMIC_ACQUIRE)) return 0;
+    __atomic_fetch_add(&g_gh_hits, 1u, __ATOMIC_RELAXED);
+    return 1;
+}
+
+static int gh_fail(const char* why) {
+    unsigned i = 0;
+    for (; why[i] && i < sizeof g_gh_err - 1; i++) g_gh_err[i] = why[i];
+    g_gh_err[i] = 0;
+    dlog2("/tpl ghost: перехват не поставлен: ", why);
+    return 0;
+}
+
+/* Инструкция зависит от своего адреса (при переносе в заглушку сломается)? */
+static int gh_pc_rel(u32 w) {
+    if ((w & 0x1F000000u) == 0x10000000u) return 1;              /* ADR, ADRP */
+    if ((w & 0x3B000000u) == 0x18000000u) return 1;              /* LDR / LDRSW / PRFM (literal) */
+    if ((w & 0x7C000000u) == 0x14000000u) return 1;              /* B, BL */
+    if ((w & 0xFF000010u) == 0x54000000u) return 1;              /* B.cond */
+    if ((w & 0x7E000000u) == 0x34000000u) return 1;              /* CBZ, CBNZ */
+    if ((w & 0x7E000000u) == 0x36000000u) return 1;              /* TBZ, TBNZ */
+    return 0;
+}
+
+#define GH_TRAMP_WORDS 32                                /* место под одну заглушку (занято 22 слова) */
+/* Заглушка (arm64). Вход — абсолютным прыжком из начала метода, регистры как при входе (x0 — this, x1 — аргумент, x2 — MethodInfo).
+   Сохраняем x0–x3 и x30, зовём gh_hook; результат != 0 → восстанавливаем x30/sp и возвращаемся из метода (ret), иначе восстанавливаем
+   x0–x3, выполняем 4 затёртые инструкции и прыгаем на 5-ю инструкцию метода.
+     0  stp x0, x1, [sp, #-48]!      1  stp x2, x3, [sp, #16]       2  str x30, [sp, #32]
+     3  ldr x16, =gh_hook (слово 18) 4  blr x16                     5  cbnz w0, слово 15
+     6  ldr x30, [sp, #32]           7  ldp x2, x3, [sp, #16]       8  ldp x0, x1, [sp], #48
+     9-12 четыре затёртые инструкции (позиционно независимые — проверено gh_pc_rel)
+    13  ldr x16, =метод+16 (слово 20) 14 br x16
+    15  ldr x30, [sp, #32]           16 add sp, sp, #48             17 ret
+    18-19 адрес gh_hook              20-21 адрес метода+16 */
+static void gh_make_tramp(u32* t, const u32* orig4, uptr hook, uptr resume) {
+    int i;
+    t[0] = 0xA9BD07E0u;
+    t[1] = 0xA9010FE2u;
+    t[2] = 0xF90013FEu;
+    t[3] = 0x580001F0u;
+    t[4] = 0xD63F0200u;
+    t[5] = 0x35000140u;
+    t[6] = 0xF94013FEu;
+    t[7] = 0xA9410FE2u;
+    t[8] = 0xA8C307E0u;
+    for (i = 0; i < 4; i++) t[9 + i] = orig4[i];
+    t[13] = 0x580000F0u;
+    t[14] = 0xD61F0200u;
+    t[15] = 0xF94013FEu;
+    t[16] = 0x9100C3FFu;
+    t[17] = 0xD65F03C0u;
+    t[18] = (u32)(hook & 0xFFFFFFFFu);
+    t[19] = (u32)(((unsigned long long)hook) >> 32);
+    t[20] = (u32)(resume & 0xFFFFFFFFu);
+    t[21] = (u32)(((unsigned long long)resume) >> 32);
+}
+/* 16 байт, которыми заменяется начало метода: ldr x16,[pc,#8]; br x16; .quad адрес заглушки */
+static void gh_make_entry(u32* e, uptr tramp) {
+    e[0] = 0x58000050u;
+    e[1] = 0xD61F0200u;
+    e[2] = (u32)(tramp & 0xFFFFFFFFu);
+    e[3] = (u32)(((unsigned long long)tramp) >> 32);
+}
+
+#ifdef GH_ARM64
+static void* g_gh_veneer;                                /* страница с заглушками (после снятия остаётся — вдруг поток ещё внутри) */
+static uptr g_gh_site[GH_SITES];                         /* адреса методов */
+static u32 g_gh_orig[GH_SITES][4];                       /* их исходные 4 слова */
+static int g_gh_patched[GH_SITES];
+
+static void gh_flush(void* p, unsigned n) {              /* синхронизация кэшей после записи кода */
+    uptr ctr, dl, il, a, e;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    dl = 4u << ((ctr >> 16) & 15u); il = 4u << (ctr & 15u);
+    e = (uptr)p + n;
+    for (a = (uptr)p & ~(dl - 1); a < e; a += dl) __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (a = (uptr)p & ~(il - 1); a < e; a += il) __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+/* Записать n слов в код игры; права на страницы возвращаются как были (r-x). Слова пишутся с конца к началу: первым ложится адрес,
+   последним — первая инструкция. Запасной путь — /proc/self/mem. */
+static int gh_write_code(uptr addr, const u32* w, int n) {
+    uptr p0 = addr & ~(uptr)4095, p1 = (addr + (uptr)n * 4 - 1) & ~(uptr)4095;
+    unsigned long len = (unsigned long)(p1 - p0) + 4096;
+    int i;
+    if (mprotect((void*)p0, len, 7) == 0) {
+        for (i = n - 1; i >= 0; i--) ((volatile u32*)addr)[i] = w[i];
+        gh_flush((void*)addr, (unsigned)n * 4);
+        mprotect((void*)p0, len, 5);
+        return 1;
+    }
+    {
+        int fd = open("/proc/self/mem", 2); long r = -1;
+        if (fd >= 0) { r = pwrite(fd, w, (unsigned long)n * 4, (long)addr); close(fd); }
+        if (r == (long)n * 4) { gh_flush((void*)addr, (unsigned)n * 4); return 1; }
+    }
+    return 0;
+}
+static int gh_install(void) {
+    void* kls; uptr fn[GH_SITES]; u32 code[GH_SITES][4]; int s, i;
+    if (g_gh_state == 1) return 1;
+    if (!g_img) return gh_fail("игра ещё не готова");
+    kls = A.class_from_name(g_img, "Hassle.Players", "LocalPlayer");
+    if (!kls) return gh_fail("нет класса LocalPlayer");
+    for (s = 0; s < GH_SITES; s++) {
+        void* m = A.class_get_method_from_name(kls, g_gh_siteName[s], g_gh_siteArgc[s]);
+        if (!m || !hm_readable(m, sizeof(void*))) return gh_fail("нет метода отправки синхронизации");
+        fn[s] = *(uptr*)m;
+        if (!fn[s] || (fn[s] & 3) || !hm_range_ok((void*)fn[s], 64)) return gh_fail("адрес метода отправки нечитаем");
+        for (i = 0; i < 4; i++) code[s][i] = ((const u32*)fn[s])[i];
+        if (g_gh_veneer && g_gh_patched[s] && g_gh_site[s] == fn[s]) for (i = 0; i < 4; i++) code[s][i] = g_gh_orig[s][i];   /* уже патчен нами — берём сохранённое */
+        if ((code[s][0] & 0xFF0003FFu) != 0xD10003FFu) return gh_fail("пролог метода не начинается с «sub sp, sp, #…» (другая сборка игры?)");
+        for (i = 0; i < 4; i++) if (gh_pc_rel(code[s][i])) return gh_fail("пролог метода зависит от адреса — перенести нельзя");
+        if (g_gh_veneer && g_gh_site[s] && g_gh_site[s] != fn[s]) return gh_fail("адрес метода изменился после первой установки");
+    }
+    if (!g_gh_veneer) {
+        u32 v[GH_TRAMP_WORDS];
+        void* page = mmap(NULL, 4096, 3, 0x22, -1, 0);           /* R|W, MAP_PRIVATE|MAP_ANONYMOUS; адрес любой — прыжок абсолютный */
+        if (page == (void*)-1 || !page) return gh_fail("не удалось выделить страницу под заглушки");
+        for (s = 0; s < GH_SITES; s++) {
+            for (i = 0; i < GH_TRAMP_WORDS; i++) v[i] = 0xD503201Fu;     /* nop */
+            gh_make_tramp(v, code[s], (uptr)gh_hook, fn[s] + 16);
+            for (i = 0; i < GH_TRAMP_WORDS; i++) ((u32*)page)[s * GH_TRAMP_WORDS + i] = v[i];
+        }
+        gh_flush(page, (unsigned)(GH_SITES * GH_TRAMP_WORDS * 4));
+        if (mprotect(page, 4096, 5) != 0) { munmap(page, 4096); return gh_fail("не удалось сделать страницу заглушек исполняемой"); }
+        g_gh_veneer = page;
+        for (s = 0; s < GH_SITES; s++) { g_gh_site[s] = fn[s]; for (i = 0; i < 4; i++) g_gh_orig[s][i] = code[s][i]; }
+    }
+    for (s = 0; s < GH_SITES; s++) {
+        u32 e[4];
+        if (g_gh_patched[s]) continue;
+        gh_make_entry(e, (uptr)((u32*)g_gh_veneer + s * GH_TRAMP_WORDS));
+        if (!gh_write_code(fn[s], e, 4)) {
+            int k;
+            for (k = 0; k < s; k++) if (g_gh_patched[k] && gh_write_code(g_gh_site[k], g_gh_orig[k], 4)) g_gh_patched[k] = 0;   /* откат первого */
+            return gh_fail("запись в код игры запрещена системой");
+        }
+        g_gh_patched[s] = 1;
+    }
+    g_gh_state = 1;
+    dlog("/tpl ghost: перехваты SendOnFootFullSyncData и SendAimSyncData установлены");
+    return 1;
+}
+static void gh_unhook(void) {
+    int s, ok = 1;
+    __atomic_store_n(&g_gh_on, 0, __ATOMIC_RELEASE);
+    for (s = 0; s < GH_SITES; s++)
+        if (g_gh_patched[s]) { if (gh_write_code(g_gh_site[s], g_gh_orig[s], 4)) g_gh_patched[s] = 0; else ok = 0; }
+    if (ok) { g_gh_state = 0; dlog("/tpl ghost: перехваты сняты, код игры восстановлен"); }
+    else dlog("/tpl ghost: не удалось вернуть исходные инструкции");
+}
+#else
+static int gh_install(void) { return gh_fail("поддерживается только arm64"); }
+static void gh_unhook(void) { __atomic_store_n(&g_gh_on, 0, __ATOMIC_RELEASE); }
+#endif
+
+static void tpl_cmd_ghost(int sub) {
+    TplCtx c; Buf b; char msg[300];
+    if (sub == 4) {
+        gh_unhook();
+        chat_say(g_gh_state ? "Призрак: выключен, но вернуть код игры не удалось (см. konstt.log)" : "Призрак: выключен, перехваты сняты, код игры в исходном виде");
+        return;
+    }
+    if (sub == 0) sub = g_gh_on ? 2 : 1;
+    if (sub == 1) {
+        if (g_gh_on) { chat_say("Призрак уже включён (выключить: /tpl ghost off, вернуться: /tpl ghost back)"); return; }
+        if (!tpl_ctx(&c, 1)) return;                                 /* пешком: пакеты машины мы не перехватываем */
+        if (!tpl_cur_pos(&c, g_gh_pos)) { chat_say("Призрак: не удалось прочитать вашу позицию (подробности в konstt.log)"); return; }
+        g_gh_havePos = 1;
+        if (!gh_install()) { chat_say("Призрак: не удалось поставить перехват — подробности в konstt.log"); return; }
+        __atomic_store_n(&g_gh_on, 1, __ATOMIC_RELEASE);
+        b_init(&b, msg, sizeof msg);
+        b_s(&b, "Призрак ВКЛЮЧЁН: сервер и NPC считают, что вы стоите здесь: "); tpl_b_xyz(&b, g_gh_pos);
+        chat_say(msg);
+        chat_usage("Теперь двигайтесь или телепортируйтесь (/tpl …). Не садитесь в машину и не стреляйте — это выдаст позицию. Выключить: /tpl ghost off, вернуться на место: /tpl ghost back");
+        dlog2("/tpl ghost: ", msg);
+        return;
+    }
+    if (!g_gh_on) { chat_say("Призрак и так выключен"); return; }
+    if (sub == 3) {
+        if (!g_gh_havePos) { chat_say("Призрак: точка включения неизвестна — выключаю без возврата"); }
+        else {
+            if (!tpl_ctx(&c, 1)) return;                             /* в машине вернуться нельзя — режим остаётся включённым */
+            tpl_goto(g_gh_pos, 3, "включения призрака");
+        }
+    }
+    __atomic_store_n(&g_gh_on, 0, __ATOMIC_RELEASE);
+    b_init(&b, msg, sizeof msg);
+    b_s(&b, "Призрак выключен (не отправлено пакетов: "); b_int(&b, (long)g_gh_hits); b_s(&b, ")");
+    if (sub == 2) b_s(&b, ". Сервер получит вашу настоящую позицию — для NPC и игроков вы появитесь на новом месте");
+    chat_say(msg);
+    dlog2("/tpl ghost: ", msg);
+}
+static void tpl_status_extra(void) {
+    char m[200]; Buf b; b_init(&b, m, sizeof m);
+    b_s(&b, "Призрак: "); b_s(&b, g_gh_on ? "ВКЛЮЧЁН" : "выключен");
+    b_s(&b, g_gh_state ? ", перехват стоит" : ", перехват не поставлен");
+    b_s(&b, ", пакетов не отправлено: "); b_int(&b, (long)g_gh_hits);
+    chat_say(m);
+}
+
+/* «/tpl int N»: сменить интерьер на N (только номер). have=0 — номер не указан, показать текущий */
+static void tpl_cmd_int(int id, int have) {
+    TplCtx c; Buf b; char msg[240]; void *m, *exc = NULL, *args[1]; u8 v; char et[240];
+    if (!tpl_ctx(&c, 0)) return;
+    if (!have) {
+        int cur = int_field(c.me, "m_Interior", "m_Interior", NULL, -1);
+        b_init(&b, msg, sizeof msg);
+        if (cur < 0) b_s(&b, "Интерьер: текущий номер прочитать не удалось. Сменить: /tpl int N");
+        else { b_s(&b, "Интерьер сейчас: "); b_int(&b, cur); b_s(&b, ". Сменить: /tpl int N (0 — улица)"); }
+        chat_say(msg);
+        return;
+    }
+    if (id < 0 || id > 255) { chat_say("Интерьер: номер от 0 до 255 (0 — улица)"); return; }
+    m = find_method(A.object_get_class(c.me), "SetInterior", 1);
+    if (!m) { chat_say("Интерьер: метод SetInterior не найден (подробности в konstt.log)"); dlog("/tpl int: LocalPlayer.SetInterior не найден"); return; }
+    v = (u8)id; args[0] = &v;
+    A.runtime_invoke(m, c.me, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("/tpl int: SetInterior бросил исключение: ", et); chat_say("Интерьер: не вышло — подробности в konstt.log"); return; }
+    b_init(&b, msg, sizeof msg);
+    b_s(&b, "Интерьер: "); b_int(&b, id); b_s(&b, id == 0 ? " (улица)" : "");
+    b_s(&b, ". Игра сама сообщила об этом серверу. Позиция не менялась");
+    chat_say(msg);
+    dlog2("/tpl int: ", msg);
+}
+
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN; float dist; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
-/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя.  name — имя точки (слово после save/go/del);
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet; float dist, rawNum; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
+/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int.
+   gsub (для ghost): 0 — переключить, 1 on, 2 off, 3 back, 4 unhook;  iid/iidSet — номер интерьера;  rawNum — число до подрезки по TPL_MIN (для «/tpl 0 int»).  name — имя точки (слово после save/go/del);
    unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
 
 /* UTF-8 в нижний регистр для кириллицы (ASCII свёртывает вызывающий): А–П → а–п, Р–Я → р–я, Ё → ё */
@@ -285,7 +572,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -301,7 +588,17 @@ static int tpl_word(const char* t) {
     if (seq(t, "go") || seq(t, "иди") || seq(t, "вернуться")) return 16;
     if (seq(t, "list") || seq(t, "ls") || seq(t, "points") || seq(t, "список") || seq(t, "точки")) return 17;
     if (seq(t, "del") || seq(t, "delete") || seq(t, "rm") || seq(t, "remove") || seq(t, "удали") || seq(t, "удалить")) return 18;
+    if (seq(t, "ghost") || seq(t, "gh") || seq(t, "призрак") || seq(t, "невидимка") || seq(t, "hide")) return 19;
+    if (seq(t, "int") || seq(t, "interior") || seq(t, "инт") || seq(t, "интерьер")) return 20;
     return -1;
+}
+/* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 0 — не оно */
+static int tpl_gword(const char* t) {
+    if (seq(t, "on") || seq(t, "1") || seq(t, "вкл") || seq(t, "включить")) return 1;
+    if (seq(t, "off") || seq(t, "0") || seq(t, "выкл") || seq(t, "выключить")) return 2;
+    if (seq(t, "back") || seq(t, "назад") || seq(t, "вернись") || seq(t, "возврат") || seq(t, "return")) return 3;
+    if (seq(t, "unhook") || seq(t, "снять")) return 4;
+    return 0;
 }
 /* вся строка — число («2», «2.5», «2,5»)? */
 static int tpl_num(const char* t, float* out) {
@@ -337,6 +634,8 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 16) a->mode = 4;
     else if (w == 17) a->mode = 5;
     else if (w == 18) a->mode = 6;
+    else if (w == 19) a->mode = 7;
+    else if (w == 20) a->mode = 8;
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -345,6 +644,8 @@ static void tpl_token(const char* tok, TplArgs* a) {
         tpl_copy_name(a->name, tok, TPL_NAME); a->nameSet = a->name[0] ? 1 : 0;
         return;
     }
+    if (a->mode == 7) { int g = tpl_gword(tok); if (g) { a->gsub = g; return; } }     /* после «ghost»: on / off / back / unhook */
+    if (a->mode == 8 && tpl_num(tok, &v)) { a->iid = (int)(v + 0.5f); a->iidSet = 1; return; }   /* после «int»: номер (0 — валидный, не подрезаем) */
     if (a->mode == 2 && tpl_snum(tok, &v)) {                       /* после «to» числа — это координаты (с минусом можно) */
         if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
         return;
@@ -371,7 +672,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
     a->bad = 1;
 }
 static void tpl_args_init(TplArgs* a) {
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = 0; a->dist = TPL_DEF;
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = 0; a->dist = TPL_DEF; a->rawNum = -1.0f;
     a->c[0] = a->c[1] = a->c[2] = 0.0f; a->name[0] = a->unk[0] = 0;
 }
 /* аргументы: string[] */
@@ -398,6 +699,7 @@ static void tpl_parse(void* arr, TplArgs* a) {
             tpl_token(tok, a);
         }
     }
+    a->rawNum = a->numSet ? a->dist : -1.0f;
     if (a->dist < TPL_MIN) a->dist = TPL_MIN;
     if (a->dist > TPL_MAX) { a->dist = TPL_MAX; a->clamped = 1; }
 }
@@ -566,6 +868,7 @@ static void tpl_cmd_list(int page) {
 static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
+    chat_usage("/tpl ghost [on|off|back] — призрак: сервер и NPC не видят, что вы двигаетесь;  /tpl int N — сменить интерьер (только номер, 0 — улица)");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
@@ -594,12 +897,20 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
     }
     if (a.status) {
         chat_say(g_tpl_alt ? "Телепорт: сейчас способ «через движение» (/tpl alt — вернуть основной)" : "Телепорт: сейчас основной способ Player.SetPosition (/tpl alt — запасной)");
+        tpl_status_extra();
         return;
     }
     if (a.mode == 1) { tpl_show(); return; }
     if (a.mode == 2) {
         if (a.nc != 2 && a.nc != 3) { chat_usage("Нужно 3 числа: /tpl to X Y Z (или 2 числа X Z — высота по земле). Числа с минусом можно, например /tpl to 120.5 8 -340"); return; }
         tpl_goto(a.c, a.nc, NULL);
+        return;
+    }
+    if (a.mode == 7) { tpl_cmd_ghost(a.gsub); return; }
+    if (a.mode == 8) {
+        int have = a.iidSet || a.numSet;
+        int id = a.iidSet ? a.iid : (a.numSet ? (int)(a.rawNum + 0.5f) : 0);        /* «/tpl 5 int» — число стояло до слова int */
+        tpl_cmd_int(id, have);
         return;
     }
     if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
@@ -617,7 +928,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back] | int N");
     return NULL;
 }
 #ifndef KONSTT_TEST
