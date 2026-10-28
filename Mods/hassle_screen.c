@@ -18,7 +18,7 @@
  * Скрин из Telegram (кнопка «📸 Скрин» в меню «Управление» скрипта HassleB)
  *   • Свой крошечный HTTP-сервер на 127.0.0.1:17781..17790 (Near занимает 17771..17780 — не пересекаемся). Скрипт (WebView) ходит
  *     на него обычным XHR, как Near.js. Игровой поток сервер не трогает: только атомарные флаги и чтение файла.
- *       GET /screen/status        JSON: v, seq (номер последнего УДАЧНОГО снимка), fails (сколько снимков не вышло), w, h, bytes,
+ *       GET /screen/status        JSON: v, cap (2 — умеет Live: m=, kb=, live=1; нет поля — старая сборка), seq (номер последнего УДАЧНОГО снимка), fails (сколько снимков не вышло), w, h, bytes,
  *                                 pending, hooked, dead. Скрипт ждёт роста seq (готово) или fails (не вышло).
  *       GET /screen/shot?delay=N  заявка на снимок (по умолчанию 0 с). {"ok":true} | {"ok":false,"err":"busy"|"need_cmd"}.
  *                                 need_cmd — подписка на кадр ещё не сделана (первый раз после запуска игры): скрипт шлёт в чат «/screen 0».
@@ -622,7 +622,7 @@ static void scr_respond(int fd, const char* status, const char* ctype, const cha
 static void scr_http_status(int c) {
     char js[320]; Buf b;
     b_init(&b, js, sizeof js);
-    b_s(&b, "{\"v\":1,\"seq\":"); b_int(&b, __atomic_load_n(&g_scr_doneSeq, __ATOMIC_ACQUIRE));
+    b_s(&b, "{\"v\":1,\"cap\":2,\"seq\":"); b_int(&b, __atomic_load_n(&g_scr_doneSeq, __ATOMIC_ACQUIRE));
     b_s(&b, ",\"fails\":"); b_int(&b, __atomic_load_n(&g_scr_fails, __ATOMIC_ACQUIRE));
     b_s(&b, ",\"w\":"); b_int(&b, g_scr_lastW); b_s(&b, ",\"h\":"); b_int(&b, g_scr_lastH);
     b_s(&b, ",\"bytes\":"); b_int(&b, g_scr_lastLen);
