@@ -280,6 +280,7 @@ static void native_nearlog_cmd(void* self, void* args, void* mi) {
 
 /* /nearlog регистрируется, как только ядро нашло образец делегата (раньше это делал сборщик вместе с /rec) */
 static int g_nearlogReg;
+static int g_near_modId = -1;                          /* номер в реестре модов: по нему на экране загрузки считается «Запускаем моды N/M» */
 static void near_try_register(void) {
     int st = __atomic_load_n(&g_tplState, __ATOMIC_ACQUIRE);
     if (g_nearlogReg || !st) return;                     /* 0 — образец ещё ищется */
@@ -298,6 +299,7 @@ static void* near_collector_main(void* arg) {
         usleep(POLL_US);
     }
     dlog("near: игра готова, начинаю опрос игроков");
+    hm_mod_ready(g_near_modId);                          /* мод заработал — на экране загрузки он засчитан */
     for (;;) {
         near_try_register();
         collect_tick();
@@ -388,6 +390,7 @@ static void* near_server_thread(void* arg) {
 #ifndef KONSTT_TEST
 __attribute__((constructor)) static void near_mod_ctor(void) {   /* только создаёт потоки-ждуны; IL2CPP они трогают после готовности игры */
     unsigned long t1 = 0, t2 = 0;
+    g_near_modId = hm_mod_register("near");              /* учесть мод в счётчике — только в конструкторе */
     pthread_create(&t1, NULL, near_server_thread, NULL);
     pthread_create(&t2, NULL, near_collector_main, NULL);
 }
