@@ -8,7 +8,9 @@
  * Команды:
  *   /air                  включить (поднимет на 2.5 м) ↔ выключить
  *   /air on [м]           включить, подняться на столько метров (0.5…60);  /air off — выключить;  /air land — выключить и поставить на землю
- *   /air up [м]  /air down [м]   сместиться вверх/вниз (по умолчанию 1 м)
+ *   Кнопки (как в airbrake из SAMP, только на экране): джойстик — лететь; кнопка ПРЫЖОК (держите) — вверх; ПРИСЕД (двойное касание джойстика и
+ *                         удержание, так игра включает присед) — вниз. Камерой вверх/вниз тоже можно (режим 3d). /air keys — выключить/включить эти кнопки.
+ *   /air up [м]  /air down [м]   сместиться вверх/вниз сразу на N метров (по умолчанию 1 м)
  *   /air speed N          скорость полёта, м/с (по умолчанию 6, до 40)
  *   /air flat | 3d        flat — по джойстику летите только горизонтально (высота — командами up/down);
  *                         3d (по умолчанию) — вперёд летите туда, куда смотрит камера, в т.ч. вверх/вниз: посмотрели вниз на кучу — и опускаетесь к ней
@@ -23,6 +25,9 @@
  *     колбэк в UnitySynchronizationContext), в нём мы считаем новую точку = прежняя + направление джойстика × скорость × dt и ставим
  *     персонажа туда ICharacterMovement.SetPosition(Vector3, updateGround=false) — это прямая постановка капсулы, как «/tpl alt»,
  *     и обнуляем ICharacterMovement.velocity. Так игра не может ни уронить вас (гравитацию мы просто не используем), ни толкнуть.
+ *   • Кнопки: в JS-интерфейсе (Hud.js) джойстик — это экранный стик Unity Input System «<Gamepad>/leftStick» со значением (dx/max, -dy/max): вверх по экрану = +,
+ *     прыжок — «<Keyboard>/leftShift», присед — «<Keyboard>/c» (двойной тап по джойстику). В игре они приходят в Character.Keys (Dictionary<PadKeys,bool>):
+ *     KEY_JUMP = 5, KEY_CROUCH = 1 — словарь читаем напрямую из его массива записей (без вызова методов обобщённого класса).
  *   • Направление: Character.m_MovementInput (Vector2: x — вправо, y — вперёд) и камера Game.MainCamera: «вправо» берётся по горизонтали,
  *     «вперёд» — по камере (3d) либо горизонтально (flat). Если джойстик не читается, /air input переключает на Character.MovementDirection
  *     (мировой вектор; осторожно: если игра не обнуляет его в покое, вас будет сносить — тогда верните /air input ещё раз).
@@ -60,6 +65,8 @@ static float g_air_speed = AIR_SPEED;
 static int g_air_look3d = 1;
 static int g_air_inSrc;                           /* 0 — Character.m_MovementInput, 1 — Character.MovementDirection */
 static int g_air_watch;
+static int g_air_keys = 1;                         /* 1 — прыжок/присед двигают вверх/вниз */
+static int g_air_kj, g_air_kc;                     /* последнее состояние кнопок (для /air status) */
 static float g_air_hold[3], g_air_last[3], g_air_y0;
 static long long g_air_tPrev;
 static void* g_air_ctrl;                          /* контроллер, к которому уже применены флаги (сменился — персонаж пересоздан, применяем заново) */
@@ -289,6 +296,49 @@ static int air_move_vec(const AirCtx* c, float* out) {
     return 1;
 }
 
+
+/* ───────────── кнопки: Character.Keys (Dictionary<PadKeys,bool>) ───────────── */
+#define AIR_KEY_CROUCH 1
+#define AIR_KEY_JUMP 5
+static int g_air_kInit, g_air_kOffK = -1, g_air_kOffV = -1, g_air_kOffH = -1, g_air_kEsz;
+/* состояние кнопок jump и crouch за один проход по записям словаря. 1 — словарь прочитался */
+static int air_keys(void* ctrl, int* jump, int* crouch) {
+    void *dict, *arr, *ac, *ec; int cnt, i; long len; char* data;
+    *jump = *crouch = 0;
+    dict = ctrl ? ref_field_s(ctrl, "Keys") : NULL;
+    if (!dict) return 0;
+    arr = ref_field_s(dict, "_entries"); if (!arr) arr = ref_field_s(dict, "entries");
+    if (!arr || !hm_obj_ok(arr)) return 0;
+    if (!g_air_kInit) {                                              /* смещения полей записи — один раз */
+        void *fk, *fv, *fh; int shift;
+        ac = A.object_get_class(arr); ec = A.class_get_element_class(ac);
+        fk = ec ? find_field(ec, "key") : NULL; fv = ec ? find_field(ec, "value") : NULL; fh = ec ? find_field(ec, "hashCode") : NULL;
+        g_air_kEsz = ec ? arr_elem_size(ec) : 0;
+        if (!fk || !fv || g_air_kEsz <= 0) { g_air_kInit = -1; dlog("air: Character.Keys: не разобрать запись словаря — кнопки вверх/вниз не работают"); return 0; }
+        shift = A.class_is_valuetype(ec) ? struct_shift(ec) : 0;
+        g_air_kOffK = A.field_get_offset(fk) - shift; g_air_kOffV = A.field_get_offset(fv) - shift;
+        g_air_kOffH = fh ? A.field_get_offset(fh) - shift : -1;
+        g_air_kInit = 1;
+        { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "air: Character.Keys: размер записи "); b_int(&x, g_air_kEsz); b_s(&x, ", смещения key/value/hash "); b_int(&x, g_air_kOffK);
+          b_ch(&x, '/'); b_int(&x, g_air_kOffV); b_ch(&x, '/'); b_int(&x, g_air_kOffH); dlog(lg); }
+    }
+    if (g_air_kInit < 0) return 0;
+    cnt = int_field(dict, "_count", "count", NULL, -1);
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 64) return 0;
+    if (cnt < 0 || cnt > len) cnt = (int)len;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < cnt; i++) {
+        char* e = data + (uptr)i * (uptr)g_air_kEsz; int key;
+        if (!hm_range_ok(e, g_air_kEsz)) break;
+        if (g_air_kOffH >= 0 && *(int*)(e + g_air_kOffH) < 0) continue;     /* свободная запись */
+        key = *(int*)(e + g_air_kOffK);
+        if (key == AIR_KEY_JUMP) *jump = *(u8*)(e + g_air_kOffV) ? 1 : 0;
+        else if (key == AIR_KEY_CROUCH) *crouch = *(u8*)(e + g_air_kOffV) ? 1 : 0;
+    }
+    return 1;
+}
+
 /* ───────────── NPC: ближайшие и поиск по ID (как в /vtune) ───────────── */
 typedef struct { int id; float d, dy; float p[3]; } AirNpc;
 static AirNpc g_air_npc[AIR_NEAR]; static int g_air_nnpc; static float g_air_ref[3];
@@ -443,6 +493,14 @@ static void air_tick(void) {
         g_air_jumps++;
         dlog("air: вас переставили далеко — держу новую точку");
     }
+    if (g_air_keys) {                                                /* прыжок — вверх, присед — вниз (как клавиши высоты в airbrake) */
+        int kj = 0, kc = 0;
+        if (air_keys(c.ctrl, &kj, &kc)) {
+            g_air_kj = kj; g_air_kc = kc;
+            if (kj && !kc) g_air_hold[1] += g_air_speed * dt;
+            else if (kc && !kj) g_air_hold[1] -= g_air_speed * dt;
+        }
+    }
     if (air_move_vec(&c, mv3)) {
         g_air_hold[0] += mv3[0] * g_air_speed * dt;
         g_air_hold[1] += mv3[1] * g_air_speed * dt;
@@ -500,7 +558,7 @@ static int air_tokens(void* arr, char tok[][32], int maxn) {
     return n;
 }
 static void air_usage(void) {
-    chat_usage("/air — полёт: вкл/выкл (2.5 м вверх);  /air up|down [м];  /air speed N;  /air flat|3d;  /air land — выключить и на землю");
+    chat_usage("/air — полёт вкл/выкл. Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
     chat_usage("/air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
@@ -518,6 +576,9 @@ static void air_status(void) {
     b_init(&b, m, sizeof m); b_s(&b, "  ввод ("); b_s(&b, g_air_inSrc ? "MovementDirection" : "m_MovementInput"); b_s(&b, "): ");
     b_fix(&b, g_air_rawIn[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_rawIn[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_rawIn[2], 2);
     b_s(&b, " — подвигайте джойстик: числа должны меняться (/air input — сменить источник)");
+    chat_say(m);
+    b_init(&b, m, sizeof m); b_s(&b, "  кнопки вверх/вниз: "); b_s(&b, g_air_keys ? "вкл" : "выкл"); b_s(&b, ", прыжок "); b_s(&b, g_air_kj ? "НАЖАТ" : "нет");
+    b_s(&b, ", присед "); b_s(&b, g_air_kc ? "НАЖАТ" : "нет"); b_s(&b, " — зажмите прыжок: должно стать «НАЖАТ»");
     chat_say(m);
 }
 static void native_air_cmd(void* self, void* args, void* mi) {
@@ -573,6 +634,11 @@ static void native_air_cmd(void* self, void* args, void* mi) {
     }
     if (seq(tok[0], "flat") || seq(tok[0], "ровно")) { g_air_look3d = 0; chat_say("/air: режим flat — по джойстику летите горизонтально, высота — /air up|down"); return; }
     if (seq(tok[0], "3d") || seq(tok[0], "look") || seq(tok[0], "камера")) { g_air_look3d = 1; chat_say("/air: режим 3d — вперёд летите туда, куда смотрит камера"); return; }
+    if (seq(tok[0], "keys") || seq(tok[0], "кнопки")) {
+        g_air_keys = !g_air_keys;
+        chat_say(g_air_keys ? "/air: кнопки включены — ПРЫЖОК (держать) вверх, ПРИСЕД (двойной тап по джойстику и держать) вниз" : "/air: кнопки вверх/вниз выключены (высота — камерой в 3d или /air up|down)");
+        return;
+    }
     if (seq(tok[0], "watch") || seq(tok[0], "слежка")) {
         g_air_watch = !g_air_watch; g_air_watchId = -1;
         chat_say(g_air_watch ? "/air: слежка включена — пока летите, пишу ID ближайшего NPC (ближе 4 м), когда он меняется" : "/air: слежка выключена");
