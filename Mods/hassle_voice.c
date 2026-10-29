@@ -767,12 +767,14 @@ static int vc_has_bl_to(const u32* c, int n, uptr base, uptr target) {
      12-15 четыре затёртые инструкции пролога (позиционно независимые — проверено vc_pc_rel)
      16 ldr x16, =Update+16 (слово 20)  17 br x16
      18-19 адрес vc_hook    20-21 адрес PutData+16 */
+/* ВАЖНО: x2..x7 лежат в кадре заглушки строго по смещениям 16/32/48 (x30 — 64); раньше x4/x5 и x6/x7 были записаны по 64 и 96:
+   x30 затирал сохранённый x4 (frameSize = младшие 32 бита адреса возврата → гигантский буфер, malloc до ~2,5 ГБ), а x6/x7 портили кадр вызывающего. */
 static void vc_make_tramp(u32* t, const u32* orig4, uptr hook, uptr resume) {
     int i;
     for (i = 0; i < VC_TRAMP_WORDS; i++) t[i] = 0;
-    t[0] = 0xA9BB07E0u; t[1] = 0xA9010FE2u; t[2] = 0xA90417E4u; t[3] = 0xA9061FE6u;
+    t[0] = 0xA9BB07E0u; t[1] = 0xA9010FE2u; t[2] = 0xA90217E4u; t[3] = 0xA9031FE6u;
     t[4] = 0xF90023FEu; t[5] = 0x580001B0u; t[6] = 0xD63F0200u;
-    t[7] = 0xF94023FEu; t[8] = 0xA9461FE6u; t[9] = 0xA94417E4u; t[10] = 0xA9410FE2u; t[11] = 0xA8C507E0u;
+    t[7] = 0xF94023FEu; t[8] = 0xA9431FE6u; t[9] = 0xA94217E4u; t[10] = 0xA9410FE2u; t[11] = 0xA8C507E0u;
     for (i = 0; i < 4; i++) t[12 + i] = orig4[i];
     t[16] = 0x58000090u; t[17] = 0xD61F0200u;
     t[18] = (u32)(hook & 0xFFFFFFFFu);   t[19] = (u32)(((unsigned long long)hook) >> 32);
