@@ -1428,7 +1428,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
     if (a.mode == 9) { tpl_cmd_gps(); return; }
     if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList); return; }
     if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
-    if (a.mode == 3 || a.mode == 4 || a.mode == 6) {gp
+    if (a.mode == 3 || a.mode == 4 || a.mode == 6) {
         if (!a.nameSet) { chat_usage(a.mode == 3 ? "Укажите имя точки: /tpl save дом" : a.mode == 4 ? "Укажите имя точки: /tpl go дом (список: /tpl list)" : "Укажите имя точки: /tpl del дом (список: /tpl list)"); return; }
         if (a.mode == 3) tpl_cmd_save(a.name); else if (a.mode == 4) tpl_cmd_go(a.name); else tpl_cmd_del(a.name);
         return;
