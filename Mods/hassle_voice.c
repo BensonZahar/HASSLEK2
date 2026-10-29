@@ -16,7 +16,8 @@
  *   /voice tg        состояние отправки: сколько ушло, сколько ошибок, последняя причина
  *
  * Telegram: токен и чат — в файле <папка voice>/tg.txt (строка 1 — токен бота, 2 — chat_id, 3 — необязательная метка аккаунта) или от скрипта
- *   через HTTP 127.0.0.1:17791..17800 (/voice/status, /voice/cfg?k=&c=&who=&tg=0|1&on=0|1&mode=near|all&test=1; на диск токен не пишется).
+ *   через HTTP 127.0.0.1:17791..17800 (/voice/status, /voice/cfg?k=&c=&who=&tg=0|1&on=0|1&mode=near|all&kb=&test=1; на диск токен не пишется).
+ *   kb — reply_markup (JSON, только ASCII: не-ASCII как \uXXXX, urlencoded) — кнопки под каждым голосовым, их строит скрипт (как kb= у /screen).
  *   Отправка идёт отдельным потоком через JNI HttpURLConnection (как /screen): игру не тормозит; очередь на 32 реплики, лишние отбрасываются.
  *
  * Куда и во что
@@ -358,7 +359,7 @@ static const char* vc_kind(const VcPkt* p) {
    через HTTP /voice/cfg (на диск не пишутся). Очередь короткая: если Telegram не успевает, самые новые реплики отбрасываются, а не копятся. */
 #define VC_TG_Q        32
 #define VC_TG_MIN_MS   400                   /* короче — щелчки и обрывки, не шлём */
-#define VC_UP_HEAD     2048                  /* место под заголовки multipart перед файлом */
+#define VC_UP_HEAD     4096                  /* место под заголовки multipart перед файлом (подпись + кнопки reply_markup) */
 #define VC_UP_MAX      (3 * 1024 * 1024)     /* файл больше (>10 мин речи) не шлём; в .bss — память занимается только по факту записи */
 typedef struct { char path[360]; char nick[48]; const char* kind; int pid, durMs; float dist; } VcTgJob;   /* pid < 0 — не игрок; dist < 0 — расстояние неизвестно */
 static VcTgJob g_vc_tgq[VC_TG_Q];
@@ -368,6 +369,10 @@ static volatile int g_vc_haveLast;
 static volatile int g_vc_tg;                 /* 1 — слать в Telegram */
 static volatile int g_vc_tgCfg;              /* 1 — токен и чат заданы */
 static char g_vc_tgTok[160], g_vc_tgChat[48], g_vc_tgWho[48];
+#define VC_KB_MAX 1400
+static char g_vc_tgKb[2][VC_KB_MAX];         /* reply_markup для sendVoice (JSON, только ASCII) — присылает скрипт; два буфера: отправитель не видит недописанную строку */
+static volatile int g_vc_tgKbIdx;            /* какой буфер актуален */
+static volatile int g_vc_tgKbSet;            /* 1 — клавиатура задана */
 static volatile unsigned g_vc_tgSent, g_vc_tgFail, g_vc_tgDrop;
 static volatile int g_vc_tgCode;
 static char g_vc_tgMsg[200];
@@ -466,7 +471,7 @@ static void vc_mp_field(Buf* b, const char* boundary, const char* name) {
     b_s(b, "--"); b_s(b, boundary); b_s(b, "\r\nContent-Disposition: form-data; name=\""); b_s(b, name); b_s(b, "\"\r\n\r\n");
 }
 /* Собирает multipart в g_vc_upBuf: sendVoice (chat_id, caption, parse_mode, duration, voice) или sendDocument. Возвращает длину тела или 0. */
-static unsigned long vc_tg_build(const char* boundary, const char* chat, const VcTgJob* j, const char* cap, int asDoc) {
+static unsigned long vc_tg_build(const char* boundary, const char* chat, const VcTgJob* j, const char* cap, const char* kb, int asDoc) {
     Buf b; int fd, tooBig = 0; long off, got = 0;
     fd = open(j->path, 0);
     if (fd < 0) { vc_tg_msg("не открыть файл реплики"); return 0; }
@@ -474,6 +479,7 @@ static unsigned long vc_tg_build(const char* boundary, const char* chat, const V
     vc_mp_field(&b, boundary, "chat_id"); b_s(&b, chat); b_s(&b, "\r\n");
     vc_mp_field(&b, boundary, "caption"); b_s(&b, cap); b_s(&b, "\r\n");
     vc_mp_field(&b, boundary, "parse_mode"); b_s(&b, "HTML\r\n");
+    if (kb && kb[0]) { vc_mp_field(&b, boundary, "reply_markup"); b_s(&b, kb); b_s(&b, "\r\n"); }   /* кнопки под голосовым, как у /screen */
     if (!asDoc) { vc_mp_field(&b, boundary, "duration"); b_int(&b, (j->durMs + 500) / 1000); b_s(&b, "\r\n"); }
     b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\""); b_s(&b, asDoc ? "document" : "voice");
     b_s(&b, "\"; filename=\"voice.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
@@ -586,7 +592,7 @@ out:
 
 static unsigned g_vc_boundSeq;
 static void vc_tg_send(const VcTgJob* j) {
-    char cap[700], bd[64], tok[160], chat[48], who[48]; Buf b; unsigned long total; int code = 0, asDoc = 0, retry = 0, att, i;
+    char cap[700], bd[64], tok[160], chat[48], who[48], kb[VC_KB_MAX]; Buf b; unsigned long total; int code = 0, asDoc = 0, retry = 0, att, i;
     if (!g_vc_tgCfg) return;
     for (i = 0; g_vc_tgTok[i] && i < 159; i++) tok[i] = g_vc_tgTok[i];
     tok[i] = 0;
@@ -594,11 +600,14 @@ static void vc_tg_send(const VcTgJob* j) {
     chat[i] = 0;
     for (i = 0; g_vc_tgWho[i] && i < 47; i++) who[i] = g_vc_tgWho[i];
     who[i] = 0;
+    {   const char* ks = g_vc_tgKb[__atomic_load_n(&g_vc_tgKbIdx, __ATOMIC_ACQUIRE) & 1];
+        for (i = 0; ks[i] && i < VC_KB_MAX - 1; i++) kb[i] = ks[i];
+        kb[i] = 0; }
     if (!tok[0] || !chat[0]) return;
     g_vc_tgMsg[0] = 0;
     b_init(&b, bd, sizeof bd); b_s(&b, "----hassle"); b_int(&b, time(NULL)); b_int(&b, (long)++g_vc_boundSeq);
     vc_tg_caption(j, who, cap, sizeof cap);
-    total = vc_tg_build(bd, chat, j, cap, 0);
+    total = vc_tg_build(bd, chat, j, cap, kb, 0);
     for (att = 0; total && att < 4; att++) {
         code = vc_tg_post(tok, asDoc ? "sendDocument" : "sendVoice", bd, total, &retry);
         if (code == 200) break;
@@ -608,9 +617,14 @@ static void vc_tg_send(const VcTgJob* j) {
             while (w-- > 0) usleep(1000000);
             continue;
         }
+        if (code == 400 && kb[0]) {                                     /* не приняли кнопки — голосовое важнее: шлём то же без них */
+            dlog2("voice: 400 с кнопками, шлю без них: ", g_vc_tgMsg);
+            kb[0] = 0; total = vc_tg_build(bd, chat, j, cap, kb, asDoc);
+            continue;
+        }
         if (code == 400 && !asDoc) {                                    /* не принял как голосовое — отправим файлом */
             dlog2("voice: sendVoice 400: ", g_vc_tgMsg);
-            asDoc = 1; total = vc_tg_build(bd, chat, j, cap, 1);
+            asDoc = 1; total = vc_tg_build(bd, chat, j, cap, kb, 1);
             continue;
         }
         break;
@@ -1178,6 +1192,7 @@ static void vc_http_status(int c) {
     b_s(&b, ",\"mode\":\""); b_s(&b, g_vc_mode == VC_MODE_NEAR ? "near" : "all");
     b_s(&b, "\",\"tg\":"); b_int(&b, g_vc_tg ? 1 : 0);
     b_s(&b, ",\"cfg\":"); b_int(&b, g_vc_tgCfg ? 1 : 0);
+    b_s(&b, ",\"kb\":1,\"kbset\":"); b_int(&b, g_vc_tgKbSet ? 1 : 0);     /* kb:1 — сборка умеет кнопки под голосовыми (нет поля — старая) */
     b_s(&b, ",\"files\":"); b_int(&b, (long)g_vc_files);
     b_s(&b, ",\"queued\":"); b_int(&b, (long)(g_vc_tgHead - g_vc_tgTail));
     b_s(&b, ",\"sent\":"); b_int(&b, (long)g_vc_tgSent);
@@ -1189,7 +1204,7 @@ static void vc_http_status(int c) {
 }
 static void vc_http_cfg(int c, const char* rq) {
     static const char okj[] = "{\"ok\":true}", bad[] = "{\"ok\":false,\"err\":\"bad_args\"}", nocfg[] = "{\"ok\":false,\"err\":\"no_token\"}";
-    char tok[160], chat[48], who[48], v[16]; int hasK, hasC;
+    char tok[160], chat[48], who[48], v[16], kbq[VC_KB_MAX]; int hasK, hasC;
     hasK = vc_qparam(rq, "k", tok, sizeof tok); hasC = vc_qparam(rq, "c", chat, sizeof chat);
     if (hasK != hasC || (hasK && (!tok[0] || !chat[0]))) { vc_respond(c, "200 OK", "application/json", bad, sizeof bad - 1); return; }
     if (hasK) {
@@ -1198,6 +1213,14 @@ static void vc_http_cfg(int c, const char* rq) {
         __atomic_store_n(&g_vc_tgCfg, 1, __ATOMIC_RELEASE);
     }
     if (vc_qparam(rq, "who", who, sizeof who)) vc_copy(g_vc_tgWho, sizeof g_vc_tgWho, who);
+    if (vc_qparam(rq, "kb", kbq, sizeof kbq)) {                         /* reply_markup под голосовыми: пусто — убрать кнопки */
+        unsigned kl = slen(kbq);
+        if (kl && (kbq[0] != '{' || kbq[kl - 1] != '}' || kl + 2 >= sizeof kbq)) { kbq[0] = 0; dlog("voice: kb не принят (обрезан или не JSON) — голосовые пойдут без кнопок"); }
+        {   int w = 1 - (__atomic_load_n(&g_vc_tgKbIdx, __ATOMIC_ACQUIRE) & 1);
+            vc_copy(g_vc_tgKb[w], sizeof g_vc_tgKb[w], kbq);
+            __atomic_store_n(&g_vc_tgKbIdx, w, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_vc_tgKbSet, kbq[0] ? 1 : 0, __ATOMIC_RELEASE); }
+    }
     if (vc_qparam(rq, "mode", v, sizeof v)) __atomic_store_n(&g_vc_mode, seq(v, "all") ? VC_MODE_ALL : VC_MODE_NEAR, __ATOMIC_RELEASE);
     if (vc_qparam(rq, "tg", v, sizeof v)) {
         if (v[0] == '1' && g_vc_tgCfg) { __atomic_store_n(&g_vc_tg, 1, __ATOMIC_RELEASE); __atomic_store_n(&g_vc_reqRec, 1, __ATOMIC_RELEASE); __atomic_store_n(&g_vc_reqTgFlag, 1, __ATOMIC_RELEASE); }
@@ -1227,7 +1250,7 @@ static void* vc_http_main(void* arg) {
         dlog_i("voice: HTTP слушает порт ", g_vc_httpPort);
         for (;;) {
             int c = accept(fd, NULL, NULL);
-            char rq[1600]; long n; struct vc_tv t;
+            char rq[4096]; long n; struct vc_tv t;
             if (c < 0) { usleep(100000); continue; }
             t.sec = 5; t.usec = 0;
             setsockopt(c, 1, 20, &t, sizeof t);
