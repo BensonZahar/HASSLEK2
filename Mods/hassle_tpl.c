@@ -39,9 +39,11 @@
  *                        В строке: номер в списке (для «pick N»), ID пикапа, [модель N] («?» — не прочиталась, причина в konstt.log), расстояние, 3D-подпись рядом и координаты.
  *   /tpl pick N          телепорт к номеру N из ПОСЛЕДНЕГО списка (номера остаются, пока не вызовете «/tpl pick» заново — можно ходить по ним подряд).
  *                        Встаёте так, как сервер видит игрока на пикапе (Transform на 1 м ниже точки пикапа: в пакет уходит Transform.y + 1), поэтому он срабатывает как при касании (раздевалка, вход и т.п.).
- *   /tpl pick N under [сек]  «нырок»: встаёте на 1 м НИЖЕ обычной точки пикапа (под пол), держитесь там сек секунд (по умолчанию 0.4, от 0.2 до 15) и возвращаетесь
+ *   /tpl pick N under [сек]  «нырок»: встаёте на g_tpl_under_dy (по умолчанию 2 м) НИЖЕ обычной точки пикапа (под пол), держитесь там сек секунд (по умолчанию 0.4, от 0.2 до 15) и возвращаетесь
  *                        туда, где стояли — пикап срабатывает, а вы не стоите на нём (не мешаете тем, кто на нём стоит). Для пикапа с клавишей (вход в дом и т.п.) задайте
  *                        больше секунд и нажмите клавишу, пока вы под полом. Только пикапы (не маркеры) и только пешком. Синонимы: under, dive, ниже, нырок.
+ *   /tpl depth [м]       глубина нырка (0…10, по умолчанию 2; без числа — показать). Сервер принимает пикап в шаре: до 5 м от точки пикапа у обычных и до 1.3 м у пикапов
+ *                        с клавишей (дом, вход), поэтому глубже 1.3 м работают только обычные, глубже 5 м — никакие. Действует до перезапуска игры.
  *   /tpl pick list [стр] список по 10 на странице; «list 2» листает прежний снимок, не пересобирая
  *   В машине (вы за рулём) все команды телепорта (/tpl 5 вперёд, /tpl to …, /tpl go …) переносят МАШИНУ вместе с вами.
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
@@ -453,9 +455,11 @@ static volatile long long g_tplw_pendT;
 static int g_tplw_thread;
 static long long g_tplw_t0, g_tplw_tArr;
 static float g_tplw_from[3], g_tplw_to[3], g_tplw_total;
-/* Нырок под пол (/tpl pick N under [сек]): встали на TPL_UNDER_DY ниже обычной точки пикапа, держим там (каждый тик ставим заново — под полом земли нет, иначе упадём),
+/* Нырок под пол (/tpl pick N under [сек]): встали на g_tpl_under_dy ниже обычной точки пикапа, держим там (каждый тик ставим заново — под полом земли нет, иначе упадём),
    через hold мс возвращаем туда, где стояли. Всё в главном потоке, тики те же, что у наблюдателя. */
-#define TPL_UNDER_DY 1.0f                                /* м ниже обычной точки: сервер видит вас в 1 м под пикапом (у пикапов с клавишей предел сервера 1.3 м) */
+#define TPL_UNDER_DEF 2.0f                               /* м: глубина нырка по умолчанию (на сколько ниже обычной точки пикапа; сервер видит вас ровно на столько под пикапом) */
+#define TPL_UNDER_MAX 10.0f
+static float g_tpl_under_dy = TPL_UNDER_DEF;             /* текущая глубина: /tpl depth N (до перезапуска игры) */
 #define TPLU_HOLD_MS 400LL                               /* по умолчанию держим 0.4 с: несколько пакетов синхронизации успевают дойти до сервера */
 #define TPLU_HOLD_MIN 200LL
 #define TPLU_HOLD_MAX 15000LL
@@ -954,7 +958,7 @@ static void tpl_cmd_int(int id, int have) {
 
 /* ───────────── разбор аргументов ───────────── */
 typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList, under, num2Set; float dist, rawNum, num2; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
-/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick).
+/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick), 11 — depth (глубина нырка).
    gsub (для ghost): 0 — переключить, 1 on, 2 off, 3 back, 4 unhook;  iid/iidSet — номер интерьера;  rawNum — число до подрезки по TPL_MIN (для «/tpl 0 int»).  name — имя точки (слово после save/go/del);
    unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
 
@@ -972,7 +976,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; 23 under (нырок под пол); -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; 23 under (нырок под пол); 24 depth (глубина нырка); -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -994,6 +998,7 @@ static int tpl_word(const char* t) {
     if (seq(t, "pick") || seq(t, "pickup") || seq(t, "pickups") || seq(t, "pk") || seq(t, "пикап") || seq(t, "пикапы") ||
         seq(t, "маркер") || seq(t, "маркеры") || seq(t, "marker") || seq(t, "markers") || seq(t, "mk")) return 22;
     if (seq(t, "under") || seq(t, "dive") || seq(t, "ниже") || seq(t, "нырок")) return 23;
+    if (seq(t, "depth") || seq(t, "deep") || seq(t, "глубина") || seq(t, "глуб")) return 24;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -1045,6 +1050,7 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 21) a->mode = 9;
     else if (w == 22) { if (a->mode == 5) a->pkList = 1; a->mode = 10; }
     else if (w == 23) a->under = 1;
+    else if (w == 24) a->mode = 11;
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -1509,7 +1515,22 @@ static void tpl_pk_line(int i) {
     b_s(&b, "  ("); tpl_b_xyz(&b, e->p); b_ch(&b, ')');
     chat_say(msg);
 }
-/* «/tpl pick N under [сек]» — нырок: встаём на TPL_UNDER_DY НИЖЕ обычной точки пикапа (под полом: сервер всё ещё видит вас в пределах его радиуса,
+/* «/tpl depth [м]» — глубина нырка (на сколько ниже обычной точки пикапа). Без числа — показать. Действует до перезапуска игры. */
+static void tpl_cmd_depth(float v) {
+    Buf b; char msg[240];
+    if (v < 0.0f) {
+        b_init(&b, msg, sizeof msg); b_s(&b, "Глубина нырка: "); b_fix(&b, g_tpl_under_dy, 1); b_s(&b, " м (по умолчанию "); b_fix(&b, TPL_UNDER_DEF, 1); b_s(&b, "). Сменить: /tpl depth 1.5");
+        chat_say(msg); return;
+    }
+    if (v > TPL_UNDER_MAX) v = TPL_UNDER_MAX;
+    g_tpl_under_dy = v;
+    b_init(&b, msg, sizeof msg); b_s(&b, "Глубина нырка: "); b_fix(&b, v, 1); b_s(&b, " м");
+    if (v > 5.0f) b_s(&b, " — глубже 5 м сервер не принимает никакой пикап");
+    else if (v > 1.3f) b_s(&b, " — пикапы с клавишей (дом, вход) сервер на такой глубине не примет, только обычные");
+    chat_say(msg);
+    dlog2("/tpl: ", msg);
+}
+/* «/tpl pick N under [сек]» — нырок: встаём на g_tpl_under_dy НИЖЕ обычной точки пикапа (под полом: сервер всё ещё видит вас в пределах его радиуса,
    а клиент даёт пикапу сработать, как только капсула коснётся триггера), держим hold и возвращаем туда, где стояли. Только пикапы, только пешком. */
 static void tpl_dive(const TplPk* pk, const char* lb, float holdSec) {
     TplCtx c; float back[3], tp[3]; char lb2[130]; Buf x, b; char msg[220]; long long hold; int ok;
@@ -1520,7 +1541,7 @@ static void tpl_dive(const TplPk* pk, const char* lb, float holdSec) {
     hold = holdSec < 0.0f ? TPLU_HOLD_MS : (long long)(holdSec * 1000.0f + 0.5f);
     if (hold < TPLU_HOLD_MIN) hold = TPLU_HOLD_MIN;
     if (hold > TPLU_HOLD_MAX) hold = TPLU_HOLD_MAX;
-    tp[0] = pk->p[0]; tp[1] = pk->p[1] - TPL_SYNC_DY - TPL_UNDER_DY; tp[2] = pk->p[2];
+    tp[0] = pk->p[0]; tp[1] = pk->p[1] - TPL_SYNC_DY - g_tpl_under_dy; tp[2] = pk->p[2];
     b_init(&x, lb2, sizeof lb2); b_s(&x, lb); b_s(&x, " (под полом)");
     g_tplf_nosnap = 1; ok = tpl_goto_ex(tp, 3, lb2, 0); g_tplf_nosnap = 0;
     if (!ok) return;
@@ -1532,9 +1553,11 @@ static void tpl_dive(const TplPk* pk, const char* lb, float holdSec) {
         if (pthread_create(&t, NULL, tplw_worker, NULL) == 0) g_tplw_thread = 1;
     }
     __atomic_store_n(&g_tplu_on, 1, __ATOMIC_RELEASE);
-    b_init(&b, msg, sizeof msg); b_s(&b, "Нырок: под пикапом на "); b_fix(&b, TPL_UNDER_DY, 1); b_s(&b, " м, вернёмся через "); b_fix(&b, (double)hold / 1000.0, 1);
+    b_init(&b, msg, sizeof msg); b_s(&b, "Нырок: под пикапом на "); b_fix(&b, g_tpl_under_dy, 1); b_s(&b, " м, вернёмся через "); b_fix(&b, (double)hold / 1000.0, 1);
     b_s(&b, " с (пикап с клавишей — нажмите её сейчас; дольше: /tpl pick N under 5)");
     chat_say(msg);
+    if (g_tpl_under_dy > 5.0f) chat_say("Внимание: глубже 5 м сервер не принимает никакой пикап (его радиус проверки) — задайте меньше: /tpl depth 3");
+    else if (g_tpl_under_dy > 1.3f) chat_say("Внимание: у пикапов с клавишей (дом, вход) сервер принимает не глубже 1.3 м; на такой глубине сработают только обычные пикапы");
     { char lg[200]; Buf y; b_init(&y, lg, sizeof lg); b_s(&y, "/tpl: нырок: стояли "); tpl_b_xyz(&y, back); b_s(&y, ", ныряем в "); tpl_b_xyz(&y, tp); b_s(&y, ", держим мс "); b_int(&y, (int)hold); dlog(lg); }
 }
 /* «/tpl pick» — обновить и показать список ближайших; «/tpl pick list [стр]» — то же (стр > 1 листает прежний снимок, не пересобирая);
@@ -1613,7 +1636,7 @@ static void tpl_usage(void) {
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
     chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
-    chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место");
+    chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место;  /tpl depth [м] — глубина нырка (по умолчанию 2)");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
 static void native_tpl_cmd(void* self, void* args, void* mi) {
@@ -1661,6 +1684,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
     }
     if (a.mode == 9) { tpl_cmd_gps(); return; }
     if (a.under && a.mode != 10) { chat_usage("Нырок под пол — только к пикапу: /tpl pick N under [секунды]  (сначала /tpl pick — список с номерами)"); return; }
+    if (a.mode == 11) { tpl_cmd_depth(a.numSet ? a.rawNum : -1.0f); return; }
     if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList, a.under, a.num2Set ? a.num2 : -1.0f); return; }
     if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
     if (a.mode == 3 || a.mode == 4 || a.mode == 6) {
@@ -1677,7 +1701,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N | gps | pick [N] [under [сек]]");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N | gps | pick [N] [under [сек]] | depth [м]");
     return NULL;
 }
 #ifndef KONSTT_TEST
