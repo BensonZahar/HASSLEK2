@@ -10,6 +10,14 @@
  *   /voice status    состояние: идёт ли запись, стоит ли перехват, сколько пакетов и файлов
  *   /voice folder    куда сохраняются файлы
  *   /voice unhook    вернуть код игры в исходный вид (запись выключается)
+ *   /voice tg on     включить запись и слать каждую реплику в Telegram голосовым сообщением с подписью «🎙 Ник #id · рядом · 3.2 с»
+ *   /voice tg off    перестать слать в Telegram (запись в файлы не трогается)
+ *   /voice tg test   отправить в Telegram последнюю записанную реплику (проверка токена и чата)
+ *   /voice tg        состояние отправки: сколько ушло, сколько ошибок, последняя причина
+ *
+ * Telegram: токен и чат — в файле <папка voice>/tg.txt (строка 1 — токен бота, 2 — chat_id, 3 — необязательная метка аккаунта) или от скрипта
+ *   через HTTP 127.0.0.1:17791..17800 (/voice/status, /voice/cfg?k=&c=&who=&tg=0|1&on=0|1&mode=near|all&test=1; на диск токен не пишется).
+ *   Отправка идёт отдельным потоком через JNI HttpURLConnection (как /screen): игру не тормозит; очередь на 32 реплики, лишние отбрасываются.
  *
  * Куда и во что
  *   • Папка: <папка журнала HLOG>/voice (обычно /sdcard/Android/data/<пакет>/files/HLOG/voice, видно по USB и в файловом менеджере).
@@ -288,7 +296,7 @@ typedef struct {
     u32 serial, seq; int pkts;
     u8 held[VC_PKT_MAX]; int heldLen, heldSamples;  /* последний пакет ждёт следующего, чтобы последняя страница получила флаг конца потока */
     u16 pid; u8 use3d, attach, effect; int bass;
-    char path[360];
+    char path[360], nick[48];
 } VcSess;
 static VcSess g_vc_sess[VC_SESS];
 static u32 g_vc_serialSeed;
@@ -319,6 +327,288 @@ static const char* vc_kind(const VcPkt* p) {
     return p->use3d ? "near" : "global";
 }
 
+/* ───────────── отправка в Telegram (sendVoice) ─────────────
+   Закрытый файл-реплика (см. vc_sess_close) ставится в очередь, отдельный поток шлёт его в Telegram как голосовое сообщение с подписью:
+   ник говорящего, вид (рядом/рация/телефон/общий), длительность. Ogg Opus моно 48 кГц — ровно тот формат, который Telegram показывает как
+   голосовое, ничего не перекодируем. Отправка — так же, как у /screen: JNI → java.net.HttpURLConnection (своего TLS в C нет), в фоновом потоке.
+   Токен бота и чат берутся из файла <папка voice>/tg.txt (строки: токен, chat_id, необязательная метка аккаунта) или приходят от скрипта
+   через HTTP /voice/cfg (на диск не пишутся). Очередь короткая: если Telegram не успевает, самые новые реплики отбрасываются, а не копятся. */
+#define VC_TG_Q        32
+#define VC_TG_MIN_MS   400                   /* короче — щелчки и обрывки, не шлём */
+#define VC_UP_HEAD     2048                  /* место под заголовки multipart перед файлом */
+#define VC_UP_MAX      (3 * 1024 * 1024)     /* файл больше (>10 мин речи) не шлём; в .bss — память занимается только по факту записи */
+typedef struct { char path[360]; char nick[48]; const char* kind; int pid, durMs; } VcTgJob;   /* pid < 0 — не игрок */
+static VcTgJob g_vc_tgq[VC_TG_Q];
+static volatile unsigned g_vc_tgHead, g_vc_tgTail;
+static VcTgJob g_vc_last;                    /* последняя закрытая реплика — для /voice tg test */
+static volatile int g_vc_haveLast;
+static volatile int g_vc_tg;                 /* 1 — слать в Telegram */
+static volatile int g_vc_tgCfg;              /* 1 — токен и чат заданы */
+static char g_vc_tgTok[160], g_vc_tgChat[48], g_vc_tgWho[48];
+static volatile unsigned g_vc_tgSent, g_vc_tgFail, g_vc_tgDrop;
+static volatile int g_vc_tgCode;
+static char g_vc_tgMsg[200];
+static volatile int g_vc_reqRec, g_vc_reqTgFlag, g_vc_reqTest;     /* заявки писателю от HTTP-потока: IL2CPP и файлы трогает только он */
+static u8 g_vc_upBuf[VC_UP_HEAD + VC_UP_MAX + 512];
+
+static void vc_tg_msg(const char* m) { unsigned i; for (i = 0; m && m[i] && i < sizeof g_vc_tgMsg - 1; i++) g_vc_tgMsg[i] = m[i]; g_vc_tgMsg[i] = 0; }
+static const char* vc_kind_ru(const char* k) {
+    return seq(k, "radio") ? "рация" : seq(k, "phone") ? "телефон" : seq(k, "global") ? "общий канал" : "рядом";
+}
+static void vc_html(Buf* b, const char* t) {
+    for (; *t; t++) {
+        if (*t == '&') b_s(b, "&amp;"); else if (*t == '<') b_s(b, "&lt;"); else if (*t == '>') b_s(b, "&gt;"); else b_ch(b, *t);
+    }
+}
+/* Подпись (HTML): «[аккаунт] 🎙 Ник #id · рядом · 3.2 с» */
+static void vc_tg_caption(const VcTgJob* j, const char* who, char* out, unsigned cap) {
+    Buf b; b_init(&b, out, cap);
+    if (who[0]) { b_s(&b, "<b>"); vc_html(&b, who); b_s(&b, "</b> слышит:\n"); }
+    b_s(&b, "🎙 ");
+    if (j->nick[0]) { b_s(&b, "<b>"); vc_html(&b, j->nick); b_s(&b, "</b>"); if (j->pid >= 0) { b_s(&b, " #"); b_int(&b, j->pid); } }
+    else if (j->pid >= 0) { b_s(&b, "игрок #"); b_int(&b, j->pid); }
+    else b_s(&b, "голос");
+    b_s(&b, " · "); b_s(&b, vc_kind_ru(j->kind));
+    b_s(&b, " · "); b_int(&b, j->durMs / 1000); b_ch(&b, '.'); b_int(&b, (j->durMs % 1000) / 100); b_s(&b, " с");
+}
+
+static void vc_tg_push(const VcTgJob* src) {
+    unsigned h = g_vc_tgHead;
+    if (h - __atomic_load_n(&g_vc_tgTail, __ATOMIC_ACQUIRE) >= VC_TG_Q) { __atomic_fetch_add(&g_vc_tgDrop, 1, __ATOMIC_RELAXED); return; }
+    g_vc_tgq[h & (VC_TG_Q - 1)] = *src;
+    __atomic_store_n(&g_vc_tgHead, h + 1, __ATOMIC_RELEASE);
+}
+/* Зовётся из писателя при закрытии файла (единственный поставщик очереди; из заявки /voice tg test — тоже он). */
+static void vc_tg_enqueue(const char* path, const char* nick, const char* kind, int pid, int durMs) {
+    VcTgJob j; unsigned i;
+    for (i = 0; path[i] && i < sizeof j.path - 1; i++) j.path[i] = path[i];
+    j.path[i] = 0;
+    for (i = 0; nick[i] && i < sizeof j.nick - 1; i++) j.nick[i] = nick[i];
+    j.nick[i] = 0;
+    j.kind = kind; j.pid = pid; j.durMs = durMs;
+    g_vc_last = j; g_vc_haveLast = 1;
+    if (!g_vc_tg || !g_vc_tgCfg || durMs < VC_TG_MIN_MS) return;
+    vc_tg_push(&j);
+}
+
+typedef int (*vcj_getvms_t)(void**, int, int*);
+typedef int (*vcj_getenv_t)(void*, void**, int);
+typedef int (*vcj_attach_t)(void*, void**, void*);
+typedef int (*vcj_detach_t)(void*);
+typedef void* (*vcj_find_t)(void*, const char*);
+typedef void (*vcj_clr_t)(void*);
+typedef void* (*vcj_mid_t)(void*, void*, const char*, const char*);
+typedef void* (*vcj_newobj_t)(void*, void*, void*, ...);
+typedef void* (*vcj_callo_t)(void*, void*, void*, ...);
+typedef int (*vcj_calli_t)(void*, void*, void*, ...);
+typedef void (*vcj_callv_t)(void*, void*, void*, ...);
+typedef void* (*vcj_str_t)(void*, const char*);
+typedef void* (*vcj_newarr_t)(void*, int);
+typedef void (*vcj_getreg_t)(void*, void*, int, int, signed char*);
+typedef void (*vcj_setreg_t)(void*, void*, int, int, const signed char*);
+typedef unsigned char (*vcj_exc_t)(void*);
+#define VCJ(env, T, idx) ((T)((*(void***)(env))[idx]))
+#define VCJV(vm, T, idx) ((T)((*(void***)(vm))[idx]))
+/* индексы JNINativeInterface — те же, что в hassle_screen.c: FindClass 6, ExceptionClear 17, GetMethodID 33, CallObjectMethod 34, CallIntMethod 49,
+   CallVoidMethod 61, NewObject 28, NewStringUTF 167, NewByteArray 176, GetByteArrayRegion 200, SetByteArrayRegion 208, ExceptionCheck 228;
+   JavaVM: AttachCurrentThread 4, DetachCurrentThread 5, GetEnv 6 */
+static int vcj_clean(void* env) { if (VCJ(env, vcj_exc_t, 228)(env)) { VCJ(env, vcj_clr_t, 17)(env); return 0; } return 1; }
+static void* vcj_get_vm(void) {
+    vcj_getvms_t f = NULL; void *vm = NULL, *h; int n = 0;
+    h = dlopen(NULL, RTLD_NOW_); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs");
+    if (!f) { h = dlopen("libnativehelper.so", RTLD_NOW_ | 4); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs"); }
+    if (!f) { h = dlopen("libart.so", RTLD_NOW_ | 4); if (h) *(void**)&f = dlsym(h, "JNI_GetCreatedJavaVMs"); }
+    if (!f) return NULL;
+    if (f(&vm, 1, &n) != 0 || n < 1) return NULL;
+    return vm;
+}
+/* ответ Telegram: "description":"..." (короткий текст для журнала) */
+static void vc_tg_desc(const char* r, unsigned n, char* out, unsigned cap) {
+    static const char key[] = "\"description\":\""; unsigned i, k = 0;
+    out[0] = 0;
+    for (i = 0; i + sizeof key < n; i++) {
+        if (r[i] == '"' && sprefix(r + i, key)) {
+            i += sizeof key - 1;
+            while (i < n && r[i] != '"' && k + 1 < cap) { if (r[i] == '\\' && i + 1 < n) i++; out[k++] = r[i++]; }
+            out[k] = 0; return;
+        }
+    }
+    for (i = 0; i < n && k + 1 < cap; i++) out[k++] = (r[i] == '\r' || r[i] == '\n') ? ' ' : r[i];
+    out[k] = 0;
+}
+static void vc_mp_field(Buf* b, const char* boundary, const char* name) {
+    b_s(b, "--"); b_s(b, boundary); b_s(b, "\r\nContent-Disposition: form-data; name=\""); b_s(b, name); b_s(b, "\"\r\n\r\n");
+}
+/* Собирает multipart в g_vc_upBuf: sendVoice (chat_id, caption, parse_mode, duration, voice) или sendDocument. Возвращает длину тела или 0. */
+static unsigned long vc_tg_build(const char* boundary, const char* chat, const VcTgJob* j, const char* cap, int asDoc) {
+    Buf b; int fd, tooBig = 0; long off, got = 0;
+    fd = open(j->path, 0);
+    if (fd < 0) { vc_tg_msg("не открыть файл реплики"); return 0; }
+    b_init(&b, (char*)g_vc_upBuf, VC_UP_HEAD);
+    vc_mp_field(&b, boundary, "chat_id"); b_s(&b, chat); b_s(&b, "\r\n");
+    vc_mp_field(&b, boundary, "caption"); b_s(&b, cap); b_s(&b, "\r\n");
+    vc_mp_field(&b, boundary, "parse_mode"); b_s(&b, "HTML\r\n");
+    if (!asDoc) { vc_mp_field(&b, boundary, "duration"); b_int(&b, (j->durMs + 500) / 1000); b_s(&b, "\r\n"); }
+    b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\""); b_s(&b, asDoc ? "document" : "voice");
+    b_s(&b, "\"; filename=\"voice.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+    if (b.n + 8 >= VC_UP_HEAD) { close(fd); vc_tg_msg("подпись слишком длинная"); return 0; }
+    off = (long)b.n;
+    for (;;) {
+        long room = (long)sizeof g_vc_upBuf - 256 - off, n;
+        if (room <= 0) { char t; if (read(fd, &t, 1) > 0) tooBig = 1; break; }
+        n = read(fd, g_vc_upBuf + off, (unsigned long)room);
+        if (n <= 0) break;
+        off += n; got += n;
+    }
+    close(fd);
+    if (tooBig) { vc_tg_msg("реплика слишком длинная для отправки"); return 0; }
+    if (got < 64) { vc_tg_msg("файл реплики пустой"); return 0; }
+    b_init(&b, (char*)g_vc_upBuf + off, 256);
+    b_s(&b, "\r\n--"); b_s(&b, boundary); b_s(&b, "--\r\n");
+    return (unsigned long)off + b.n;
+}
+
+/* Сам POST. HTTP-код (200 — принят) или 0 при сбое до ответа (причина в g_vc_tgMsg). *retry — «retry_after» из ответа 429. */
+static int vc_tg_post(const char* tok, const char* method, const char* boundary, unsigned long total, int* retry) {
+    void *vm, *env = NULL, *cURL = NULL, *cConn = NULL, *cHttp = NULL, *cOS = NULL, *cIS = NULL;
+    void *jurl, *jstr, *conn, *os = NULL, *in = NULL, *arr = NULL, *jm, *jct, *jctv;
+    void *mNew, *mOpen, *mCT, *mRT, *mDoOut, *mProp, *mGetOut, *mMeth, *mFix, *mCode, *mErr, *mGetIn, *mDisc, *mWrite, *mFlush, *mClose, *mRead, *mIClose;
+    int attached = 0, rc, code = 0; unsigned long sent = 0; char url[300], ct[120]; Buf b;
+    char resp[2048]; unsigned rn = 0;
+    vcj_find_t FindClass; vcj_mid_t GetMid; vcj_callo_t CallObj; vcj_calli_t CallInt; vcj_callv_t CallVoid;
+#define VCJ_FAIL(m) do { vc_tg_msg(m); code = 0; goto out; } while (0)
+    *retry = 0;
+    vm = vcj_get_vm(); if (!vm) { vc_tg_msg("нет JavaVM (JNI_GetCreatedJavaVMs не найдена)"); return 0; }
+    rc = VCJV(vm, vcj_getenv_t, 6)(vm, &env, 0x00010006);
+    if (rc == -2) { if (VCJV(vm, vcj_attach_t, 4)(vm, &env, NULL) != 0 || !env) { vc_tg_msg("AttachCurrentThread не удался"); return 0; } attached = 1; }
+    else if (rc != 0 || !env) { vc_tg_msg("GetEnv не удался"); return 0; }
+    FindClass = VCJ(env, vcj_find_t, 6); GetMid = VCJ(env, vcj_mid_t, 33);
+    CallObj = VCJ(env, vcj_callo_t, 34); CallInt = VCJ(env, vcj_calli_t, 49); CallVoid = VCJ(env, vcj_callv_t, 61);
+    cURL = FindClass(env, "java/net/URL"); cConn = FindClass(env, "java/net/URLConnection"); cHttp = FindClass(env, "java/net/HttpURLConnection");
+    cOS = FindClass(env, "java/io/OutputStream"); cIS = FindClass(env, "java/io/InputStream");
+    if (!cURL || !cConn || !cHttp || !cOS || !cIS || !vcj_clean(env)) VCJ_FAIL("нет нужных классов java.net / java.io");
+    mNew = GetMid(env, cURL, "<init>", "(Ljava/lang/String;)V");
+    mOpen = GetMid(env, cURL, "openConnection", "()Ljava/net/URLConnection;");
+    mCT = GetMid(env, cConn, "setConnectTimeout", "(I)V");
+    mRT = GetMid(env, cConn, "setReadTimeout", "(I)V");
+    mDoOut = GetMid(env, cConn, "setDoOutput", "(Z)V");
+    mProp = GetMid(env, cConn, "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V");
+    mGetOut = GetMid(env, cConn, "getOutputStream", "()Ljava/io/OutputStream;");
+    mGetIn = GetMid(env, cConn, "getInputStream", "()Ljava/io/InputStream;");
+    mMeth = GetMid(env, cHttp, "setRequestMethod", "(Ljava/lang/String;)V");
+    mFix = GetMid(env, cHttp, "setFixedLengthStreamingMode", "(I)V");
+    mCode = GetMid(env, cHttp, "getResponseCode", "()I");
+    mErr = GetMid(env, cHttp, "getErrorStream", "()Ljava/io/InputStream;");
+    mDisc = GetMid(env, cHttp, "disconnect", "()V");
+    mWrite = GetMid(env, cOS, "write", "([BII)V"); mFlush = GetMid(env, cOS, "flush", "()V"); mClose = GetMid(env, cOS, "close", "()V");
+    mRead = GetMid(env, cIS, "read", "([B)I"); mIClose = GetMid(env, cIS, "close", "()V");
+    if (!vcj_clean(env) || !mNew || !mOpen || !mCT || !mRT || !mDoOut || !mProp || !mGetOut || !mGetIn || !mMeth || !mFix || !mCode || !mErr || !mDisc || !mWrite || !mFlush || !mClose || !mRead || !mIClose)
+        VCJ_FAIL("не нашлись методы Java (HttpURLConnection)");
+    b_init(&b, url, sizeof url); b_s(&b, "https://api.telegram.org/bot"); b_s(&b, tok); b_ch(&b, '/'); b_s(&b, method);
+    b_init(&b, ct, sizeof ct); b_s(&b, "multipart/form-data; boundary="); b_s(&b, boundary);
+    jstr = VCJ(env, vcj_str_t, 167)(env, url); if (!jstr) VCJ_FAIL("NewStringUTF");
+    jurl = VCJ(env, vcj_newobj_t, 28)(env, cURL, mNew, jstr); if (!jurl || !vcj_clean(env)) VCJ_FAIL("new URL() не удался");
+    conn = CallObj(env, jurl, mOpen); if (!conn || !vcj_clean(env)) VCJ_FAIL("openConnection не удался");
+    CallVoid(env, conn, mCT, 15000); CallVoid(env, conn, mRT, 60000); if (!vcj_clean(env)) VCJ_FAIL("таймауты");
+    jm = VCJ(env, vcj_str_t, 167)(env, "POST"); CallVoid(env, conn, mMeth, jm); if (!vcj_clean(env)) VCJ_FAIL("setRequestMethod");
+    CallVoid(env, conn, mDoOut, 1); if (!vcj_clean(env)) VCJ_FAIL("setDoOutput");
+    jct = VCJ(env, vcj_str_t, 167)(env, "Content-Type"); jctv = VCJ(env, vcj_str_t, 167)(env, ct);
+    CallVoid(env, conn, mProp, jct, jctv); if (!vcj_clean(env)) VCJ_FAIL("setRequestProperty");
+    CallVoid(env, conn, mFix, (int)total); if (!vcj_clean(env)) VCJ_FAIL("setFixedLengthStreamingMode");
+    os = CallObj(env, conn, mGetOut); if (!os || !vcj_clean(env)) VCJ_FAIL("нет соединения с api.telegram.org (getOutputStream)");
+    arr = VCJ(env, vcj_newarr_t, 176)(env, 65536); if (!arr) VCJ_FAIL("NewByteArray");
+    while (sent < total) {
+        unsigned long n = total - sent < 65536 ? total - sent : 65536;
+        VCJ(env, vcj_setreg_t, 208)(env, arr, 0, (int)n, (const signed char*)(g_vc_upBuf + sent));
+        CallVoid(env, os, mWrite, arr, 0, (int)n);
+        if (!vcj_clean(env)) VCJ_FAIL("обрыв при отправке данных");
+        sent += n;
+    }
+    CallVoid(env, os, mFlush); CallVoid(env, os, mClose); if (!vcj_clean(env)) VCJ_FAIL("обрыв при завершении отправки");
+    code = CallInt(env, conn, mCode); if (!vcj_clean(env)) VCJ_FAIL("нет ответа от Telegram (getResponseCode)");
+    in = CallObj(env, conn, code >= 400 ? mErr : mGetIn);
+    if (!vcj_clean(env)) in = NULL;
+    if (in) {
+        for (;;) {
+            int r = CallInt(env, in, mRead, arr);
+            if (!vcj_clean(env) || r < 0) break;
+            if (r == 0) continue;
+            if (rn + (unsigned)r > sizeof resp - 1) r = (int)(sizeof resp - 1 - rn);
+            if (r > 0) { VCJ(env, vcj_getreg_t, 200)(env, arr, 0, r, (signed char*)(resp + rn)); rn += (unsigned)r; }
+            if (rn >= sizeof resp - 1) break;
+        }
+        CallVoid(env, in, mIClose); vcj_clean(env);
+    }
+    resp[rn] = 0;
+    if (code == 429) {                                                 /* "retry_after":N */
+        static const char mk[] = "\"retry_after\":"; unsigned q;
+        for (q = 0; q + sizeof mk < rn; q++) {
+            if (resp[q] == '"' && sprefix(resp + q, mk)) {
+                int v = 0; q += sizeof mk - 1;
+                while (q < rn && resp[q] >= '0' && resp[q] <= '9' && v < 1000) { v = v * 10 + (resp[q] - '0'); q++; }
+                *retry = v; break;
+            }
+        }
+    }
+    if (code != 200) { char d[160]; vc_tg_desc(resp, rn, d, sizeof d); vc_tg_msg(d[0] ? d : "пустой ответ"); }
+    CallVoid(env, conn, mDisc); vcj_clean(env);
+out:
+    if (attached) VCJV(vm, vcj_detach_t, 5)(vm);
+    return code;
+#undef VCJ_FAIL
+}
+
+static unsigned g_vc_boundSeq;
+static void vc_tg_send(const VcTgJob* j) {
+    char cap[700], bd[64], tok[160], chat[48], who[48]; Buf b; unsigned long total; int code = 0, asDoc = 0, retry = 0, att, i;
+    if (!g_vc_tgCfg) return;
+    for (i = 0; g_vc_tgTok[i] && i < 159; i++) tok[i] = g_vc_tgTok[i];
+    tok[i] = 0;
+    for (i = 0; g_vc_tgChat[i] && i < 47; i++) chat[i] = g_vc_tgChat[i];
+    chat[i] = 0;
+    for (i = 0; g_vc_tgWho[i] && i < 47; i++) who[i] = g_vc_tgWho[i];
+    who[i] = 0;
+    if (!tok[0] || !chat[0]) return;
+    g_vc_tgMsg[0] = 0;
+    b_init(&b, bd, sizeof bd); b_s(&b, "----hassle"); b_int(&b, time(NULL)); b_int(&b, (long)++g_vc_boundSeq);
+    vc_tg_caption(j, who, cap, sizeof cap);
+    total = vc_tg_build(bd, chat, j, cap, 0);
+    for (att = 0; total && att < 4; att++) {
+        code = vc_tg_post(tok, asDoc ? "sendDocument" : "sendVoice", bd, total, &retry);
+        if (code == 200) break;
+        if (code == 429) {                                              /* слишком часто: ждём, сколько просит Telegram, и повторяем то же тело */
+            int w = retry < 1 ? 3 : retry > 30 ? 30 : retry;
+            dlog_i("voice: Telegram 429, жду секунд: ", w);
+            while (w-- > 0) usleep(1000000);
+            continue;
+        }
+        if (code == 400 && !asDoc) {                                    /* не принял как голосовое — отправим файлом */
+            dlog2("voice: sendVoice 400: ", g_vc_tgMsg);
+            asDoc = 1; total = vc_tg_build(bd, chat, j, cap, 1);
+            continue;
+        }
+        break;
+    }
+    g_vc_tgCode = code;
+    if (code == 200) { __atomic_fetch_add(&g_vc_tgSent, 1, __ATOMIC_RELAXED); }
+    else { __atomic_fetch_add(&g_vc_tgFail, 1, __ATOMIC_RELAXED); dlog_i("voice: Telegram не принял, код ", code); dlog2("voice: причина: ", g_vc_tgMsg); }
+}
+static void* vc_tg_main(void* arg) {
+    (void)arg;
+    if (!hm_wait_started()) return NULL;                                /* konstt_off — мод выключен целиком */
+    for (;;) {
+        unsigned t = g_vc_tgTail;
+        if (t == __atomic_load_n(&g_vc_tgHead, __ATOMIC_ACQUIRE)) { usleep(250000); continue; }
+        {
+            static VcTgJob j;
+            j = g_vc_tgq[t & (VC_TG_Q - 1)];
+            __atomic_store_n(&g_vc_tgTail, t + 1, __ATOMIC_RELEASE);
+            if (g_vc_tg && g_vc_tgCfg) { vc_tg_send(&j); usleep(1000000); }     /* пауза: у Telegram лимит ~20 сообщений в минуту на чат */
+        }
+    }
+    return NULL;
+}
+
 static void vc_sess_close(VcSess* s) {
     if (!s->active) return;
     if (s->heldLen > 0) {                          /* последний пакет — со флагом конца потока */
@@ -330,6 +620,10 @@ static void vc_sess_close(VcSess* s) {
     }
     close(s->fd);
     s->fd = -1; s->active = 0;
+    if (s->pkts > 0) {                             /* файл закрыт и целый — отдаём на отправку в Telegram (если включено) */
+        VcPkt kp; kp.effect = s->effect; kp.use3d = s->use3d;
+        vc_tg_enqueue(s->path, s->nick, vc_kind(&kp), (s->use3d && s->attach == 2) ? (int)s->pid : -1, (int)(((s->gp > VC_PRESKIP ? s->gp - VC_PRESKIP : 0) * 1000) / 48000));
+    }
 }
 
 static int vc_sess_open(VcSess* s, const VcPkt* p) {
@@ -361,7 +655,8 @@ static int vc_sess_open(VcSess* s, const VcPkt* p) {
     s->pid = p->pid; s->use3d = p->use3d; s->attach = p->attach; s->effect = p->effect; s->bass = p->bass;
     g_vc_serialSeed = g_vc_serialSeed * 1664525u + 1013904223u + (u32)p->ms;
     s->serial = g_vc_serialSeed;
-    { u32 i; for (i = 0; path[i] && i < sizeof s->path - 1; i++) s->path[i] = path[i]; s->path[i] = 0; }
+    { u32 i; for (i = 0; path[i] && i < sizeof s->path - 1; i++) s->path[i] = path[i]; s->path[i] = 0;
+      for (i = 0; nick[i] && i < sizeof s->nick - 1; i++) s->nick[i] = nick[i]; s->nick[i] = 0; }
     {   /* заголовки: OpusHead (первая страница) и OpusTags (вторая) */
         char title[96], artist[48], com[40]; Buf t;
         b_init(&t, title, sizeof title);
@@ -679,6 +974,8 @@ static void vc_say_status(void) {
     chat_say(msg);
     if (g_vc_state != 1 && g_vc_err[0]) { b_init(&b, msg, sizeof msg); b_s(&b, "Voice: перехват не поставлен: "); b_s(&b, g_vc_err); chat_say(msg); }
 }
+static int vc_cfg_load(void);
+static void vc_flag_set(const char* name, int on);
 static void native_voice_cmd(void* self, void* args, void* mi) {
     char t[4][24]; int n; char msg[420]; Buf b;
     (void)self; (void)mi;
@@ -697,13 +994,226 @@ static void native_voice_cmd(void* self, void* args, void* mi) {
     if (seq(t[0], "off")) { vc_stop(); vc_marker_set(0); chat_say("Voice: запись выключена"); return; }
     if (seq(t[0], "near")) { __atomic_store_n(&g_vc_mode, VC_MODE_NEAR, __ATOMIC_RELEASE); chat_say("Voice: пишу только тех, кто рядом"); return; }
     if (seq(t[0], "all")) { __atomic_store_n(&g_vc_mode, VC_MODE_ALL, __ATOMIC_RELEASE); chat_say("Voice: пишу всё, что слышит клиент (рядом, рация, телефон, общий канал)"); return; }
+    if (seq(t[0], "tg")) {
+        if (n > 1 && seq(t[1], "on")) {
+            if (!g_vc_tgCfg) vc_cfg_load();
+            if (!g_vc_tgCfg) { chat_say("Voice: нет токена и чата. Положите в папку voice файл tg.txt: 1-я строка токен бота, 2-я chat_id (3-я — метка аккаунта), либо включайте из скрипта"); return; }
+            if (!vc_start()) { b_init(&b, msg, sizeof msg); b_s(&b, "Voice: не получилось включить запись: "); b_s(&b, g_vc_err[0] ? g_vc_err : "нет папки"); chat_say(msg); return; }
+            vc_marker_set(1); vc_flag_set("tg_on", 1); __atomic_store_n(&g_vc_tg, 1, __ATOMIC_RELEASE);
+            chat_say("Voice: запись включена, реплики уходят в Telegram голосовыми с ником");
+            return;
+        }
+        if (n > 1 && seq(t[1], "off")) { __atomic_store_n(&g_vc_tg, 0, __ATOMIC_RELEASE); vc_flag_set("tg_on", 0); chat_say("Voice: отправка в Telegram выключена (запись в файлы идёт как шла)"); return; }
+        if (n > 1 && seq(t[1], "test")) {
+            if (!g_vc_tgCfg) vc_cfg_load();
+            if (!g_vc_tgCfg) { chat_say("Voice: Telegram не настроен (нет tg.txt)"); return; }
+            if (!g_vc_haveLast) { chat_say("Voice: ещё не было ни одной реплики — отправлять нечего"); return; }
+            { VcTgJob j = g_vc_last; vc_tg_push(&j); }
+            chat_say("Voice: последняя реплика поставлена в очередь, итог — в /voice tg");
+            return;
+        }
+        b_init(&b, msg, sizeof msg);
+        b_s(&b, "Voice → Telegram: "); b_s(&b, g_vc_tg ? "ВКЛ" : "выкл"); b_s(&b, ", настроен: "); b_s(&b, g_vc_tgCfg ? "да" : "нет");
+        b_s(&b, ", отправлено: "); b_int(&b, (long)g_vc_tgSent); b_s(&b, ", ошибок: "); b_int(&b, (long)g_vc_tgFail);
+        b_s(&b, ", отброшено: "); b_int(&b, (long)g_vc_tgDrop); b_s(&b, ", в очереди: "); b_int(&b, (long)(g_vc_tgHead - g_vc_tgTail));
+        chat_say(msg);
+        if (g_vc_tgFail && g_vc_tgMsg[0]) { b_init(&b, msg, sizeof msg); b_s(&b, "Voice: последняя причина: "); b_s(&b, g_vc_tgMsg); chat_say(msg); }
+        return;
+    }
     if (seq(t[0], "folder")) {
         if (!vc_prepare_dir()) { chat_say("Voice: папка недоступна, подробности в konstt.log"); return; }
         b_init(&b, msg, sizeof msg); b_s(&b, "Voice: файлы лежат в "); b_s(&b, g_vc_dir); chat_say(msg);
         return;
     }
     if (seq(t[0], "unhook")) { vc_stop(); vc_marker_set(0); vc_unhook(); chat_say(g_vc_state == 1 ? "Voice: перехват снять не вышло" : "Voice: перехват снят, запись выключена"); return; }
-    chat_usage("Используйте: /voice on | off | near | all | status | folder | unhook");
+    chat_usage("Используйте: /voice on | off | near | all | status | folder | unhook | tg on|off|test");
+}
+
+/* ───────────── настройки Telegram: файл tg.txt и флаг tg_on ───────────── */
+static void vc_flag_path(const char* name, char* out, unsigned cap) {
+    Buf b; b_init(&b, out, cap); b_s(&b, g_vc_dir); b_ch(&b, '/'); b_s(&b, name);
+}
+static void vc_flag_set(const char* name, int on) {
+    char p[360]; int fd;
+    if (!vc_prepare_dir()) return;
+    vc_flag_path(name, p, sizeof p);
+    if (on) { fd = open(p, 0x241, 0666); if (fd >= 0) { write(fd, "1\n", 2); close(fd); } }
+    else unlink(p);
+}
+static int vc_flag_get(const char* name) {
+    char p[360]; int fd;
+    if (!vc_prepare_dir()) return 0;
+    vc_flag_path(name, p, sizeof p);
+    fd = open(p, 0);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+static void vc_copy(char* dst, unsigned cap, const char* src) { unsigned i; for (i = 0; src[i] && i + 1 < cap; i++) dst[i] = src[i]; dst[i] = 0; }
+/* <папка voice>/tg.txt: 1-я строка — токен бота, 2-я — chat_id, 3-я (необязательно) — метка аккаунта в подписи. Пустые строки пропускаются. 1 — прочитан и годен. */
+static int vc_cfg_load(void) {
+    char p[360], buf[512], tok[160], chat[48], who[48]; int fd, n, i, line = 0, k = 0;
+    tok[0] = chat[0] = who[0] = 0;
+    if (!vc_prepare_dir()) return 0;
+    vc_flag_path("tg.txt", p, sizeof p);
+    fd = open(p, 0);
+    if (fd < 0) return 0;
+    n = (int)read(fd, buf, sizeof buf - 1); close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    for (i = 0; i <= n && line < 3; i++) {
+        char c = buf[i];
+        if (c == '\n' || c == '\r' || c == 0) { if (k > 0) { line++; k = 0; } continue; }
+        {   char* dst = line == 0 ? tok : line == 1 ? chat : who; int cap = line == 0 ? (int)sizeof tok : line == 1 ? (int)sizeof chat : (int)sizeof who;
+            if (k + 1 < cap && !(k == 0 && (c == ' ' || c == '\t'))) { dst[k++] = c; dst[k] = 0; } }
+    }
+    if (!tok[0] || !chat[0]) return 0;
+    __atomic_store_n(&g_vc_tgCfg, 0, __ATOMIC_RELEASE);
+    vc_copy(g_vc_tgTok, sizeof g_vc_tgTok, tok); vc_copy(g_vc_tgChat, sizeof g_vc_tgChat, chat); vc_copy(g_vc_tgWho, sizeof g_vc_tgWho, who);
+    __atomic_store_n(&g_vc_tgCfg, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* Заявки от HTTP-потока: писатель (поток с IL2CPP) выполняет их сам. */
+static void vc_requests(void) {
+    int r = __atomic_exchange_n(&g_vc_reqRec, 0, __ATOMIC_ACQ_REL);
+    if (r == 1) { if (vc_start()) vc_marker_set(1); else dlog2("voice: запись по заявке не включилась: ", g_vc_err); }
+    else if (r == 2) { vc_stop(); vc_marker_set(0); }
+    r = __atomic_exchange_n(&g_vc_reqTgFlag, 0, __ATOMIC_ACQ_REL);
+    if (r == 1) vc_flag_set("tg_on", 1); else if (r == 2) vc_flag_set("tg_on", 0);
+    if (__atomic_exchange_n(&g_vc_reqTest, 0, __ATOMIC_ACQ_REL) && g_vc_haveLast) { VcTgJob j = g_vc_last; vc_tg_push(&j); }
+}
+
+/* ───────────── HTTP для скрипта (127.0.0.1:17791..17800) ─────────────
+   /voice/status                                   — состояние (JSON, без токена)
+   /voice/cfg?k=ТОКЕН&c=ЧАТ&who=МЕТКА&tg=0|1&on=0|1&mode=near|all&test=1   — любые из параметров; k и c только вместе; на диск не пишется */
+extern int socket(int, int, int);
+extern int setsockopt(int, int, int, const void*, unsigned);
+extern int bind(int, const void*, unsigned);
+extern int listen(int, int);
+extern int accept(int, void*, void*);
+extern long recv(int, void*, unsigned long, int);
+extern long send(int, const void*, unsigned long, int);
+#define VC_PORT_FIRST 17791
+#define VC_PORT_COUNT 10
+struct vc_sa4 { u16 family; u16 port; u32 addr; u8 zero[8]; };
+struct vc_tv { long sec; long usec; };
+static int g_vc_httpPort;
+
+static int vc_qparam(const char* rq, const char* name, char* out, unsigned cap) {
+    unsigned i = 0, nl = slen(name), k = 0;
+    while (rq[i] && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n') i++;
+    if (rq[i] == ' ') i++;
+    while (rq[i] && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n' && rq[i] != '?') i++;
+    if (rq[i] != '?') { out[0] = 0; return 0; }
+    i++;
+    while (rq[i] && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n') {
+        if ((rq[i - 1] == '?' || rq[i - 1] == '&') && sprefix(rq + i, name) && rq[i + nl] == '=') {
+            i += nl + 1;
+            while (rq[i] && rq[i] != '&' && rq[i] != ' ' && rq[i] != '\r' && rq[i] != '\n' && k + 1 < cap) {
+                char c = rq[i];
+                if (c == '%' && rq[i + 1] && rq[i + 2]) {
+                    int hi = rq[i + 1], lo = rq[i + 2];
+                    hi = hi >= '0' && hi <= '9' ? hi - '0' : (hi | 32) >= 'a' && (hi | 32) <= 'f' ? (hi | 32) - 'a' + 10 : -1;
+                    lo = lo >= '0' && lo <= '9' ? lo - '0' : (lo | 32) >= 'a' && (lo | 32) <= 'f' ? (lo | 32) - 'a' + 10 : -1;
+                    if (hi >= 0 && lo >= 0) { out[k++] = (char)(hi * 16 + lo); i += 3; continue; }
+                }
+                out[k++] = c == '+' ? ' ' : c; i++;
+            }
+            out[k] = 0; return 1;
+        }
+        i++;
+    }
+    out[0] = 0; return 0;
+}
+static int vc_send_all(int fd, const char* p, unsigned long n) {
+    while (n) { long w = send(fd, p, n, 0x4000); if (w <= 0) return 0; p += w; n -= (unsigned long)w; }
+    return 1;
+}
+static void vc_respond(int fd, const char* status, const char* ctype, const char* body, unsigned long blen) {
+    char h[420]; Buf b;
+    b_init(&b, h, sizeof h);
+    b_s(&b, "HTTP/1.1 "); b_s(&b, status); b_s(&b, "\r\nContent-Type: "); b_s(&b, ctype);
+    b_s(&b, "\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: ");
+    b_int(&b, (long)blen); b_s(&b, "\r\n\r\n");
+    if (vc_send_all(fd, h, b.n) && blen) vc_send_all(fd, body, blen);
+}
+static void vc_http_status(int c) {
+    char js[640], m[200]; Buf b; unsigned i, k = 0;
+    for (i = 0; g_vc_tgMsg[i] && k + 2 < sizeof m; i++) { char ch = g_vc_tgMsg[i]; m[k++] = (ch == '"' || ch == '\\' || (unsigned char)ch < 32) ? ' ' : ch; }
+    m[k] = 0;
+    b_init(&b, js, sizeof js);
+    b_s(&b, "{\"v\":1,\"on\":"); b_int(&b, g_vc_on ? 1 : 0);
+    b_s(&b, ",\"hooked\":"); b_int(&b, g_vc_state == 1 ? 1 : 0);
+    b_s(&b, ",\"mode\":\""); b_s(&b, g_vc_mode == VC_MODE_NEAR ? "near" : "all");
+    b_s(&b, "\",\"tg\":"); b_int(&b, g_vc_tg ? 1 : 0);
+    b_s(&b, ",\"cfg\":"); b_int(&b, g_vc_tgCfg ? 1 : 0);
+    b_s(&b, ",\"files\":"); b_int(&b, (long)g_vc_files);
+    b_s(&b, ",\"queued\":"); b_int(&b, (long)(g_vc_tgHead - g_vc_tgTail));
+    b_s(&b, ",\"sent\":"); b_int(&b, (long)g_vc_tgSent);
+    b_s(&b, ",\"fail\":"); b_int(&b, (long)g_vc_tgFail);
+    b_s(&b, ",\"drop\":"); b_int(&b, (long)g_vc_tgDrop);
+    b_s(&b, ",\"code\":"); b_int(&b, g_vc_tgCode);
+    b_s(&b, ",\"msg\":\""); b_s(&b, m); b_s(&b, "\"}");
+    vc_respond(c, "200 OK", "application/json", js, b.n);
+}
+static void vc_http_cfg(int c, const char* rq) {
+    static const char okj[] = "{\"ok\":true}", bad[] = "{\"ok\":false,\"err\":\"bad_args\"}", nocfg[] = "{\"ok\":false,\"err\":\"no_token\"}";
+    char tok[160], chat[48], who[48], v[16]; int hasK, hasC;
+    hasK = vc_qparam(rq, "k", tok, sizeof tok); hasC = vc_qparam(rq, "c", chat, sizeof chat);
+    if (hasK != hasC || (hasK && (!tok[0] || !chat[0]))) { vc_respond(c, "200 OK", "application/json", bad, sizeof bad - 1); return; }
+    if (hasK) {
+        __atomic_store_n(&g_vc_tgCfg, 0, __ATOMIC_RELEASE);
+        vc_copy(g_vc_tgTok, sizeof g_vc_tgTok, tok); vc_copy(g_vc_tgChat, sizeof g_vc_tgChat, chat);
+        __atomic_store_n(&g_vc_tgCfg, 1, __ATOMIC_RELEASE);
+    }
+    if (vc_qparam(rq, "who", who, sizeof who)) vc_copy(g_vc_tgWho, sizeof g_vc_tgWho, who);
+    if (vc_qparam(rq, "mode", v, sizeof v)) __atomic_store_n(&g_vc_mode, seq(v, "all") ? VC_MODE_ALL : VC_MODE_NEAR, __ATOMIC_RELEASE);
+    if (vc_qparam(rq, "tg", v, sizeof v)) {
+        if (v[0] == '1' && g_vc_tgCfg) { __atomic_store_n(&g_vc_tg, 1, __ATOMIC_RELEASE); __atomic_store_n(&g_vc_reqRec, 1, __ATOMIC_RELEASE); __atomic_store_n(&g_vc_reqTgFlag, 1, __ATOMIC_RELEASE); }
+        else if (v[0] == '0') { __atomic_store_n(&g_vc_tg, 0, __ATOMIC_RELEASE); __atomic_store_n(&g_vc_reqTgFlag, 2, __ATOMIC_RELEASE); }
+        else { vc_respond(c, "200 OK", "application/json", nocfg, sizeof nocfg - 1); return; }
+    }
+    if (vc_qparam(rq, "on", v, sizeof v)) __atomic_store_n(&g_vc_reqRec, v[0] == '1' ? 1 : 2, __ATOMIC_RELEASE);
+    if (vc_qparam(rq, "test", v, sizeof v) && v[0] == '1') __atomic_store_n(&g_vc_reqTest, 1, __ATOMIC_RELEASE);
+    vc_respond(c, "200 OK", "application/json", okj, sizeof okj - 1);
+}
+static void* vc_http_main(void* arg) {
+    int fd = -1, i, one = 1;
+    (void)arg;
+    if (!hm_wait_started()) return NULL;                                /* konstt_off — мод выключен целиком */
+    for (;;) {
+        for (i = 0; i < VC_PORT_COUNT && fd < 0; i++) {
+            struct vc_sa4 sa; int s = socket(2, 1, 0), z;
+            if (s < 0) break;
+            setsockopt(s, 1, 2, &one, sizeof one);
+            sa.family = 2; sa.port = (u16)(((VC_PORT_FIRST + i) >> 8) | (((VC_PORT_FIRST + i) & 255) << 8));
+            sa.addr = 0x0100007F;
+            for (z = 0; z < 8; z++) sa.zero[z] = 0;
+            if (bind(s, &sa, sizeof sa) == 0 && listen(s, 4) == 0) { fd = s; g_vc_httpPort = VC_PORT_FIRST + i; }
+            else close(s);
+        }
+        if (fd < 0) { usleep(3000000); continue; }
+        dlog_i("voice: HTTP слушает порт ", g_vc_httpPort);
+        for (;;) {
+            int c = accept(fd, NULL, NULL);
+            char rq[1600]; long n; struct vc_tv t;
+            if (c < 0) { usleep(100000); continue; }
+            t.sec = 5; t.usec = 0;
+            setsockopt(c, 1, 20, &t, sizeof t);
+            setsockopt(c, 1, 21, &t, sizeof t);
+            n = recv(c, rq, sizeof rq - 1, 0);
+            if (n > 0) {
+                rq[n] = 0;
+                if (sprefix(rq, "OPTIONS ")) vc_respond(c, "204 No Content", "text/plain", "", 0);
+                else if (sprefix(rq, "GET /voice/status")) vc_http_status(c);
+                else if (sprefix(rq, "GET /voice/cfg")) vc_http_cfg(c, rq);
+                else vc_respond(c, "404 Not Found", "text/plain", "no", 2);
+            }
+            close(c);
+        }
+    }
+    return NULL;
 }
 
 /* ───────────── запуск ───────────── */
@@ -717,8 +1227,13 @@ static void* vc_main(void* arg) {
         if (vc_start()) dlog("voice: запись включена автоматически (флаг auto_on)");
         else dlog2("voice: автозапуск не вышел: ", g_vc_err);
     }
+    if (vc_cfg_load()) {                                              /* tg.txt есть — Telegram настроен; tg_on помнит, что было включено */
+        if (vc_flag_get("tg_on")) { __atomic_store_n(&g_vc_tg, 1, __ATOMIC_RELEASE); dlog("voice: отправка в Telegram включена (флаг tg_on)"); }
+    }
     for (;;) {                                                        /* писатель: забирает пакеты и ведёт файлы */
-        int open_ = vc_tick();
+        int open_;
+        vc_requests();
+        open_ = vc_tick();
         usleep((open_ || g_vc_on) ? 40000 : 250000);
     }
     return NULL;
@@ -728,5 +1243,7 @@ __attribute__((constructor)) static void vc_ctor(void) {
     unsigned long t = 0;
     g_vc_modId = hm_mod_register("voice");                           /* учесть мод в счётчике — только в конструкторе */
     pthread_create(&t, NULL, vc_main, NULL);
+    pthread_create(&t, NULL, vc_tg_main, NULL);
+    pthread_create(&t, NULL, vc_http_main, NULL);
 }
 #endif
