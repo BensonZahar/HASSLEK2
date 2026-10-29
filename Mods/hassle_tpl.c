@@ -275,16 +275,17 @@ static void tpl_stop_vehicle(void* veh) {
 /* Поставить игрока (или его машину) в точку. npE — позиция в системе Entity.Transform (для SetPosition игрока/машины), npM — в системе transform
    движения (для запасного способа, только пешком); любой может быть NULL. findH — искать высоту по земле (только основной способ).
    Возврат: 1 основной, 2 запасной, 3 — перенесена машина, 0 не вышло. */
+static void tplf_guard(const TplCtx* c);                        /* «как на ровном» после телепорта пешком (ниже, рядом с наблюдателем) */
 static int tpl_place(const TplCtx* c, const float* npE, const float* npM, u8 findH) {
     if (c->veh) {                                                    /* за рулём: двигаем машину; запасной способ (/tpl alt) тут не нужен */
         if (npE && tpl_call_set(c->veh, npE, findH, "машине")) { tpl_stop_vehicle(c->veh); return 3; }
         return 0;
     }
     if (!g_tpl_alt && npE) {
-        if (tpl_call_set(c->me, npE, findH, "Player")) return 1;
+        if (tpl_call_set(c->me, npE, findH, "Player")) { tplf_guard(c); return 1; }
         dlog("/tpl: основной способ не вышел, пробую запасной (через движение)");
     }
-    if (npM && c->mv && tpl_call_set(c->mv, npM, 1, "движению")) return 2;
+    if (npM && c->mv && tpl_call_set(c->mv, npM, 1, "движению")) { tplf_guard(c); return 2; }
     return 0;
 }
 static void tpl_fail(void) { chat_say("Телепорт: не вышло — подробности в konstt.log. Попробуйте /tpl alt"); }
@@ -442,6 +443,7 @@ static int gh_hook(void* player, void* a1) {
 #define TPLW_WATCH   3000LL                              /* мс наблюдения после прибытия */
 #define TPLW_TICK_US 60000
 
+static volatile int g_tplf_on;                           /* 1 — способность Fall выключена нами после телепорта и ждёт возврата */
 static volatile int g_tplw_on;                           /* 0 — нет, 1 — ждём прибытия, 2 — наблюдаем после прибытия */
 static volatile int g_tplw_pending;                      /* тик отправлен и ещё не обработан */
 static volatile long long g_tplw_pendT;
@@ -472,7 +474,7 @@ static void tplw_post(void) {
 static void* tplw_worker(void* arg) {
     (void)arg;
     for (;;) {
-        if (!__atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
+        if (!__atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
         if (!g_tplw_pending || gh_now_ms() - g_tplw_pendT > 1000) {      /* прошлый тик не дошёл (игра на паузе/грузится) — шлём новый */
             g_tplw_pending = 1; g_tplw_pendT = gh_now_ms();
             tplw_post();
@@ -480,6 +482,106 @@ static void* tplw_worker(void* arg) {
         usleep(TPLW_TICK_US);
     }
     return NULL;
+}
+/* ───────────── «как на ровном» после телепорта (так же, как /air stand) ─────────────
+   После телепорта персонаж на миг в воздухе (высота точки выше пола) — включается способность Fall: клип падения, руки в стороны.
+   Как в /air: на время падения ставим у Fall Enabled = false (Character.TryStartAbility пропускает выключенные), если уже активна — StopAbility(force);
+   вернуть Enabled — когда персонаж встал на землю (get_isOnGround у движения; не прочиталось — через 2.5 с), но не позже TPLF_MAX_MS.
+   Если Fall уже выключена до нас (например, работает /air) — ничего не трогаем, чтобы потом не оставить её выключенной насовсем. */
+#define TPLF_MIN_MS 700LL                                /* не возвращаем раньше: даём падению начаться */
+#define TPLF_BLIND_MS 2500LL                             /* земля не читается — возвращаем по времени */
+#define TPLF_MAX_MS 8000LL                               /* предел: дольше Fall выключенной не держим */
+static long long g_tplf_t0;
+static int tplf_getb(void* obj, const char* getter, int dflt) {
+    void *m, *exc = NULL, *r;
+    if (!obj) return dflt;
+    m = find_method(A.object_get_class(obj), getter, 0);
+    if (!m) return dflt;
+    r = A.runtime_invoke(m, obj, NULL, &exc);
+    if (exc || !r || !hm_readable((char*)r + HDR, 1)) return dflt;
+    return *((u8*)r + HDR) ? 1 : 0;
+}
+static int tplf_setb(void* obj, const char* setter, int v) {
+    void *m, *exc = NULL, *args[1]; u8 b = v ? 1 : 0;
+    if (!obj) return 0;
+    m = find_method(A.object_get_class(obj), setter, 1);
+    if (!m) return 0;
+    args[0] = &b;
+    A.runtime_invoke(m, obj, args, &exc);
+    return exc ? 0 : 1;
+}
+static int tplf_fieldb(void* obj, const char* name, int v) {            /* запасной путь: поле Ability.m_Enabled */
+    void* f = find_field(A.object_get_class(obj), name); u8* q;
+    if (!f || (A.field_get_flags(f) & 0x10)) return 0;
+    q = (u8*)obj + A.field_get_offset(f);
+    if (!hm_readable(q, 1)) return 0;
+    *q = v ? 1 : 0;
+    return 1;
+}
+static void* tplf_fall(void* me) {                                      /* способность Fall из Character.m_Abilities (List<Ability>) */
+    void *ctrl, *list, *items; int n, i; long len; char* data;
+    ctrl = me ? ref_field_s(me, "m_Controller") : NULL;                 /* Actor.m_Controller */
+    if (!ctrl || !hm_obj_ok(ctrl)) return NULL;
+    list = ref_field_s(ctrl, "m_Abilities");
+    if (!list || !hm_obj_ok(list)) return NULL;
+    items = ref_field_s(list, "_items");
+    if (!items || !hm_obj_ok(items)) return NULL;
+    n = int_field(list, "_size", "size", NULL, -1);
+    len = *(long*)((char*)items + 3 * sizeof(void*));
+    if (len <= 0 || len > 64) return NULL;
+    if (n < 0 || n > len) n = (int)len;
+    data = (char*)items + 4 * sizeof(void*);
+    for (i = 0; i < n; i++) {
+        void* a = *(void**)(data + (uptr)i * sizeof(void*));
+        if (!a || !hm_obj_ok(a)) continue;
+        if (seq(A.class_get_name(A.object_get_class(a)), "Fall")) return a;
+    }
+    return NULL;
+}
+static void tplf_stop(void* ab) {                                       /* Ability.StopAbility(bool force) */
+    void *m, *exc = NULL, *args[1]; u8 force = 1;
+    m = find_method(A.object_get_class(ab), "StopAbility", 1);
+    if (!m) return;
+    args[0] = &force;
+    A.runtime_invoke(m, ab, args, &exc);
+}
+/* Главный поток, сразу после успешного телепорта ПЕШКОМ (из tpl_place) */
+static void tplf_guard(const TplCtx* c) {
+    void* fall;
+    if (!c || c->veh || !c->me) return;
+    mt_capture_ctx();
+    if (!g_mt_ctx || !g_mt_postM || !g_mt_kCb) { dlog("/tpl: нет канала в главный поток — Fall после телепорта не трогаю"); return; }
+    fall = tplf_fall(c->me);
+    if (!fall) { dlog("/tpl: у персонажа не найдена способность Fall — руки в падении не убрать"); return; }
+    if (!__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) {
+        if (!tplf_getb(fall, "get_Enabled", 1)) return;                  /* уже выключена не нами (например /air) — пусть так и остаётся */
+        if (!tplf_setb(fall, "set_Enabled", 0) && !tplf_fieldb(fall, "m_Enabled", 0)) { dlog("/tpl: Fall.Enabled не записался"); return; }
+    }
+    if (tplf_getb(fall, "get_IsActive", 0)) tplf_stop(fall);
+    g_tplf_t0 = gh_now_ms();
+    if (!g_tplw_thread) {
+        unsigned long t = 0;
+        if (pthread_create(&t, NULL, tplw_worker, NULL) != 0) {
+            if (!tplf_setb(fall, "set_Enabled", 1)) tplf_fieldb(fall, "m_Enabled", 1);
+            dlog("/tpl: не создался поток — Fall возвращена сразу"); return;
+        }
+        g_tplw_thread = 1;
+    }
+    if (!__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) dlog("/tpl: Fall выключена на время падения после телепорта");
+    __atomic_store_n(&g_tplf_on, 1, __ATOMIC_RELEASE);
+}
+/* Главный поток, по тику: пора ли вернуть Fall */
+static void tplf_tick(long long now) {
+    TplCtx c; long long dt = now - g_tplf_t0; int gr, back = 0; void* fall;
+    if (!__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE) || dt < TPLF_MIN_MS) return;
+    if (!tpl_ctx_q(&c, 0, 1)) { if (dt >= TPLF_MAX_MS) { __atomic_store_n(&g_tplf_on, 0, __ATOMIC_RELEASE); dlog("/tpl: персонажа нет — Fall вернуть не удалось"); } return; }
+    gr = c.mv ? tplf_getb(c.mv, "get_isOnGround", -1) : -1;
+    if (gr == 1 || dt >= TPLF_MAX_MS || (gr < 0 && dt >= TPLF_BLIND_MS)) back = 1;
+    if (!back) return;
+    fall = tplf_fall(c.me);
+    if (fall && !tplf_setb(fall, "set_Enabled", 1) && !tplf_fieldb(fall, "m_Enabled", 1)) dlog("/tpl: Fall.Enabled не вернулся");
+    __atomic_store_n(&g_tplf_on, 0, __ATOMIC_RELEASE);
+    { char lg[120]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: Fall возвращена через мс: "); b_int(&x, (int)dt); b_s(&x, gr == 1 ? " (встали на землю)" : gr == 0 ? " (по пределу)" : " (земля не читается)"); dlog(lg); }
 }
 /* Главный поток, сразу после успешного Entity.SetPosition у машины. from — где была, to — куда ставим. 1 — машина ещё не на точке */
 static int tplw_begin(const TplCtx* c, const float* from, const float* to) {
@@ -508,6 +610,7 @@ static int tplw_begin(const TplCtx* c, const float* from, const float* to) {
 static void tplw_tick(void) {
     TplCtx c; float p[3]; long long now = gh_now_ms(); int st; Buf b; char msg[300];
     g_tplw_pending = 0;
+    if (__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) tplf_tick(now);
     st = __atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE);
     if (!st) return;
     if (!tpl_ctx_q(&c, 2, 1) || !c.veh) { tplw_end("вы уже не за рулём"); return; }
@@ -1377,7 +1480,7 @@ static void tpl_cmd_pick(int num, int list) {
         }
         b_init(&x, lb, sizeof lb); b_ch(&x, '#'); b_int(&x, num);
         if (g_tpl_pk[num - 1].lab[0]) { b_ch(&x, ' '); b_s(&x, g_tpl_pk[num - 1].lab); }
-        tpl_goto_ex(g_tpl_pk[num - 1].p, 3, lb, 0);
+        tpl_goto_ex(g_tpl_pk[num - 1].p, 3, lb, 1);                       /* высота — по земле под пикапом: на высоту самого пикапа (он висит над полом) встали бы и упали вниз */
         return;
     }
     if (list && num > 1 && g_tpl_npk) { page = num; rescan = 0; }
