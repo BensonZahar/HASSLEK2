@@ -30,13 +30,13 @@
 #include "hassle_core.c"
 extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct timespec = два long */
 
-#define CAR_NROW 9
+#define CAR_NROW 12
 #define CAR_NORIG 8
 #define CAR_MAXMODELS 32
-#define CAR_MAXENT 9
+#define CAR_MAXENT 12
 #define CAR_FILE "car_profiles.txt"
 
-/* where: 0 — WheeledVehiclePhysics (BaseVehicle.m_Physics), 1 — CommonVehicleHandling (BaseVehicle.m_Handling) */
+/* where: 0 — WheeledVehiclePhysics (BaseVehicle.m_Physics), 1 — CommonVehicleHandling (BaseVehicle.m_Handling), 2 — Engine (m_Physics.m_Engine) */
 typedef struct { const char* cmd; const char* key; int where; const char* field; } CarRow;
 static const CarRow g_car_rows[CAR_NROW] = {
     { "speed",   "speed",   0, "MaxSpeedForward" },
@@ -48,9 +48,12 @@ static const CarRow g_car_rows[CAR_NROW] = {
     { "brake",   "brake",   0, "MaxBrakeForce" },
     { "steer",   "steer",   0, "MaxSteerAngle" },
     { "drag",    "drag",    0, "AeroDrag" },
+    { "power",   "power",   2, "m_MaxPower" },          /* мощность двигателя (Engine.SetPower) — прямой рычаг разгона */
+    { "inertia", "inertia", 2, "m_Inertia" },           /* инерция двигателя: меньше — быстрее набирает обороты */
+    { "traction","htract",  1, "TractionMultiplier" },  /* сцепление в хендлинге */
 };
 
-typedef struct { void* veh; int id; unsigned have; float orig[CAR_NROW]; } CarOrig;
+typedef struct { void* veh; int id; unsigned have, wset; float orig[CAR_NROW], want[CAR_NROW]; } CarOrig;   /* orig — что было; want — что мы записали */
 static CarOrig g_car_orig[CAR_NORIG];
 static int g_car_origNext;
 
@@ -127,6 +130,15 @@ static float* car_fptr(void* veh, int where, const char* field) {
         if (tk != 12) return NULL;
         off = A.field_get_offset(f);
         p = (float*)((char*)host + off);
+    } else if (where == 2) {
+        void* ph = ref_field_s(veh, "m_Physics");
+        host = ph && hm_obj_ok(ph) ? ref_field_s(ph, "m_Engine") : NULL;
+        if (!host || !hm_obj_ok(host)) return NULL;       /* у техники нет двигателя (m_Engine не создан) */
+        f = find_field(A.object_get_class(host), field);
+        if (!f) return NULL;
+        if (A.type_get_type(A.field_get_type(f)) != 12) return NULL;
+        off = A.field_get_offset(f);
+        p = (float*)((char*)host + off);
     } else {
         f = find_field(A.object_get_class(veh), "m_Handling");
         if (!f) return NULL;
@@ -174,7 +186,7 @@ static CarOrig* car_orig_get(void* veh, int create) {
     for (i = 0; i < CAR_NORIG; i++) if (g_car_orig[i].veh == veh && g_car_orig[i].id == id) return &g_car_orig[i];
     if (!create) return NULL;
     i = g_car_origNext; g_car_origNext = (g_car_origNext + 1) % CAR_NORIG;
-    g_car_orig[i].veh = veh; g_car_orig[i].id = id; g_car_orig[i].have = 0;
+    g_car_orig[i].veh = veh; g_car_orig[i].id = id; g_car_orig[i].have = 0; g_car_orig[i].wset = 0;
     return &g_car_orig[i];
 }
 /* записать строку row: mul=1 — orig*val, иначе val. 1 — записано */
@@ -187,7 +199,36 @@ static int car_write_row(void* veh, int row, float val, int mul) {
     nv = mul ? o->orig[row] * val : val;
     if (!car_finite(nv) || nv < 0.0f) return 0;
     if (*p != nv) *p = nv;
+    o->want[row] = nv; o->wset |= (1u << row);
     return 1;
+}
+/* Пересчитать физику из хендлинга: BaseVehicle.OnHandlingsUpdate() — тот же метод, что игра зовёт при обновлении хендлингов. */
+static int car_call_update(void* veh) {
+    void *m, *exc = NULL; char et[200];
+    m = find_method(A.object_get_class(veh), "OnHandlingsUpdate", 0);
+    if (!m) { dlog("vtune: у машины нет OnHandlingsUpdate"); return 0; }
+    A.runtime_invoke(m, veh, NULL, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("vtune: OnHandlingsUpdate бросил исключение: ", et); return 0; }
+    return 1;
+}
+/* После пересчёта: наши значения физики/двигателя возвращаем на место; если игра откатила сам ХЕНДЛИНГ — считаем (reverted) и пишем обратно. */
+static int car_post_update(void* veh) {
+    CarOrig* o = car_orig_get(veh, 0); int i, reverted = 0;
+    if (!car_call_update(veh)) return 0;
+    if (!o) return 0;
+    for (i = 0; i < CAR_NROW; i++) if (o->wset & (1u << i)) {
+        float* p = car_fptr(veh, g_car_rows[i].where, g_car_rows[i].field);
+        if (p && *p != o->want[i]) { if (g_car_rows[i].where == 1) reverted++; *p = o->want[i]; }
+    }
+    return reverted;
+}
+/* параметр cmd → все его строки; хендлинг пишем первым, затем (если был хендлинг) пересчёт физики. n — сколько записано, *rev — сколько хендлинг-полей игра откатила */
+static int car_set_cmd(void* veh, const char* cmd, float v, int mul, int* rev) {
+    int i, n = 0, hand = 0;
+    for (i = 0; i < CAR_NROW; i++) if (g_car_rows[i].where == 1 && seq(g_car_rows[i].cmd, cmd)) { int w = car_write_row(veh, i, v, mul); n += w; hand += w; }
+    for (i = 0; i < CAR_NROW; i++) if (g_car_rows[i].where != 1 && seq(g_car_rows[i].cmd, cmd)) n += car_write_row(veh, i, v, mul);
+    if (rev) *rev = hand ? car_post_update(veh) : 0;
+    return n;
 }
 
 /* ───────────── профили ───────────── */
@@ -275,8 +316,10 @@ static void car_prof_load(void) {
 
 /* применить профиль модели к машине; возвращает число записанных полей */
 static int car_apply_prof(void* veh, const CarProf* p) {
-    int k, ok = 0;
-    for (k = 0; k < p->n; k++) { int r = car_row_by_key(p->e[k].key); if (r >= 0 && car_write_row(veh, r, p->e[k].val, p->e[k].mul)) ok++; }
+    int k, ok = 0, hand = 0;
+    for (k = 0; k < p->n; k++) { int r = car_row_by_key(p->e[k].key); if (r >= 0 && g_car_rows[r].where == 1 && car_write_row(veh, r, p->e[k].val, p->e[k].mul)) { ok++; hand++; } }
+    for (k = 0; k < p->n; k++) { int r = car_row_by_key(p->e[k].key); if (r >= 0 && g_car_rows[r].where != 1 && car_write_row(veh, r, p->e[k].val, p->e[k].mul)) ok++; }
+    if (hand) car_post_update(veh);
     return ok;
 }
 
@@ -299,7 +342,7 @@ static void car_info(void* veh) {
     chat_usage(line);
 }
 static void car_help(void) {
-    chat_usage("/vtune — инфо о машине;  /vtune speed 90 | speed x1.5 — скорость (абсолют или множитель оригинала);  параметры: speed reverse force accel grip brake steer drag");
+    chat_usage("/vtune — инфо о машине;  /vtune speed 90 | speed x1.5 — скорость (абсолют или множитель оригинала);  параметры: speed reverse force accel power inertia grip traction brake steer drag");
     chat_usage("/vtune reset — вернуть оригинал;  /vtune save — запомнить как профиль этой МОДЕЛИ (по ID модели);  /vtune model ID параметр значение — профиль вручную;  /vtune model ID del");
     chat_usage("/vtune list — профили;  /vtune auto on|off — применять профиль автоматически, когда садитесь за руль этой модели");
 }
@@ -375,12 +418,12 @@ static void native_car_cmd(void* self, void* args, void* mi) {
         if (!car_num(tok[1], &fid)) { chat_usage("Нужен ID модели: /vtune model 123 speed x1.8 (ID модели покажет /vtune, когда вы в машине)"); return; }
         model = (int)(fid + 0.5f);
         if (nt >= 3 && (seq(tok[2], "del") || seq(tok[2], "delete"))) { car_prof_del(model); car_prof_save(); g_car_dirty = 1; chat_say("car: профиль модели удалён"); return; }
-        if (nt < 4 || !car_val(tok[3], &v, &mul)) { chat_usage("Формат: /vtune model ID параметр значение  (значение: 90 или x1.5; параметры: speed reverse force accel grip brake steer drag)"); return; }
+        if (nt < 4 || !car_val(tok[3], &v, &mul)) { chat_usage("Формат: /vtune model ID параметр значение  (значение: 90 или x1.5; параметры: speed reverse force accel power inertia grip traction brake steer drag)"); return; }
         p = car_prof_get(model);
         if (!p) { chat_say("car: слишком много профилей"); return; }
         r = 0;
         for (i = 0; i < CAR_NROW; i++) if (seq(g_car_rows[i].cmd, tok[2])) { car_prof_put(p, g_car_rows[i].key, v, mul); r++; }
-        if (!r) { chat_usage("Неизвестный параметр. Доступно: speed reverse force accel grip brake steer drag"); return; }
+        if (!r) { chat_usage("Неизвестный параметр. Доступно: speed reverse force accel power inertia grip traction brake steer drag"); return; }
         car_prof_save(); g_car_dirty = 1;
         chat_say(g_car_auto ? "car: профиль модели сохранён (применится при посадке; авто — вкл)" : "car: профиль модели сохранён (включите /vtune auto on, чтобы применялся сам)");
         return;
@@ -393,6 +436,7 @@ static void native_car_cmd(void* self, void* args, void* mi) {
         CarOrig* o = car_orig_get(veh, 0); int n = 0;
         if (!o) { chat_say("car: эта машина не менялась — сбрасывать нечего"); return; }
         for (i = 0; i < CAR_NROW; i++) if (o->have & (1u << i)) { float* p = car_fptr(veh, g_car_rows[i].where, g_car_rows[i].field); if (p) { *p = o->orig[i]; n++; } }
+        o->wset = 0; car_call_update(veh);                         /* игра заново считает физику из вернувшегося хендлинга */
         g_car_lastVeh = veh; g_car_lastId = car_veh_id(veh);       /* авто-режим не должен тут же вернуть профиль */
         { char m[80]; Buf b; b_init(&b, m, sizeof m); b_s(&b, "car: оригинал возвращён, полей: "); b_int(&b, n); chat_say(m); }
         return;
@@ -412,10 +456,24 @@ static void native_car_cmd(void* self, void* args, void* mi) {
         return;
     }
     if (nt >= 2 && car_val(tok[1], &v, &mul)) {            /* /vtune параметр значение — текущей машине */
-        int n = 0;
-        for (i = 0; i < CAR_NROW; i++) if (seq(g_car_rows[i].cmd, tok[0])) n += car_write_row(veh, i, v, mul);
-        if (!n) { chat_usage("car: не вышло — параметра нет или у этой техники нет такого поля (список: /vtune help)"); return; }
+        int n, rev = 0; float *pw = car_fptr(veh, 2, "m_MaxPower"), pw0 = pw ? *pw : 0.0f;
+        n = car_set_cmd(veh, tok[0], v, mul, &rev);
+        if (!n) { chat_usage("vtune: не вышло — параметра нет или у этой техники нет такого поля (список: /vtune help)"); return; }
         g_car_lastVeh = veh; g_car_lastId = car_veh_id(veh);
+        if (rev) chat_say("vtune: ВНИМАНИЕ — игра при пересчёте откатила значение хендлинга (берёт его из своей таблицы). Пришлите konstt.log и вывод /vtune");
+        if (seq(tok[0], "accel")) {                                  /* разгон: хендлинг → пересчёт; если мощность двигателя не изменилась, умножаем её сами */
+            pw = car_fptr(veh, 2, "m_MaxPower");
+            if (pw && pw0 > 0.0f) {
+                float d = *pw > pw0 ? *pw - pw0 : pw0 - *pw; char m[140]; Buf b; b_init(&b, m, sizeof m);
+                if (d <= pw0 * 0.001f) {
+                    CarOrig* o = car_orig_get(veh, 0); int ra = car_row_by_key("haccel");
+                    float ratio = (o && ra >= 0 && (o->have & (1u << ra)) && o->orig[ra] > 0.0001f) ? o->want[ra] / o->orig[ra] : (mul ? v : 1.0f);
+                    car_write_row(veh, car_row_by_key("power"), ratio, 1);
+                    b_s(&b, "vtune: игра мощность из accel не пересчитала — умножил мощность двигателя напрямую (x"); b_fix(&b, ratio, 2); b_s(&b, ")");
+                } else { b_s(&b, "vtune: игра пересчитала мощность двигателя: "); b_fix(&b, pw0, 1); b_s(&b, " -> "); b_fix(&b, *pw, 1); }
+                chat_say(m);
+            }
+        }
         car_info(veh);
         return;
     }
