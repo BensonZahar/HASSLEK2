@@ -16,8 +16,9 @@
  *   /voice tg        состояние отправки: сколько ушло, сколько ошибок, последняя причина
  *
  * Telegram: токен и чат — в файле <папка voice>/tg.txt (строка 1 — токен бота, 2 — chat_id, 3 — необязательная метка аккаунта) или от скрипта
- *   через HTTP 127.0.0.1:17791..17800 (/voice/status, /voice/cfg?k=&c=&who=&tg=0|1&on=0|1&mode=near|all&kb=&test=1; на диск токен не пишется).
- *   kb — reply_markup (JSON, только ASCII: не-ASCII как \uXXXX, urlencoded) — кнопки под каждым голосовым, их строит скрипт (как kb= у /screen).
+ *   через HTTP 127.0.0.1:17791..17800 (/voice/status, /voice/cfg?k=&c=&who=&tg=0|1&on=0|1&mode=near|all&kb=&kbp=&test=1; на диск токен не пишется).
+ *   kb — reply_markup (JSON, только ASCII: не-ASCII как \uXXXX, urlencoded) — кнопки под каждым голосовым, их строит скрипт (как kb= у /screen);
+ *   kbp — то же для голоса игрока: «%P» в callback_data мод заменяет на ID говорящего (для кнопки «Выдача лицензии»).
  *   Отправка идёт отдельным потоком через JNI HttpURLConnection (как /screen): игру не тормозит; очередь на 32 реплики, лишние отбрасываются.
  *
  * Куда и во что
@@ -370,7 +371,7 @@ static volatile int g_vc_tg;                 /* 1 — слать в Telegram */
 static volatile int g_vc_tgCfg;              /* 1 — токен и чат заданы */
 static char g_vc_tgTok[160], g_vc_tgChat[48], g_vc_tgWho[48];
 #define VC_KB_MAX 1400
-static char g_vc_tgKb[2][VC_KB_MAX];         /* reply_markup для sendVoice (JSON, только ASCII) — присылает скрипт; два буфера: отправитель не видит недописанную строку */
+static char g_vc_tgKb[2][2][VC_KB_MAX];      /* reply_markup для sendVoice (JSON, только ASCII) — присылает скрипт. [буфер][0 — для всех, 1 — для игрока: «%P» меняется на его ID (кнопка лицензии)]; два буфера: отправитель не видит недописанную строку */
 static volatile int g_vc_tgKbIdx;            /* какой буфер актуален */
 static volatile int g_vc_tgKbSet;            /* 1 — клавиатура задана */
 static volatile unsigned g_vc_tgSent, g_vc_tgFail, g_vc_tgDrop;
@@ -600,9 +601,19 @@ static void vc_tg_send(const VcTgJob* j) {
     chat[i] = 0;
     for (i = 0; g_vc_tgWho[i] && i < 47; i++) who[i] = g_vc_tgWho[i];
     who[i] = 0;
-    {   const char* ks = g_vc_tgKb[__atomic_load_n(&g_vc_tgKbIdx, __ATOMIC_ACQUIRE) & 1];
-        for (i = 0; ks[i] && i < VC_KB_MAX - 1; i++) kb[i] = ks[i];
-        kb[i] = 0; }
+    {   char (*kv)[VC_KB_MAX] = g_vc_tgKb[__atomic_load_n(&g_vc_tgKbIdx, __ATOMIC_ACQUIRE) & 1];
+        const char* ks = (j->pid >= 0 && kv[1][0]) ? kv[1] : kv[0];       /* говорит игрок — клавиатура с его ID, иначе общая */
+        unsigned k = 0;
+        for (i = 0; ks[i] && k < VC_KB_MAX - 12; i++) {
+            if (ks[i] == '%' && ks[i + 1] == 'P') {                         /* «%P» → ID говорящего (callback_data кнопки «Выдача лицензии») */
+                char dg[12]; int n = 0, pv = j->pid >= 0 ? j->pid : 0;
+                do { dg[n++] = (char)('0' + pv % 10); pv /= 10; } while (pv && n < 11);
+                while (n > 0) kb[k++] = dg[--n];
+                i++; continue;
+            }
+            kb[k++] = ks[i];
+        }
+        kb[k] = 0; }
     if (!tok[0] || !chat[0]) return;
     g_vc_tgMsg[0] = 0;
     b_init(&b, bd, sizeof bd); b_s(&b, "----hassle"); b_int(&b, time(NULL)); b_int(&b, (long)++g_vc_boundSeq);
@@ -1192,7 +1203,7 @@ static void vc_http_status(int c) {
     b_s(&b, ",\"mode\":\""); b_s(&b, g_vc_mode == VC_MODE_NEAR ? "near" : "all");
     b_s(&b, "\",\"tg\":"); b_int(&b, g_vc_tg ? 1 : 0);
     b_s(&b, ",\"cfg\":"); b_int(&b, g_vc_tgCfg ? 1 : 0);
-    b_s(&b, ",\"kb\":1,\"kbset\":"); b_int(&b, g_vc_tgKbSet ? 1 : 0);     /* kb:1 — сборка умеет кнопки под голосовыми (нет поля — старая) */
+    b_s(&b, ",\"kb\":2,\"kbset\":"); b_int(&b, g_vc_tgKbSet ? 1 : 0);     /* kb:2 — сборка умеет кнопки под голосовыми и кнопку игрока «%P» (1 — только общие, нет поля — старая) */
     b_s(&b, ",\"files\":"); b_int(&b, (long)g_vc_files);
     b_s(&b, ",\"queued\":"); b_int(&b, (long)(g_vc_tgHead - g_vc_tgTail));
     b_s(&b, ",\"sent\":"); b_int(&b, (long)g_vc_tgSent);
@@ -1202,9 +1213,13 @@ static void vc_http_status(int c) {
     b_s(&b, ",\"msg\":\""); b_s(&b, m); b_s(&b, "\"}");
     vc_respond(c, "200 OK", "application/json", js, b.n);
 }
+static void vc_kb_check(char* s, unsigned cap) {                       /* пусто — убрать кнопки; обрезано или не JSON — отбрасываем (голосовое пойдёт без них) */
+    unsigned kl = slen(s);
+    if (kl && (s[0] != '{' || s[kl - 1] != '}' || kl + 2 >= cap)) { s[0] = 0; dlog("voice: kb не принят (обрезан или не JSON) — голосовые пойдут без кнопок"); }
+}
 static void vc_http_cfg(int c, const char* rq) {
     static const char okj[] = "{\"ok\":true}", bad[] = "{\"ok\":false,\"err\":\"bad_args\"}", nocfg[] = "{\"ok\":false,\"err\":\"no_token\"}";
-    char tok[160], chat[48], who[48], v[16], kbq[VC_KB_MAX]; int hasK, hasC;
+    char tok[160], chat[48], who[48], v[16], kbq[VC_KB_MAX], kpq[VC_KB_MAX]; int hasK, hasC;
     hasK = vc_qparam(rq, "k", tok, sizeof tok); hasC = vc_qparam(rq, "c", chat, sizeof chat);
     if (hasK != hasC || (hasK && (!tok[0] || !chat[0]))) { vc_respond(c, "200 OK", "application/json", bad, sizeof bad - 1); return; }
     if (hasK) {
@@ -1213,13 +1228,15 @@ static void vc_http_cfg(int c, const char* rq) {
         __atomic_store_n(&g_vc_tgCfg, 1, __ATOMIC_RELEASE);
     }
     if (vc_qparam(rq, "who", who, sizeof who)) vc_copy(g_vc_tgWho, sizeof g_vc_tgWho, who);
-    if (vc_qparam(rq, "kb", kbq, sizeof kbq)) {                         /* reply_markup под голосовыми: пусто — убрать кнопки */
-        unsigned kl = slen(kbq);
-        if (kl && (kbq[0] != '{' || kbq[kl - 1] != '}' || kl + 2 >= sizeof kbq)) { kbq[0] = 0; dlog("voice: kb не принят (обрезан или не JSON) — голосовые пойдут без кнопок"); }
-        {   int w = 1 - (__atomic_load_n(&g_vc_tgKbIdx, __ATOMIC_ACQUIRE) & 1);
-            vc_copy(g_vc_tgKb[w], sizeof g_vc_tgKb[w], kbq);
+    {   int hasKb = vc_qparam(rq, "kb", kbq, sizeof kbq), hasKp = vc_qparam(rq, "kbp", kpq, sizeof kpq);   /* kb — кнопки под всеми голосовыми, kbp — под голосом игрока (с «%P») */
+        if (hasKb || hasKp) {
+            int cur = __atomic_load_n(&g_vc_tgKbIdx, __ATOMIC_ACQUIRE) & 1, w = 1 - cur;
+            vc_copy(g_vc_tgKb[w][0], VC_KB_MAX, g_vc_tgKb[cur][0]); vc_copy(g_vc_tgKb[w][1], VC_KB_MAX, g_vc_tgKb[cur][1]);
+            if (hasKb) { vc_kb_check(kbq, sizeof kbq); vc_copy(g_vc_tgKb[w][0], VC_KB_MAX, kbq); }
+            if (hasKp) { vc_kb_check(kpq, sizeof kpq); vc_copy(g_vc_tgKb[w][1], VC_KB_MAX, kpq); }
             __atomic_store_n(&g_vc_tgKbIdx, w, __ATOMIC_RELEASE);
-            __atomic_store_n(&g_vc_tgKbSet, kbq[0] ? 1 : 0, __ATOMIC_RELEASE); }
+            __atomic_store_n(&g_vc_tgKbSet, (g_vc_tgKb[w][0][0] || g_vc_tgKb[w][1][0]) ? 1 : 0, __ATOMIC_RELEASE);
+        }
     }
     if (vc_qparam(rq, "mode", v, sizeof v)) __atomic_store_n(&g_vc_mode, seq(v, "all") ? VC_MODE_ALL : VC_MODE_NEAR, __ATOMIC_RELEASE);
     if (vc_qparam(rq, "tg", v, sizeof v)) {
