@@ -28,6 +28,7 @@
  */
 #pragma once
 #include "hassle_core.c"
+extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct timespec = два long */
 
 #define CAR_NROW 9
 #define CAR_NORIG 8
