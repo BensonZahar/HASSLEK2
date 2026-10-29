@@ -39,6 +39,9 @@
  *                        В строке: номер в списке (для «pick N»), ID пикапа, [модель N] («?» — не прочиталась, причина в konstt.log), расстояние, 3D-подпись рядом и координаты.
  *   /tpl pick N          телепорт к номеру N из ПОСЛЕДНЕГО списка (номера остаются, пока не вызовете «/tpl pick» заново — можно ходить по ним подряд).
  *                        Встаёте так, как сервер видит игрока на пикапе (Transform на 1 м ниже точки пикапа: в пакет уходит Transform.y + 1), поэтому он срабатывает как при касании (раздевалка, вход и т.п.).
+ *   /tpl pick N under [сек]  «нырок»: встаёте на 1 м НИЖЕ обычной точки пикапа (под пол), держитесь там сек секунд (по умолчанию 0.4, от 0.2 до 15) и возвращаетесь
+ *                        туда, где стояли — пикап срабатывает, а вы не стоите на нём (не мешаете тем, кто на нём стоит). Для пикапа с клавишей (вход в дом и т.п.) задайте
+ *                        больше секунд и нажмите клавишу, пока вы под полом. Только пикапы (не маркеры) и только пешком. Синонимы: under, dive, ниже, нырок.
  *   /tpl pick list [стр] список по 10 на странице; «list 2» листает прежний снимок, не пересобирая
  *   В машине (вы за рулём) все команды телепорта (/tpl 5 вперёд, /tpl to …, /tpl go …) переносят МАШИНУ вместе с вами.
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
@@ -450,6 +453,15 @@ static volatile long long g_tplw_pendT;
 static int g_tplw_thread;
 static long long g_tplw_t0, g_tplw_tArr;
 static float g_tplw_from[3], g_tplw_to[3], g_tplw_total;
+/* Нырок под пол (/tpl pick N under [сек]): встали на TPL_UNDER_DY ниже обычной точки пикапа, держим там (каждый тик ставим заново — под полом земли нет, иначе упадём),
+   через hold мс возвращаем туда, где стояли. Всё в главном потоке, тики те же, что у наблюдателя. */
+#define TPL_UNDER_DY 1.0f                                /* м ниже обычной точки: сервер видит вас в 1 м под пикапом (у пикапов с клавишей предел сервера 1.3 м) */
+#define TPLU_HOLD_MS 400LL                               /* по умолчанию держим 0.4 с: несколько пакетов синхронизации успевают дойти до сервера */
+#define TPLU_HOLD_MIN 200LL
+#define TPLU_HOLD_MAX 15000LL
+static volatile int g_tplu_on;                           /* 1 — под полом, ждём возврата */
+static long long g_tplu_t0, g_tplu_hold; static int g_tplu_try;
+static float g_tplu_back[3], g_tplu_dive[3];
 
 static float tplw_dxz(const float* a, const float* b) {
     double dx = (double)a[0] - (double)b[0], dz = (double)a[2] - (double)b[2];
@@ -474,7 +486,7 @@ static void tplw_post(void) {
 static void* tplw_worker(void* arg) {
     (void)arg;
     for (;;) {
-        if (!__atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
+        if (!__atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
         if (!g_tplw_pending || gh_now_ms() - g_tplw_pendT > 1000) {      /* прошлый тик не дошёл (игра на паузе/грузится) — шлём новый */
             g_tplw_pending = 1; g_tplw_pendT = gh_now_ms();
             tplw_post();
@@ -614,11 +626,30 @@ static int tplw_begin(const TplCtx* c, const float* from, const float* to) {
     }
     return pending;
 }
+/* Главный поток, по тику: нырок под пол. Пока держим — ставим на то же место (не даём упасть); время вышло — возвращаем туда, где стояли */
+static void tplu_tick(long long now) {
+    TplCtx c; float eb[3], mb[3], nm[3]; int haveE, haveM, via; long long dt = now - g_tplu_t0;
+    if (!__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) return;
+    if (!tpl_ctx_q(&c, 1, 1)) { __atomic_store_n(&g_tplu_on, 0, __ATOMIC_RELEASE); dlog("/tpl: нырок: персонажа нет или вы в машине — вернуть наверх не удалось"); return; }
+    if (dt < g_tplu_hold) { tpl_call_set(c.me, g_tplu_dive, 0, "Player (нырок, держим)"); return; }
+    __atomic_store_n(&g_tplu_on, 0, __ATOMIC_RELEASE);
+    haveE = c.etr && tpl_vec(c.etr, "get_position", eb);
+    haveM = c.mtr && tpl_vec(c.mtr, "get_position", mb);
+    nm[0] = g_tplu_back[0]; nm[1] = g_tplu_back[1]; nm[2] = g_tplu_back[2];
+    if (haveE && haveM) { nm[0] += mb[0] - eb[0]; nm[1] += mb[1] - eb[1]; nm[2] += mb[2] - eb[2]; }
+    g_tplf_nosnap = 1; via = tpl_place(&c, g_tplu_back, nm, 0); g_tplf_nosnap = 0;
+    if (via) { g_tplu_try = 0; chat_say("Нырок: вернулись на прежнее место"); dlog("/tpl: нырок: вернулись наверх"); return; }
+    if (++g_tplu_try < 6) { g_tplu_t0 = now - g_tplu_hold + 150; __atomic_store_n(&g_tplu_on, 1, __ATOMIC_RELEASE); return; }   /* ещё попытки через 150 мс */
+    g_tplu_try = 0;
+    chat_say("Нырок: вернуть наверх не вышло! Вы под полом — срочно: /tpl to X Y Z (координаты до нырка смотрите в konstt.log)");
+    { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: нырок: не вернули; место, где стояли: "); tpl_b_xyz(&x, g_tplu_back); dlog(lg); }
+}
 /* Главный поток, по тику */
 static void tplw_tick(void) {
     TplCtx c; float p[3]; long long now = gh_now_ms(); int st; Buf b; char msg[300];
     g_tplw_pending = 0;
     if (__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) tplf_tick(now);
+    if (__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) tplu_tick(now);
     st = __atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE);
     if (!st) return;
     if (!tpl_ctx_q(&c, 2, 1) || !c.veh) { tplw_end("вы уже не за рулём"); return; }
@@ -922,7 +953,7 @@ static void tpl_cmd_int(int id, int have) {
 }
 
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList; float dist, rawNum; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList, under, num2Set; float dist, rawNum, num2; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
 /* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick).
    gsub (для ghost): 0 — переключить, 1 on, 2 off, 3 back, 4 unhook;  iid/iidSet — номер интерьера;  rawNum — число до подрезки по TPL_MIN (для «/tpl 0 int»).  name — имя точки (слово после save/go/del);
    unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
@@ -941,7 +972,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; 23 under (нырок под пол); -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -962,6 +993,7 @@ static int tpl_word(const char* t) {
     if (seq(t, "gps") || seq(t, "гпс") || seq(t, "метка") || seq(t, "mark") || seq(t, "waypoint") || seq(t, "wp")) return 21;
     if (seq(t, "pick") || seq(t, "pickup") || seq(t, "pickups") || seq(t, "pk") || seq(t, "пикап") || seq(t, "пикапы") ||
         seq(t, "маркер") || seq(t, "маркеры") || seq(t, "marker") || seq(t, "markers") || seq(t, "mk")) return 22;
+    if (seq(t, "under") || seq(t, "dive") || seq(t, "ниже") || seq(t, "нырок")) return 23;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -1012,6 +1044,7 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 20) a->mode = 8;
     else if (w == 21) a->mode = 9;
     else if (w == 22) { if (a->mode == 5) a->pkList = 1; a->mode = 10; }
+    else if (w == 23) a->under = 1;
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -1026,7 +1059,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
         if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
         return;
     }
-    if (tpl_num(tok, &v)) { if (!a->numSet) { a->dist = v; a->numSet = 1; } return; }
+    if (tpl_num(tok, &v)) { if (!a->numSet) { a->dist = v; a->numSet = 1; } else if (!a->num2Set) { a->num2 = v; a->num2Set = 1; } return; }   /* второе число — секунды нырка */
     w = tpl_word(tok);
     if (w >= 0) { tpl_apply_word(w, a); return; }
     for (k = 1; tok[k]; k++) {                                     /* слитно: «вправо4», «f3», «left2.5» */
@@ -1048,7 +1081,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
     a->bad = 1;
 }
 static void tpl_args_init(TplArgs* a) {
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = 0; a->dist = TPL_DEF; a->rawNum = -1.0f;
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = a->under = a->num2Set = 0; a->num2 = 0.0f; a->dist = TPL_DEF; a->rawNum = -1.0f;
     a->c[0] = a->c[1] = a->c[2] = 0.0f; a->name[0] = a->unk[0] = 0;
 }
 /* аргументы: string[] */
@@ -1476,9 +1509,37 @@ static void tpl_pk_line(int i) {
     b_s(&b, "  ("); tpl_b_xyz(&b, e->p); b_ch(&b, ')');
     chat_say(msg);
 }
+/* «/tpl pick N under [сек]» — нырок: встаём на TPL_UNDER_DY НИЖЕ обычной точки пикапа (под полом: сервер всё ещё видит вас в пределах его радиуса,
+   а клиент даёт пикапу сработать, как только капсула коснётся триггера), держим hold и возвращаем туда, где стояли. Только пикапы, только пешком. */
+static void tpl_dive(const TplPk* pk, const char* lb, float holdSec) {
+    TplCtx c; float back[3], tp[3]; char lb2[130]; Buf x, b; char msg[220]; long long hold; int ok;
+    if (pk->kind != 0) { chat_say("Под пол можно только к пикапу, не к маркеру. Обычный телепорт: /tpl pick N"); return; }
+    if (__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) { chat_say("Нырок уже идёт — подождите, пока вернёт на место"); return; }
+    if (!tpl_ctx(&c, 1)) return;                                     /* в машине — отказ, причину пишет сама */
+    if (!c.etr || !tpl_vec(c.etr, "get_position", back)) { chat_say("Нырок: не удалось прочитать вашу позицию — вернуться будет некуда, не ныряю"); return; }
+    hold = holdSec < 0.0f ? TPLU_HOLD_MS : (long long)(holdSec * 1000.0f + 0.5f);
+    if (hold < TPLU_HOLD_MIN) hold = TPLU_HOLD_MIN;
+    if (hold > TPLU_HOLD_MAX) hold = TPLU_HOLD_MAX;
+    tp[0] = pk->p[0]; tp[1] = pk->p[1] - TPL_SYNC_DY - TPL_UNDER_DY; tp[2] = pk->p[2];
+    b_init(&x, lb2, sizeof lb2); b_s(&x, lb); b_s(&x, " (под полом)");
+    g_tplf_nosnap = 1; ok = tpl_goto_ex(tp, 3, lb2, 0); g_tplf_nosnap = 0;
+    if (!ok) return;
+    g_tplu_back[0] = back[0]; g_tplu_back[1] = back[1]; g_tplu_back[2] = back[2];
+    g_tplu_dive[0] = tp[0]; g_tplu_dive[1] = tp[1]; g_tplu_dive[2] = tp[2];
+    g_tplu_t0 = gh_now_ms(); g_tplu_hold = hold; g_tplu_try = 0;
+    if (!g_tplw_thread) {
+        unsigned long t = 0;
+        if (pthread_create(&t, NULL, tplw_worker, NULL) == 0) g_tplw_thread = 1;
+    }
+    __atomic_store_n(&g_tplu_on, 1, __ATOMIC_RELEASE);
+    b_init(&b, msg, sizeof msg); b_s(&b, "Нырок: под пикапом на "); b_fix(&b, TPL_UNDER_DY, 1); b_s(&b, " м, вернёмся через "); b_fix(&b, (double)hold / 1000.0, 1);
+    b_s(&b, " с (пикап с клавишей — нажмите её сейчас; дольше: /tpl pick N under 5)");
+    chat_say(msg);
+    { char lg[200]; Buf y; b_init(&y, lg, sizeof lg); b_s(&y, "/tpl: нырок: стояли "); tpl_b_xyz(&y, back); b_s(&y, ", ныряем в "); tpl_b_xyz(&y, tp); b_s(&y, ", держим мс "); b_int(&y, (int)hold); dlog(lg); }
+}
 /* «/tpl pick» — обновить и показать список ближайших; «/tpl pick list [стр]» — то же (стр > 1 листает прежний снимок, не пересобирая);
    «/tpl pick N» — телепорт к N-му из последнего списка (если списка ещё не было — покажет его). num < 0 — числа не было. */
-static void tpl_cmd_pick(int num, int list) {
+static void tpl_cmd_pick(int num, int list, int under, float holdSec) {
     TplCtx c; int i, from, to, pages, page = 1, rescan = 1; Buf b; char msg[220];
     if (!tpl_ctx(&c, 0)) return;
     if (num >= 0 && !list && g_tpl_npk) {
@@ -1489,6 +1550,7 @@ static void tpl_cmd_pick(int num, int list) {
         }
         b_init(&x, lb, sizeof lb); b_ch(&x, '#'); b_int(&x, num);
         if (g_tpl_pk[num - 1].lab[0]) { b_ch(&x, ' '); b_s(&x, g_tpl_pk[num - 1].lab); }
+        if (under) { tpl_dive(&g_tpl_pk[num - 1], lb, holdSec); return; }
         {   /* Pickup.Transform = координаты сервера как есть (PickupPool.Create ничего не прибавляет), а сервер видит игрока в Transform.y + TPL_SYNC_DY.
                Поэтому, чтобы сервер видел вас ровно в точке пикапа, Transform ставим на TPL_SYNC_DY НИЖЕ пикапа (иначе падаем на метр сверху вниз).
                Машину не трогаем: у неё свой пакет и свой центр. Маркеры (kind 1, 2) — как раньше. */
@@ -1551,7 +1613,7 @@ static void tpl_usage(void) {
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
     chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
-    chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N");
+    chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
 static void native_tpl_cmd(void* self, void* args, void* mi) {
@@ -1598,7 +1660,8 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         return;
     }
     if (a.mode == 9) { tpl_cmd_gps(); return; }
-    if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList); return; }
+    if (a.under && a.mode != 10) { chat_usage("Нырок под пол — только к пикапу: /tpl pick N under [секунды]  (сначала /tpl pick — список с номерами)"); return; }
+    if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList, a.under, a.num2Set ? a.num2 : -1.0f); return; }
     if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
     if (a.mode == 3 || a.mode == 4 || a.mode == 6) {
         if (!a.nameSet) { chat_usage(a.mode == 3 ? "Укажите имя точки: /tpl save дом" : a.mode == 4 ? "Укажите имя точки: /tpl go дом (список: /tpl list)" : "Укажите имя точки: /tpl del дом (список: /tpl list)"); return; }
@@ -1614,7 +1677,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N | gps | pick [N]");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N | gps | pick [N] [under [сек]]");
     return NULL;
 }
 #ifndef KONSTT_TEST
