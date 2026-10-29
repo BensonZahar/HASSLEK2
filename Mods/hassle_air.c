@@ -46,13 +46,12 @@
  *   • В машине режим не работает (при посадке выключается сам). Если игра переставила вас далеко (сервер вернул/телепортировал) — держим новую точку.
  *
  * «Как на ровном» (/air stand) — по дампу IL2CPP и дизассемблированию libil2cpp.so (RVA из dump.cs)
- *   • Левитация в кадре — это способность Fall (клип m_FallDownClip, руки в стороны). Fall.CanStartAbility = «не isOnGround И FindGround(m_MinFallHeight) ничего не нашёл»
- *     (интерфейсные слоты ICharacterMovement 10 — isOnGround, 20 — FindGround(out, maxDistance); дальше читается байт hitGround результата). Пока Fall жив, Moving остановлен.
- *   • Moving.CanStartAbility земли НЕ проверяет — это обычная анимация «стоит/идёт» (LinearMixer, параметр от Character.IsMoving и клавиш). Значит достаточно не пускать Fall.
- *   • Поэтому мод на время полёта ставит у способности Fall поле m_MinFallHeight = 500 (Character.m_Abilities → элемент класса Fall): под персонажем всегда «есть земля»,
- *     Fall не стартует, остаётся Moving. Исходное значение возвращается при выключении. Если Fall всё же успел стартовать (например, вы ниже поверхности земли и под вами пусто),
- *     каждый тик его принудительно останавливаем (Ability.StopAbility(force)).
- *   • Присед (Crouch) и прыжок (Jump) требуют isOnWalkableGround, в воздухе они не стартуют — как и раньше, анимации приседа в полёте нет; вниз вы летите по состоянию кнопки.
+ *   • Левитация в кадре — это способность Fall (клип m_FallDownClip, руки в стороны). Fall.CanStartAbility = «не isOnGround И FindGround(...) ничего не нашёл».
+ *     Пока Fall жива, обычная анимация Moving («стоит/идёт», LinearMixer от джойстика) остановлена; сама Moving земли не проверяет.
+ *   • Поднять Fall.m_MinFallHeight НЕ помогает: CharacterMovement.FindGround при выключенных коллизиях (_detectCollisions, а /air их выключает) сразу возвращает «земли нет»
+ *     (проверено по журналу: Fall стартовал каждый кадр). Поэтому Fall отключается целиком: Character.TryStartAbility выходит, если у способности m_Enabled == false (смещение 0x18).
+ *     На время полёта у Fall ставим Enabled = false (Ability.set_Enabled, запасной путь — поле m_Enabled), а если она уже активна — Ability.StopAbility(force). При выключении Enabled возвращается.
+ *   • Присед (Crouch) и прыжок (Jump) требуют isOnWalkableGround, в воздухе они не стартуют — анимации приседа в полёте нет; вниз вы летите по состоянию кнопки.
  *
  * Спуск по приседу: двойной тап по джойстику включает «<Keyboard>/c» и держит его, пока палец не отпущен (Hud.js: touchStart / touchEnd). Пока кнопка зажата, высота
  * уменьшается на speed·dt каждый кадр, нижней границы нет (земля не держит: constrainToGround и коллизии выключены), так что можно уходить и под поверхность — к NPC, застрявшим в текстурах.
@@ -71,7 +70,6 @@ extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct t
 #define AIR_NEAR 8
 #define AIR_JUMP 6.0f                             /* если игра сама сдвинула вас дальше, чем на столько метров за кадр — считаем это перестановкой и берём новую точку */
 #define AIR_AUTOLAND 5.0f                         /* выше этого над точкой включения при выключении ставим на землю */
-#define AIR_FALLH 500.0f                          /* Fall.m_MinFallHeight на время полёта: «земля под ногами есть всегда» */
 #define AIR_TAP_STEP 0.5f                         /* короткий тап по ПРЫЖКУ/ПРИСЕДУ сразу сдвигает на столько метров (иначе тап длиной в 2-3 кадра почти не виден) */
 
 static volatile int g_air_on;
@@ -95,7 +93,7 @@ static int g_air_jumps;
 static int g_air_watchId = -1; static long long g_air_watchT;
 static int g_air_stand = 1;                       /* 1 — не пускаем Fall (левитацию), держим обычную анимацию */
 static void* g_air_fall;                          /* способность Fall текущего персонажа */
-static float g_air_oFallH; static int g_air_fallSaved;
+static int g_air_fallSaved;
 static float g_air_rawIn[3];                      /* последние сырые значения ввода — для /air status */
 
 /* ───────────── мелкие помощники ───────────── */
@@ -203,16 +201,6 @@ static void air_zero_vel(void* mv) {
 }
 
 
-/* float-поле по имени (в самом объекте). 1 — записали */
-static int air_field_f(void* obj, const char* name, float v, float* old) {
-    void* f = find_field(A.object_get_class(obj), name); float* p;
-    if (!f || (A.field_get_flags(f) & 0x10)) return 0;
-    p = (float*)((char*)obj + A.field_get_offset(f));
-    if (!hm_readable(p, 4)) return 0;
-    if (old) *old = *p;
-    *p = v;
-    return 1;
-}
 /* способность персонажа по имени класса (Character.m_Abilities — List<Ability>) */
 static void* air_find_ability(void* ctrl, const char* cls) {
     void *list, *items; int n, i; long len; char* data;
@@ -273,21 +261,23 @@ static int air_mypos(const AirCtx* c, float* mP, float* eP) {
 }
 
 
-/* ───────────── «как на ровном»: не даём стартовать Fall ───────────── */
+/* ───────────── «как на ровном»: отключаем способность Fall ───────────── */
+static int g_air_oFallEn = 1;
 static void air_stand(const AirCtx* c, int on) {
     if (on) {
-        float old = 0.0f;
         if (!g_air_stand || !c->ctrl) return;
         g_air_fall = air_find_ability(c->ctrl, "Fall");
         if (!g_air_fall) { dlog("air: у персонажа не найдена способность Fall — анимацию «как на ровном» не включить"); return; }
-        if (air_field_f(g_air_fall, "m_MinFallHeight", AIR_FALLH, &old)) {
-            if (!g_air_fallSaved) { g_air_oFallH = old; g_air_fallSaved = 1; }
-            dlog_i("air: Fall.m_MinFallHeight поднят, было (×100) ", (long)(old * 100.0f));
-        } else dlog("air: Fall.m_MinFallHeight не записался");
-        if (air_get_bool(g_air_fall, "get_IsActive", 0)) air_stop_ability(g_air_fall);     /* уже падали — остановить */
+        if (!g_air_fallSaved) { g_air_oFallEn = air_get_bool(g_air_fall, "get_Enabled", 1); g_air_fallSaved = 1; }
+        if (!air_set_bool(g_air_fall, "set_Enabled", 0) && !air_field_bool(g_air_fall, "m_Enabled", 0, NULL)) dlog("air: Fall.Enabled не записался");
+        else dlog("air: способность Fall отключена на время полёта");
+        if (air_get_bool(g_air_fall, "get_IsActive", 0)) { air_stop_ability(g_air_fall); dlog("air: Fall уже была активна — остановлена"); }
     } else {
         void* f = c->ctrl ? air_find_ability(c->ctrl, "Fall") : NULL;
-        if (f && g_air_fallSaved) air_field_f(f, "m_MinFallHeight", g_air_oFallH, NULL);
+        if (f && g_air_fallSaved) {
+            if (!air_set_bool(f, "set_Enabled", g_air_oFallEn)) air_field_bool(f, "m_Enabled", g_air_oFallEn, NULL);
+            dlog("air: способность Fall возвращена");
+        }
         g_air_fall = NULL; g_air_fallSaved = 0;
     }
 }
