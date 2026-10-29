@@ -26,8 +26,11 @@
  *     персонажа туда ICharacterMovement.SetPosition(Vector3, updateGround=false) — это прямая постановка капсулы, как «/tpl alt»,
  *     и обнуляем ICharacterMovement.velocity. Так игра не может ни уронить вас (гравитацию мы просто не используем), ни толкнуть.
  *   • Кнопки: в JS-интерфейсе (Hud.js) джойстик — это экранный стик Unity Input System «<Gamepad>/leftStick» со значением (dx/max, -dy/max): вверх по экрану = +,
- *     прыжок — «<Keyboard>/leftShift», присед — «<Keyboard>/c» (двойной тап по джойстику). В игре они приходят в Character.Keys (Dictionary<PadKeys,bool>):
- *     KEY_JUMP = 5, KEY_CROUCH = 1 — словарь читаем напрямую из его массива записей (без вызова методов обобщённого класса).
+ *     прыжок — «<Keyboard>/leftShift», присед — «<Keyboard>/c» (двойной тап по джойстику, второй тап НЕ отпускать). Их состояние читаем у самих экранных
+ *     контролов: статический словарь OnScreenControls.m_Controls (путь → OnWebViewScreenControl), у каждого поле m_Control — ButtonControl, берём isPressed.
+ *     Раньше читался Character.Keys (Dictionary<PadKeys,bool>, KEY_JUMP = 5, KEY_CROUCH = 1); по дампу похоже, что он зависит от способностей персонажа,
+ *     а Jump/Crouch в воздухе не стартуют (нет земли) — вероятная причина, почему в полёте кнопки «молчали» (код игры в дампе не виден, проверяйте /air status). Character.Keys остался запасным вариантом, если контролов не нашлось.
+ *     Короткий тап по кнопке сразу сдвигает на AIR_TAP_STEP (0.5 м), зажатие — летит со скоростью /air speed.
  *   • Направление: Character.m_MovementInput (Vector2: x — вправо, y — вперёд) и камера Game.MainCamera: «вправо» берётся по горизонтали,
  *     «вперёд» — по камере (3d) либо горизонтально (flat). Если джойстик не читается, /air input переключает на Character.MovementDirection
  *     (мировой вектор; осторожно: если игра не обнуляет его в покое, вас будет сносить — тогда верните /air input ещё раз).
@@ -55,6 +58,7 @@ extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct t
 #define AIR_NEAR 8
 #define AIR_JUMP 6.0f                             /* если игра сама сдвинула вас дальше, чем на столько метров за кадр — считаем это перестановкой и берём новую точку */
 #define AIR_AUTOLAND 5.0f                         /* выше этого над точкой включения при выключении ставим на землю */
+#define AIR_TAP_STEP 0.5f                         /* короткий тап по ПРЫЖКУ/ПРИСЕДУ сразу сдвигает на столько метров (иначе тап длиной в 2-3 кадра почти не виден) */
 
 static volatile int g_air_on;
 static volatile int g_air_pending;
@@ -67,6 +71,8 @@ static int g_air_inSrc;                           /* 0 — Character.m_MovementI
 static int g_air_watch;
 static int g_air_keys = 1;                         /* 1 — прыжок/присед двигают вверх/вниз */
 static int g_air_kj, g_air_kc;                     /* последнее состояние кнопок (для /air status) */
+static int g_air_kSrc = -1;                        /* откуда читаем кнопки: 2 — экранные контролы JS-интерфейса, 1 — Character.Keys, 0 — не читается, -1 — ещё не пробовали */
+static int g_air_pj, g_air_pc;                     /* прошлое состояние кнопок — чтобы поймать момент нажатия */
 static float g_air_hold[3], g_air_last[3], g_air_y0;
 static long long g_air_tPrev;
 static void* g_air_ctrl;                          /* контроллер, к которому уже применены флаги (сменился — персонаж пересоздан, применяем заново) */
@@ -339,6 +345,83 @@ static int air_keys(void* ctrl, int* jump, int* crouch) {
     return 1;
 }
 
+/* ───────────── кнопки, источник №1: экранные контролы JS-интерфейса (OnScreenControls.m_Controls) ─────────────
+ * Hud.js: кнопка ПРЫЖОК зовёт window.onScreenButtonCreate("<Keyboard>/leftShift"), джойстик — то же для "<Keyboard>/c" (присед, двойной тап),
+ * а нажатие/отпускание — onScreenControlTouchStart/End. В игре это Hassle.WebView.Controls.OnScreenControls со статическим словарём
+ * m_Controls (путь → OnWebViewScreenControl). Каждый такой объект пишет нажатие в свой InputControl (OnScreenControl.m_Control, у клавиши это
+ * ButtonControl) — читаем у него isPressed. Это настоящее состояние кнопки на экране: оно не зависит от способностей персонажа (Jump и Crouch
+ * в воздухе, скорее всего, не стартуют — «земли» под ногами нет), в отличие от Character.Keys. */
+typedef struct { void *jump, *crouch; int n; } AirBtnCtx;
+static void *g_air_oscFld; static int g_air_oscBad, g_air_oscDumped;
+static u16 air_lc(u16 c) { return (c >= 'A' && c <= 'Z') ? (u16)(c + 32) : c; }
+static int air_str_is(void* s, const char* a) {                    /* строка .NET == ASCII-строке a, без учёта регистра */
+    int n, i; const u16* ch;
+    if (!s || !hm_obj_ok(s)) return 0;
+    n = A.string_length(s); ch = A.string_chars(s);
+    if (n <= 0 || n > 64 || !ch || !hm_readable(ch, (unsigned)n * 2u)) return 0;
+    for (i = 0; i < n; i++) if (!a[i] || air_lc(ch[i]) != air_lc((u16)(unsigned char)a[i])) return 0;
+    return a[n] == 0;
+}
+static void air_btn_cb(void* it, void* ctx) {
+    AirBtnCtx* c = (AirBtnCtx*)ctx; void* p;
+    if (!hm_obj_ok(it)) return;
+    p = ref_field_s(it, "m_ControlPath");
+    if (!p) return;
+    c->n++;
+    if (air_str_is(p, "<Keyboard>/leftShift")) c->jump = it;
+    else if (air_str_is(p, "<Keyboard>/c")) c->crouch = it;
+}
+static void air_btn_dump_cb(void* it, void* ctx) {                  /* один раз пишем в журнал, какие экранные контролы вообще есть */
+    void* p = hm_obj_ok(it) ? ref_field_s(it, "m_ControlPath") : NULL; char tmp[96]; int cnt; const u16* ch;
+    (void)ctx;
+    if (!p || !hm_obj_ok(p)) return;
+    cnt = A.string_length(p); ch = A.string_chars(p);
+    if (cnt <= 0 || cnt > 40 || !ch) return;
+    utf16_to_utf8(ch, cnt, tmp, sizeof tmp);
+    dlog2("air: экранный контрол: ", tmp);
+}
+/* находит в словаре контролы прыжка и приседа. 1 — словарь прочитался */
+static int air_osc_find(AirBtnCtx* out) {
+    void *dict = NULL, *arr; int total;
+    out->jump = out->crouch = NULL; out->n = 0;
+    if (g_air_oscBad || !g_img) return 0;
+    if (!g_air_oscFld) {
+        void* cls = A.class_from_name(g_img, "Hassle.WebView.Controls", "OnScreenControls");
+        g_air_oscFld = cls ? A.class_get_field_from_name(cls, "m_Controls") : NULL;
+        if (!g_air_oscFld) { g_air_oscBad = 1; dlog("air: нет OnScreenControls.m_Controls — кнопки читаю из Character.Keys"); return 0; }
+    }
+    A.field_static_get_value(g_air_oscFld, &dict);
+    if (!dict || !hm_obj_ok(dict)) return 0;
+    arr = ref_field_s(dict, "_entries"); if (!arr) arr = ref_field_s(dict, "entries");
+    if (!arr || !hm_obj_ok(arr)) return 0;
+    total = int_field(dict, "_count", "count", NULL, -1);
+    walk_struct_array(arr, total, "value", air_btn_cb, out);
+    if (!out->jump && !out->crouch && out->n > 0 && !g_air_oscDumped) {
+        g_air_oscDumped = 1;
+        dlog("air: в OnScreenControls нет <Keyboard>/leftShift и <Keyboard>/c; есть:");
+        walk_struct_array(arr, total, "value", air_btn_dump_cb, NULL);
+    }
+    return 1;
+}
+static int air_ctl_pressed(void* oc) {                              /* OnScreenControl.m_Control.isPressed */
+    void* ctl = ref_field_s(oc, "m_Control");
+    if (!ctl) ctl = air_obj(oc, "get_control");
+    if (!ctl || !hm_obj_ok(ctl)) return 0;
+    return air_get_bool(ctl, "get_isPressed", 0);
+}
+/* состояние ПРЫЖКА и ПРИСЕДА. Возврат — источник: 2 экранные контролы (основной), 1 Character.Keys (запасной), 0 — ничего не прочиталось.
+   Если экранные контролы нашлись, Character.Keys НЕ смешиваем: он в воздухе устроен иначе, и «залипший» присед тянул бы вас вниз после отпускания. */
+static int air_buttons(void* ctrl, int* jump, int* crouch) {
+    AirBtnCtx b;
+    *jump = *crouch = 0;
+    if (air_osc_find(&b) && (b.jump || b.crouch)) {
+        if (b.jump) *jump = air_ctl_pressed(b.jump);
+        if (b.crouch) *crouch = air_ctl_pressed(b.crouch);
+        return 2;
+    }
+    return air_keys(ctrl, jump, crouch) ? 1 : 0;
+}
+
 /* ───────────── NPC: ближайшие и поиск по ID (как в /vtune) ───────────── */
 typedef struct { int id; float d, dy; float p[3]; } AirNpc;
 static AirNpc g_air_npc[AIR_NEAR]; static int g_air_nnpc; static float g_air_ref[3];
@@ -443,6 +526,7 @@ static int air_enter(float lift, const float* target /* NULL — поднять�
     g_air_hold[0] = g_air_last[0] = hold[0]; g_air_hold[1] = g_air_last[1] = hold[1]; g_air_hold[2] = g_air_last[2] = hold[2];
     g_air_y0 = mP[1];
     g_air_tPrev = air_now_ns(); g_air_jumps = 0; g_air_watchId = -1; g_air_watchT = 0; g_air_pending = 0;
+    g_air_pj = g_air_pc = 1; g_air_kSrc = -1;                        /* если кнопка уже зажата в момент включения — это не «новое нажатие» */
     if (!g_air_thread) {
         unsigned long t = 0;
         if (pthread_create(&t, NULL, air_worker, NULL) != 0) { air_flags(&c, 0); chat_say("/air: не создался рабочий поток"); dlog("air: pthread_create не вышел"); return 0; }
@@ -494,11 +578,16 @@ static void air_tick(void) {
         dlog("air: вас переставили далеко — держу новую точку");
     }
     if (g_air_keys) {                                                /* прыжок — вверх, присед — вниз (как клавиши высоты в airbrake) */
-        int kj = 0, kc = 0;
-        if (air_keys(c.ctrl, &kj, &kc)) {
+        int kj = 0, kc = 0, src = air_buttons(c.ctrl, &kj, &kc);
+        if (src != g_air_kSrc) {
+            g_air_kSrc = src;
+            dlog(src == 2 ? "air: кнопки ПРЫЖОК/ПРИСЕД читаю из экранных контролов (OnScreenControls)" : src == 1 ? "air: экранные контролы не найдены — кнопки из Character.Keys (в воздухе могут не работать)" : "air: кнопки ПРЫЖОК/ПРИСЕД не читаются ни из контролов, ни из Character.Keys");
+        }
+        if (src) {
             g_air_kj = kj; g_air_kc = kc;
-            if (kj && !kc) g_air_hold[1] += g_air_speed * dt;
-            else if (kc && !kj) g_air_hold[1] -= g_air_speed * dt;
+            if (kj && !kc) { g_air_hold[1] += g_air_speed * dt; if (!g_air_pj) g_air_hold[1] += AIR_TAP_STEP; }
+            else if (kc && !kj) { g_air_hold[1] -= g_air_speed * dt; if (!g_air_pc) g_air_hold[1] -= AIR_TAP_STEP; }
+            g_air_pj = kj; g_air_pc = kc;
         }
     }
     if (air_move_vec(&c, mv3)) {
@@ -558,7 +647,7 @@ static int air_tokens(void* arr, char tok[][32], int maxn) {
     return n;
 }
 static void air_usage(void) {
-    chat_usage("/air — полёт вкл/выкл. Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
+    chat_usage("/air — полёт вкл/выкл. Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику, второй тап держать) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
     chat_usage("/air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
@@ -577,7 +666,9 @@ static void air_status(void) {
     b_fix(&b, g_air_rawIn[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_rawIn[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_rawIn[2], 2);
     b_s(&b, " — подвигайте джойстик: числа должны меняться (/air input — сменить источник)");
     chat_say(m);
-    b_init(&b, m, sizeof m); b_s(&b, "  кнопки вверх/вниз: "); b_s(&b, g_air_keys ? "вкл" : "выкл"); b_s(&b, ", прыжок "); b_s(&b, g_air_kj ? "НАЖАТ" : "нет");
+    b_init(&b, m, sizeof m); b_s(&b, "  кнопки вверх/вниз: "); b_s(&b, g_air_keys ? "вкл" : "выкл");
+    b_s(&b, ", источник: "); b_s(&b, g_air_kSrc == 2 ? "экранные контролы" : g_air_kSrc == 1 ? "Character.Keys (запасной)" : g_air_kSrc == 0 ? "НЕ ЧИТАЕТСЯ" : "не пробовали (включите полёт)");
+    b_s(&b, ", прыжок "); b_s(&b, g_air_kj ? "НАЖАТ" : "нет");
     b_s(&b, ", присед "); b_s(&b, g_air_kc ? "НАЖАТ" : "нет"); b_s(&b, " — зажмите прыжок: должно стать «НАЖАТ»");
     chat_say(m);
 }
