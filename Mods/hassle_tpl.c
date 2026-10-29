@@ -36,7 +36,7 @@
  *                        Синонимы: /tpl метка, /tpl гпс, /tpl mark, /tpl wp
  *   /tpl pick            пикапы и маркеры РЯДОМ с вами (их присылает сервер, и клиент держит только тех, что в зоне стрима) — список по расстоянию, у каждого
  *                        свой номер 1, 2, 3 … (ID пикапа, расстояние, название — если рядом есть 3D-подпись, и координаты). Синонимы: /tpl пикап, /tpl маркеры, /tpl pk
- *                        В строке: ID пикапа, расстояние, 3D-подпись рядом (если есть), [модель N] и координаты.
+ *                        В строке: номер в списке (для «pick N»), ID пикапа, [модель N] («?» — не прочиталась, причина в konstt.log), расстояние, 3D-подпись рядом и координаты.
  *   /tpl pick N          телепорт к номеру N из ПОСЛЕДНЕГО списка (номера остаются, пока не вызовете «/tpl pick» заново — можно ходить по ним подряд).
  *                        Встаёте ровно в точку пикапа, поэтому он срабатывает как при касании (раздевалка, вход и т.п.).
  *   /tpl pick list [стр] список по 10 на странице; «list 2» листает прежний снимок, не пересобирая
@@ -1151,6 +1151,7 @@ static void tpl_cmd_list(int page) {
 #define TPL_LBNEAR 4.0f                                  /* м: подпись не дальше этого от пикапа считается его названием */
 typedef struct { int id, kind, mid; float p[3], d; char lab[56], mdl[32]; } TplPk;   /* kind: 0 — пикап, 1 — маркер (чекпоинт), 2 — гоночный маркер */
 typedef struct { float p[3]; char t[56]; } TplLb;
+static int g_tpl_why, g_tpl_nch;                                  /* почему модель не прочиталась: 1 нет Transform, 2 нет детей, 3 нет GetChild, 4 имя не прочиталось */
 static int g_tpl_log_models = 1;                                  /* писать в konstt.log имя модели каждого пикапа (чтобы сверить формат имён на устройстве) */
 static TplPk g_tpl_pk[TPL_PKMAX]; static int g_tpl_npk;       /* снимок списка: номера в «/tpl pick N» — это индексы отсюда (с единицы) */
 static TplLb g_tpl_lb[TPL_LBMAX]; static int g_tpl_nlb;
@@ -1270,14 +1271,15 @@ static void tpl_lb_cb(void* it, void* ctx) {
 /* имя модели пикапа (дочерний объект) → raw; номер модели из первой цифровой группы в имени (3…5 цифр), иначе 0 */
 static int tpl_pk_model(void* pk, char* raw, int cap) {
     void *tr, *m, *exc = NULL, *r, *ch, *nm; int n = 0, i, mid = 0, k, len; const u16* chs; char tmp[96];
-    raw[0] = 0;
+    raw[0] = 0; g_tpl_why = 0; g_tpl_nch = 0;
     tr = tpl_obj(pk, "get_transform");
-    if (!tr) return 0;
+    if (!tr) { g_tpl_why = 1; return 0; }
     m = find_method(A.object_get_class(tr), "get_childCount", 0);
     if (m) { r = A.runtime_invoke(m, tr, NULL, &exc); if (!exc && r && hm_readable((char*)r + HDR, 4)) n = *(int*)((char*)r + HDR); }
-    if (n < 1 || n > 8) return 0;
+    g_tpl_nch = n;
+    if (n < 1 || n > 8) { g_tpl_why = 2; return 0; }
     m = find_method(A.object_get_class(tr), "GetChild", 1);
-    if (!m) return 0;
+    if (!m) { g_tpl_why = 3; return 0; }
     for (i = 0; i < n && !raw[0]; i++) {
         void* args[1]; int idx = i; void* gm;
         args[0] = &idx; exc = NULL;
@@ -1297,6 +1299,7 @@ static int tpl_pk_model(void* pk, char* raw, int cap) {
               raw[L] = 0;
           } }
     }
+    if (!raw[0]) g_tpl_why = 4;
     for (k = 0; raw[k]; k++) {
         if (raw[k] >= '0' && raw[k] <= '9') {
             int j = k, v = 0; while (raw[j] >= '0' && raw[j] <= '9' && j - k < 6) { v = v * 10 + (raw[j] - '0'); j++; }
@@ -1327,8 +1330,8 @@ static void tpl_pk_cb(void* it, void* ctx) {
     tr = tpl_obj(it, "get_transform");
     if (!tr || !tpl_vec(tr, "get_position", p)) return;
     { char raw[40]; int mid = tpl_pk_model(it, raw, sizeof raw); int pid = (int)num_field(it, "m_ID", NULL);
-      if (g_tpl_log_models) { Buf x; char lg[120]; b_init(&x, lg, sizeof lg); b_s(&x, "tpl: pick: пикап ID "); b_int(&x, pid); b_s(&x, ", модель «"); b_s(&x, raw); b_s(&x, "», номер "); b_int(&x, mid); dlog(lg); }
-      tpl_pk_add(pid, 0, p, raw, mid); }
+      if (g_tpl_log_models) { Buf x; char lg[140]; b_init(&x, lg, sizeof lg); b_s(&x, "tpl: pick: ID "); b_int(&x, pid); b_s(&x, ", детей "); b_int(&x, g_tpl_nch); b_s(&x, ", имя модели «"); b_s(&x, raw); b_s(&x, "», номер "); b_int(&x, mid); b_s(&x, ", причина "); b_int(&x, g_tpl_why); dlog(lg); }
+      tpl_pk_add(pid, 0, p, raw[0] ? raw : (g_tpl_why ? "?" : ""), mid); }
 }
 /* Собрать снимок: пикапы (Pools.Pickups) + текущий маркер сервера. 1 — пул пикапов прочитался */
 static int tpl_pk_scan(void) {
@@ -1352,10 +1355,12 @@ static void tpl_pk_line(int i) {
     Buf b; char msg[260]; const TplPk* e = &g_tpl_pk[i];
     b_init(&b, msg, sizeof msg);
     b_int(&b, i + 1); b_s(&b, ". ");
-    if (e->kind == 0) { b_s(&b, "пикап ID "); b_int(&b, e->id); } else b_s(&b, e->kind == 2 ? "гоночный маркер" : "маркер");
+    if (e->kind == 0) {
+        b_s(&b, "ID "); b_int(&b, e->id);
+        b_s(&b, "  [модель "); if (e->mid) b_int(&b, e->mid); else b_s(&b, e->mdl[0] ? e->mdl : "?"); b_ch(&b, ']');
+    } else b_s(&b, e->kind == 2 ? "гоночный маркер" : "маркер");
     b_s(&b, " — "); b_fix(&b, e->d, 0); b_s(&b, " м");
     if (e->lab[0]) { b_s(&b, "  «"); b_s(&b, e->lab); b_s(&b, "»"); }
-    if (e->kind == 0 && (e->mid || e->mdl[0])) { b_s(&b, "  [модель "); if (e->mid) b_int(&b, e->mid); else b_s(&b, e->mdl); b_ch(&b, ']'); }
     b_s(&b, "  ("); tpl_b_xyz(&b, e->p); b_ch(&b, ')');
     chat_say(msg);
 }
