@@ -491,6 +491,7 @@ static void* tplw_worker(void* arg) {
 #define TPLF_MIN_MS 700LL                                /* не возвращаем раньше: даём падению начаться */
 #define TPLF_BLIND_MS 2500LL                             /* земля не читается — возвращаем по времени */
 #define TPLF_MAX_MS 8000LL                               /* предел: дольше Fall выключенной не держим */
+static int g_tplf_nosnap, g_tplf_snapOk;                          /* nosnap — этот телепорт на пикап: на землю не подтягивать */
 static long long g_tplf_t0; static int g_tplf_snaps;                /* сколько раз за это окно подтягивали к земле */
 #define TPLF_SNAP_MS 2000LL                              /* подтягиваем к земле только первые 2 с после телепорта */
 #define TPLF_SNAP_MAX 40
@@ -560,7 +561,7 @@ static void tplf_guard(const TplCtx* c) {
         if (!tplf_setb(fall, "set_Enabled", 0) && !tplf_fieldb(fall, "m_Enabled", 0)) { dlog("/tpl: Fall.Enabled не записался"); return; }
     }
     if (tplf_getb(fall, "get_IsActive", 0)) tplf_stop(fall);
-    g_tplf_t0 = gh_now_ms(); g_tplf_snaps = 0;
+    g_tplf_t0 = gh_now_ms(); g_tplf_snaps = 0; g_tplf_snapOk = !g_tplf_nosnap;
     if (!g_tplw_thread) {
         unsigned long t = 0;
         if (pthread_create(&t, NULL, tplw_worker, NULL) != 0) {
@@ -578,7 +579,7 @@ static void tplf_tick(long long now) {
     if (!__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) return;
     if (!tpl_ctx_q(&c, 0, 1)) { if (dt >= TPLF_MAX_MS) { __atomic_store_n(&g_tplf_on, 0, __ATOMIC_RELEASE); dlog("/tpl: персонажа нет — Fall вернуть не удалось"); } return; }
     gr = c.mv ? tplf_getb(c.mv, "get_isOnGround", -1) : -1;
-    if (gr == 0 && c.mv && c.mtr && dt < TPLF_SNAP_MS && g_tplf_snaps < TPLF_SNAP_MAX) {   /* всё ещё в воздухе: движение само ставит на пол (SetPosition с updateGround = FindGround + AdjustGroundHeight) */
+    if (g_tplf_snapOk && gr == 0 && c.mv && c.mtr && dt < TPLF_SNAP_MS && g_tplf_snaps < TPLF_SNAP_MAX) {   /* всё ещё в воздухе: движение само ставит на пол (SetPosition с updateGround = FindGround + AdjustGroundHeight) */
         float mp[3];
         if (tpl_vec(c.mtr, "get_position", mp) && tpl_call_set(c.mv, mp, 1, "движению (на землю)")) g_tplf_snaps++;
     }
@@ -1487,7 +1488,7 @@ static void tpl_cmd_pick(int num, int list) {
         }
         b_init(&x, lb, sizeof lb); b_ch(&x, '#'); b_int(&x, num);
         if (g_tpl_pk[num - 1].lab[0]) { b_ch(&x, ' '); b_s(&x, g_tpl_pk[num - 1].lab); }
-        tpl_goto_ex(g_tpl_pk[num - 1].p, 3, lb, 1);                       /* высота — по земле под пикапом: на высоту самого пикапа (он висит над полом) встали бы и упали вниз */
+        g_tplf_nosnap = 1; tpl_goto_ex(g_tpl_pk[num - 1].p, 3, lb, 0); g_tplf_nosnap = 0;   /* как было: ровно на высоту пикапа, без подтягивания к земле */
         return;
     }
     if (list && num > 1 && g_tpl_npk) { page = num; rescan = 0; }
