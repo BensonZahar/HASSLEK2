@@ -11,6 +11,7 @@
  *   /vtune save               запомнить отличия текущей машины от оригинала как ПРОФИЛЬ её МОДЕЛИ (по ID модели, не по экземпляру)
  *   /vtune model 123 speed x1.8   задать профиль модели 123 вручную (машина не нужна); /vtune model 123 del — удалить профиль
  *   /vtune from 522           взять хендлинг модели 522 (Handlings.CommonData[VehicleDefinition.Handling]) и поставить на вашу машину; from 522 all — вся структура; reset вернёт своё
+ *   /vtune find npc           ближайшие NPC с их ID;  /vtune find car|npc 123 — где он;  /vtune go car|npc 123 — телепорт к нему по ID ЭКЗЕМПЛЯРА (Pools.Actors / Pools.Vehicles)
  *   /vtune list               все профили;   /vtune auto on|off — автоматически применять профиль, когда вы садитесь за руль этой модели
  *
  * Какие ID бывают (из дампа IL2CPP):
@@ -459,6 +460,7 @@ static void car_help(void) {
     chat_usage("/vtune cars [N | текст] — список всех моделей машин (ID, имя, хендлинг); потолок скорости: speed xN + power xN + drag x0.3, при упоре — gear x0.6");
     chat_usage("/vtune list — профили;  /vtune auto on|off — применять профиль автоматически, когда садитесь за руль этой модели");
     chat_usage("/vtune from ID [all] — взять хендлинг МОДЕЛИ ID (из /vtune cars) и поставить на вашу машину (all — вся структура);  /vtune reset вернёт свой");
+    chat_usage("/vtune find npc — ближайшие NPC и их ID;  /vtune find car|npc ID — где он (координаты, расстояние);  /vtune go car|npc ID — телепорт к нему (ID экземпляра; тот же способ, что /tpl)");
 }
 static void car_list(void) {
     int i, k; char line[200]; Buf b;
@@ -631,6 +633,165 @@ static void car_cmd_from(void* veh, int model, int all) {
     dlog2("car: from: набор ", hn);
 }
 
+/* ───────────── /vtune find|go car|npc ID — найти по ID ЭКЗЕМПЛЯРА и телепортироваться ───────────── */
+/* ID экземпляра — это ключ в пулах игры: Pools.Vehicles (BaseVehicle.ID, ushort) и Pools.Actors (NPC: Actor.m_ID, ushort). Ищем игровым же методом
+   пула Get(int id) (его зовут RPC сервера), позицию берём из Entity.Transform, телепорт — тот же Entity.SetPosition(Vector3, findHeight), что у /tpl
+   (игра сама переставляет игрока/машину по приказу сервера). Клиент знает только тех, кого сервер ему «стримит» (рядом с вами): далёкого NPC в пуле
+   может не быть — тогда «не найден». Зависит только от ядра (код телепорта скопирован из /tpl, чтобы car не требовал hassle_tpl.c). */
+static int car_tp_finite(const float* v) {
+    return v[0] == v[0] && v[1] == v[1] && v[2] == v[2] && v[0] < 1e7f && v[0] > -1e7f && v[1] < 1e7f && v[1] > -1e7f && v[2] < 1e7f && v[2] > -1e7f;
+}
+static void* car_tp_obj(void* obj, const char* name) {            /* метод без аргументов → ссылочный объект */
+    void *m, *exc = NULL, *r;
+    if (!obj || !hm_obj_ok(obj)) return NULL;
+    m = find_method(A.object_get_class(obj), name, 0);
+    if (!m) return NULL;
+    r = A.runtime_invoke(m, obj, NULL, &exc);
+    return (exc || !r || !hm_obj_ok(r)) ? NULL : r;
+}
+static int car_tp_vec(void* obj, const char* name, float* out) {  /* метод без аргументов → Vector3 (в боксе после заголовка) */
+    void *m, *exc = NULL, *r; const float* f;
+    if (!obj || !hm_obj_ok(obj)) return 0;
+    m = find_method(A.object_get_class(obj), name, 0);
+    if (!m) return 0;
+    r = A.runtime_invoke(m, obj, NULL, &exc);
+    if (exc || !r || !hm_readable((char*)r + HDR, 12)) return 0;
+    f = (const float*)((char*)r + HDR);
+    if (!car_tp_finite(f)) return 0;
+    out[0] = f[0]; out[1] = f[1]; out[2] = f[2];
+    return 1;
+}
+static int car_ent_pos(void* ent, float* out) {                    /* Entity.Transform.position */
+    void* tr = car_tp_obj(ent, "get_Transform");
+    if (!tr) tr = car_tp_obj(ent, "get_transform");
+    return tr && car_tp_vec(tr, "get_position", out);
+}
+static int car_tp_call_set(void* obj, const float* pos, u8 flag) { /* SetPosition(Vector3, bool) */
+    void *m, *exc = NULL, *args[2]; float v[3]; char et[240];
+    v[0] = pos[0]; v[1] = pos[1]; v[2] = pos[2];
+    m = find_method(A.object_get_class(obj), "SetPosition", 2);
+    if (!m) { dlog("car: go: SetPosition не найден"); return 0; }
+    args[0] = v; args[1] = &flag;
+    A.runtime_invoke(m, obj, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("car: go: SetPosition бросил исключение: ", et); return 0; }
+    return 1;
+}
+static void car_tp_stop_vehicle(void* veh) {                       /* обнулить скорость машины после переноса */
+    void *rb, *m, *exc = NULL, *args[1]; float z[3];
+    z[0] = z[1] = z[2] = 0.0f;
+    rb = ref_field_s(veh, "m_Rigidbody");
+    if (!rb || !hm_obj_ok(rb)) return;
+    args[0] = z;
+    m = find_method(A.object_get_class(rb), "set_velocity", 1);
+    if (m) A.runtime_invoke(m, rb, args, &exc);
+    exc = NULL;
+    m = find_method(A.object_get_class(rb), "set_angularVelocity", 1);
+    if (m) A.runtime_invoke(m, rb, args, &exc);
+}
+static void* car_pool(const char* field) {                         /* Pools.<field> (Vehicles | Actors) */
+    void *cls, *f, *pool = NULL;
+    if (!g_safe || !il2cpp_light() || !g_img) return NULL;
+    ensure_attached();
+    cls = A.class_from_name(g_img, "Hassle.Global.Pooling", "Pools");
+    f = cls ? A.class_get_field_from_name(cls, field) : NULL;
+    if (!f) return NULL;
+    A.field_static_get_value(f, &pool);
+    return (pool && hm_obj_ok(pool)) ? pool : NULL;
+}
+static void* car_ent_by_id(int kind, int id) {                     /* kind 0 — машина, 1 — NPC; NULL — нет такого (или не стримится) */
+    void *pool = car_pool(kind ? "Actors" : "Vehicles"), *m, *exc = NULL, *args[1], *r; int a = id; char et[200];
+    if (!pool) { dlog("car: find: пул Pools.Vehicles/Actors не найден"); return NULL; }
+    m = find_method(A.object_get_class(pool), "Get", 1);
+    if (!m) { dlog("car: find: у пула нет Get(int)"); return NULL; }
+    args[0] = &a;
+    r = A.runtime_invoke(m, pool, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("car: find: Get бросил исключение (ID нет в пуле?): ", et); return NULL; }
+    return (r && hm_obj_ok(r)) ? r : NULL;
+}
+static void car_b_xyz(Buf* b, const float* p) { b_fix(b, p[0], 1); b_ch(b, ' '); b_fix(b, p[1], 1); b_ch(b, ' '); b_fix(b, p[2], 1); }
+static int car_kind(const char* t) {                               /* 0 машина, 1 NPC, -1 не понял */
+    if (seq(t, "car") || seq(t, "veh") || seq(t, "vehicle") || seq(t, "auto") || seq(t, "авто") || seq(t, "машина") || seq(t, "тачка")) return 0;
+    if (seq(t, "npc") || seq(t, "actor") || seq(t, "ped") || seq(t, "нпс") || seq(t, "нпц") || seq(t, "бот")) return 1;
+    return -1;
+}
+/* где вы и что двигаем: вас или вашу машину (за рулём). 0 — нельзя (причина в чате) */
+static int car_my_target(void** me, void** tgt, void** vehOut, float* pos) {
+    void *m, *veh;
+    if (!g_safe || !il2cpp_light()) { chat_say("vtune: игра ещё грузится"); return 0; }
+    ensure_attached();
+    m = local_player();
+    if (!m || !hm_obj_ok(m)) { chat_say("vtune: вы не в игре (персонаж не создан)"); return 0; }
+    veh = ref_field_s(m, "Vehicle"); if (veh && !hm_obj_ok(veh)) veh = NULL;
+    if (veh) { void* drv = ref_field_s(veh, "m_Driver"); if (drv && drv != m) { chat_say("vtune: вы пассажир — машину двигает водитель"); return 0; } }
+    *me = m; *vehOut = veh; *tgt = veh ? veh : m;
+    if (pos && !car_ent_pos(*tgt, pos)) { chat_say("vtune: не прочиталась ваша позиция"); return 0; }
+    return 1;
+}
+static float car_dist(const float* a, const float* b) { double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2]; return (float)__builtin_sqrt(dx * dx + dy * dy + dz * dz); }
+/* /vtune find car|npc ID — показать, где он; go — перенести вас к нему */
+static void car_cmd_find(int kind, int id, int go) {
+    void *ent, *me = NULL, *tgt = NULL, *veh = NULL; float tp[3], mp[3], np[3]; int haveMe; char m[240]; Buf b; const char* what = kind ? "NPC " : "Машина ";
+    ent = car_ent_by_id(kind, id);
+    if (!ent) {
+        b_init(&b, m, sizeof m); b_s(&b, "vtune: "); b_s(&b, kind ? "NPC " : "машина "); b_int(&b, id);
+        b_s(&b, " не найден(а) среди созданных у вас в игре — сервер «стримит» только тех, кто рядом (подойдите ближе или проверьте ID)");
+        chat_say(m); return;
+    }
+    if (!car_ent_pos(ent, tp)) { chat_say("vtune: нашёл, но позиция не прочиталась — подробности в konstt.log"); return; }
+    haveMe = car_my_target(&me, &tgt, &veh, mp);
+    if (!go) {
+        b_init(&b, m, sizeof m); b_s(&b, what); b_int(&b, id); b_s(&b, ": "); car_b_xyz(&b, tp);
+        if (haveMe) { b_s(&b, ", в "); b_fix(&b, car_dist(tp, mp), 1); b_s(&b, " м от вас"); }
+        if (kind) { int ok = 0; double h = num_field(ent, "m_Health", &ok); if (ok) { b_s(&b, ", здоровье "); b_fix(&b, h, 0); } }
+        else { int mid = car_model_id(ent); if (mid >= 0) { b_s(&b, ", модель "); b_int(&b, mid); } }
+        chat_say(m);
+        b_init(&b, m, sizeof m); b_s(&b, "/tpl to "); car_b_xyz(&b, tp); chat_usage(m);
+        return;
+    }
+    if (!haveMe) return;
+    if (tgt == ent) { chat_say("vtune: это и есть ваша машина"); return; }
+    np[0] = tp[0] + (veh ? 4.0f : 0.0f); np[1] = tp[1] + (veh ? 1.0f : 1.5f); np[2] = tp[2];     /* пешком — на 1.5 м над ним; в машине — рядом (+4 м), чтобы не сесть внутрь */
+    if (!car_tp_call_set(tgt, np, 0)) { chat_say("vtune: телепорт не вышел — подробности в konstt.log (можно попробовать /tpl to ...)"); return; }
+    if (veh) car_tp_stop_vehicle(veh);
+    b_init(&b, m, sizeof m); b_s(&b, "vtune: перенёс к "); b_s(&b, kind ? "NPC " : "машине "); b_int(&b, id); b_s(&b, ": "); car_b_xyz(&b, np);
+    b_s(&b, ", это в "); b_fix(&b, car_dist(np, mp), 1); b_s(&b, " м от вас");
+    if (veh) b_s(&b, " (вместе с машиной; на большом расстоянии она двинется, когда подгрузится карта)");
+    chat_say(m);
+    dlog2("car: go: ", m);
+}
+/* /vtune find npc — 8 ближайших NPC (чтобы узнать ID завис­шего) */
+typedef struct { int id; float d; float p[3]; } CarNear;
+static CarNear g_car_near[8]; static int g_car_nnear; static float g_car_myp[3];
+static void car_near_cb(void* it, void* ctx) {
+    float p[3], d; int i, j, id;
+    (void)ctx;
+    if (!hm_obj_ok(it) || !car_ent_pos(it, p)) return;
+    id = (int)num_field(it, "m_ID", NULL);
+    d = car_dist(p, g_car_myp);
+    for (i = 0; i < g_car_nnear && g_car_near[i].d <= d; i++) {}
+    if (i >= 8) return;
+    for (j = (g_car_nnear < 8 ? g_car_nnear : 7); j > i; j--) g_car_near[j] = g_car_near[j - 1];
+    g_car_near[i].id = id; g_car_near[i].d = d; g_car_near[i].p[0] = p[0]; g_car_near[i].p[1] = p[1]; g_car_near[i].p[2] = p[2];
+    if (g_car_nnear < 8) g_car_nnear++;
+}
+static void car_cmd_near_npc(void) {
+    void *me = NULL, *tgt = NULL, *veh = NULL, *pool, *dict, *arr; int i, total; char m[200]; Buf b;
+    if (!car_my_target(&me, &tgt, &veh, g_car_myp)) return;
+    pool = car_pool("Actors");
+    dict = pool ? ref_field_s(pool, "m_Items") : NULL;
+    arr = dict ? ref_field_s(dict, "_entries") : NULL;
+    if (!arr) { chat_say("vtune: пул NPC не прочитался — подробности в konstt.log"); dlog("car: near: нет Pools.Actors.m_Items._entries"); return; }
+    total = int_field(dict, "_count", "count", NULL, -1);
+    g_car_nnear = 0;
+    walk_struct_array(arr, total, "value", car_near_cb, NULL);
+    b_init(&b, m, sizeof m); b_s(&b, "NPC у вас в игре: "); b_int(&b, total); b_s(&b, g_car_nnear ? ", ближайшие:" : " — рядом никого");
+    chat_say(m);
+    for (i = 0; i < g_car_nnear; i++) {
+        b_init(&b, m, sizeof m); b_s(&b, "  NPC "); b_int(&b, g_car_near[i].id); b_s(&b, "  "); b_fix(&b, g_car_near[i].d, 1); b_s(&b, " м  ("); car_b_xyz(&b, g_car_near[i].p); b_s(&b, ")");
+        chat_say(m);
+    }
+}
+
 static void native_car_cmd(void* self, void* args, void* mi) {
     char tok[8][32]; int nt, drv = 0, r, i; void* veh; float v; int mul;
     (void)self; (void)mi;
@@ -660,6 +821,14 @@ static void native_car_cmd(void* self, void* args, void* mi) {
         if (!r) { chat_usage("Неизвестный параметр. Доступно: speed reverse force accel power inertia grip traction brake steer drag"); return; }
         car_prof_save(); g_car_dirty = 1;
         chat_say(g_car_auto ? "car: профиль модели сохранён (применится при посадке; авто — вкл)" : "car: профиль модели сохранён (включите /vtune auto on, чтобы применялся сам)");
+        return;
+    }
+    if (nt >= 2 && (seq(tok[0], "find") || seq(tok[0], "go") || seq(tok[0], "найти") || seq(tok[0], "к"))) {   /* /vtune find|go car|npc ID — по ID экземпляра; работает и пешком */
+        int kind = car_kind(tok[1]), go = !seq(tok[0], "find") && !seq(tok[0], "найти"); float fid;
+        if (kind < 0) { chat_usage("Формат: /vtune find car|npc ID  — где он;  /vtune go car|npc ID — телепорт к нему;  /vtune find npc — ближайшие NPC с их ID"); return; }
+        if (nt == 2) { if (kind == 1 && !go) { car_cmd_near_npc(); return; } chat_usage("Нужен ID экземпляра: /vtune go npc 123 (список ближайших NPC — /vtune find npc; ID своей машины покажет /vtune)"); return; }
+        if (!car_num(tok[2], &fid)) { chat_usage("ID — число: /vtune go npc 123"); return; }
+        car_cmd_find(kind, (int)(fid + 0.5f), go);
         return;
     }
     veh = car_my_vehicle(&drv);
