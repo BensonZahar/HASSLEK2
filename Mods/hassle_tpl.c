@@ -491,7 +491,9 @@ static void* tplw_worker(void* arg) {
 #define TPLF_MIN_MS 700LL                                /* не возвращаем раньше: даём падению начаться */
 #define TPLF_BLIND_MS 2500LL                             /* земля не читается — возвращаем по времени */
 #define TPLF_MAX_MS 8000LL                               /* предел: дольше Fall выключенной не держим */
-static long long g_tplf_t0;
+static long long g_tplf_t0; static int g_tplf_snaps;                /* сколько раз за это окно подтягивали к земле */
+#define TPLF_SNAP_MS 2000LL                              /* подтягиваем к земле только первые 2 с после телепорта */
+#define TPLF_SNAP_MAX 40
 static int tplf_getb(void* obj, const char* getter, int dflt) {
     void *m, *exc = NULL, *r;
     if (!obj) return dflt;
@@ -558,7 +560,7 @@ static void tplf_guard(const TplCtx* c) {
         if (!tplf_setb(fall, "set_Enabled", 0) && !tplf_fieldb(fall, "m_Enabled", 0)) { dlog("/tpl: Fall.Enabled не записался"); return; }
     }
     if (tplf_getb(fall, "get_IsActive", 0)) tplf_stop(fall);
-    g_tplf_t0 = gh_now_ms();
+    g_tplf_t0 = gh_now_ms(); g_tplf_snaps = 0;
     if (!g_tplw_thread) {
         unsigned long t = 0;
         if (pthread_create(&t, NULL, tplw_worker, NULL) != 0) {
@@ -573,15 +575,20 @@ static void tplf_guard(const TplCtx* c) {
 /* Главный поток, по тику: пора ли вернуть Fall */
 static void tplf_tick(long long now) {
     TplCtx c; long long dt = now - g_tplf_t0; int gr, back = 0; void* fall;
-    if (!__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE) || dt < TPLF_MIN_MS) return;
+    if (!__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) return;
     if (!tpl_ctx_q(&c, 0, 1)) { if (dt >= TPLF_MAX_MS) { __atomic_store_n(&g_tplf_on, 0, __ATOMIC_RELEASE); dlog("/tpl: персонажа нет — Fall вернуть не удалось"); } return; }
     gr = c.mv ? tplf_getb(c.mv, "get_isOnGround", -1) : -1;
+    if (gr == 0 && c.mv && c.mtr && dt < TPLF_SNAP_MS && g_tplf_snaps < TPLF_SNAP_MAX) {   /* всё ещё в воздухе: движение само ставит на пол (SetPosition с updateGround = FindGround + AdjustGroundHeight) */
+        float mp[3];
+        if (tpl_vec(c.mtr, "get_position", mp) && tpl_call_set(c.mv, mp, 1, "движению (на землю)")) g_tplf_snaps++;
+    }
+    if (dt < TPLF_MIN_MS) return;
     if (gr == 1 || dt >= TPLF_MAX_MS || (gr < 0 && dt >= TPLF_BLIND_MS)) back = 1;
     if (!back) return;
     fall = tplf_fall(c.me);
     if (fall && !tplf_setb(fall, "set_Enabled", 1) && !tplf_fieldb(fall, "m_Enabled", 1)) dlog("/tpl: Fall.Enabled не вернулся");
     __atomic_store_n(&g_tplf_on, 0, __ATOMIC_RELEASE);
-    { char lg[120]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: Fall возвращена через мс: "); b_int(&x, (int)dt); b_s(&x, gr == 1 ? " (встали на землю)" : gr == 0 ? " (по пределу)" : " (земля не читается)"); dlog(lg); }
+    { char lg[120]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: Fall возвращена через мс: "); b_int(&x, (int)dt); b_s(&x, ", подтягиваний к земле: "); b_int(&x, g_tplf_snaps); b_s(&x, gr == 1 ? " (встали на землю)" : gr == 0 ? " (по пределу)" : " (земля не читается)"); dlog(lg); }
 }
 /* Главный поток, сразу после успешного Entity.SetPosition у машины. from — где была, to — куда ставим. 1 — машина ещё не на точке */
 static int tplw_begin(const TplCtx* c, const float* from, const float* to) {
