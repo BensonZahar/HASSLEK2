@@ -25,7 +25,12 @@
  *                        Без аргумента — переключить. «off» — выключить (сервер получит настоящую позицию: вы «появитесь» на новом месте),
  *                        «back» — вернуться на точку включения и выключить. «/tpl ghost unhook» — вернуть код игры в исходный вид.
  *   /tpl int N           сменить интерьер на номер N (0..255, 0 — улица). Только номер, координаты не нужны и тело не двигается.
- *                        «/tpl int» без номера — показать текущий (он же в строке «/tpl pos»).
+ *                        «/tpl int» без номера — показать текущий (он же в строке «/tpl pos»). ВАЖНО: номер — это ТОЛЬКО метка (освещение
+ *                        «в помещении» + сообщение серверу), а не место: сам интерьер — обычный участок карты со своими координатами.
+ *                        Номер никуда не переносит; чтобы оказаться внутри, нужно оказаться в его координатах. Поэтому «/tpl save» запоминает
+ *                        точку ВМЕСТЕ с номером интерьера, а «/tpl go» переносит и включает тот же интерьер. Если застряла тёмная
+ *                        «комнатная» картинка на улице — «/tpl int 0».
+ *   В машине (вы за рулём) все команды телепорта (/tpl 5 вперёд, /tpl to …, /tpl go …) переносят МАШИНУ вместе с вами.
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
  *
  * Как это работает
@@ -34,7 +39,8 @@
  *   • Точки лежат в файле HLOG/tpl_points.txt (рядом с konstt.log, как route.txt), по строке «имя x y z», и переживают перезапуск игры.
  *     Файл можно править руками. До 64 точек; имя — одно слово до 31 байта (≈15 русских букв), регистр не важен. Сохранение пишет
  *     временный файл и переименовывает его, поэтому вылет посреди записи старый список не портит.
- *     Точка — это те же координаты, что показывает «/tpl pos», а «/tpl go» = «/tpl to» с этими координатами (в машине не работает).
+ *     Точка — это те же координаты, что показывает «/tpl pos», а «/tpl go» = «/tpl to» с этими координатами. Если в строке есть 5-е число —
+ *     это номер интерьера (его пишет «/tpl save»; в старых файлах его нет — тогда интерьер не трогаем): «имя x y z N».
  *   • Имя можно писать до слова-команды: «/tpl дом save». Если имя совпадает со словом-командой или числом («влево», «pos», «5»),
  *     короткая форма «/tpl имя» не сработает — тогда «/tpl go имя» (мод сам предупредит при сохранении).
  *   • Стороны — относительно КАМЕРЫ (как вы видите экран): берём Transform.right у MainCamera, обнуляем высоту, нормализуем.
@@ -45,8 +51,12 @@
  *   • Основной способ — Player.SetPosition(Vector3, findHeight=false): тот же метод, которым игра сама переставляет игрока (по приказу сервера).
  *     Запасной — ICharacterMovement.SetPosition(Vector3, updateGround=true): прямая постановка капсулы. Если основной бросил исключение — пробуем запасной сами.
  *   • Обработчик команды вызывается игрой в ГЛАВНОМ потоке (как у /rec и /nocol), поэтому Post/SynchronizationContext не нужны.
- *   • В машине не работает (телепорт водителя/пассажира сломал бы синхронизацию). Лимита по дальности нет: большие прыжки сервер может откатить,
- *     а на далёкой точке карта может быть не загружена (можно провалиться) — это на ваше усмотрение.
+ *   • В машине (за рулём) двигается сама МАШИНА: у машины тот же Entity.SetPosition(Vector3, findHeight), который игра зовёт по приказу
+ *     сервера SetVehiclePos (RPC читает id, три float, берёт машину из VehiclePool и вызывает SetPosition(...).Forget()); после него
+ *     обнуляем скорость Rigidbody, чтобы машина не улетела дальше. Пассажиру отказ: машину двигает водитель. Координаты в машине —
+ *     это Transform машины. Лимита по дальности нет: большие прыжки сервер может откатить, а на далёкой точке карта может быть
+ *     не загружена (можно провалиться) — это на ваше усмотрение. На сервере есть античит с проверкой телепорта (AC_TELEPORT) —
+ *     и пешком, и на машине дальний прыжок может быть засчитан как телепорт: риск на вас.
  *   • Это не «клиентская» штука, как /nocol: позиция уходит на сервер как обычная, и другие игроки вас видят на новом месте
  *     (если не включён /tpl ghost — тогда позиция на сервер не уходит вовсе).
  *
@@ -178,32 +188,63 @@ static int tpl_call_set(void* obj, const float* pos, u8 flag, const char* what) 
 }
 
 /* ───────────── общая часть: найти игрока и его компоненты (главный поток) ───────────── */
-typedef struct { void *me, *mv, *etr, *mtr; } TplCtx;
-/* needOnFoot=1 — для телепорта: в машине нельзя. Сама пишет в чат, почему не вышло. 1 — можно работать. */
-static int tpl_ctx_q(TplCtx* c, int needOnFoot, int quiet) {          /* quiet=1 — ничего не писать в чат (для списка точек) */
-    c->me = c->mv = c->etr = c->mtr = NULL;
+typedef struct { void *me, *mv, *etr, *mtr, *veh, *tgt; } TplCtx;   /* veh — машина, в которой вы за рулём (иначе NULL); tgt — что двигаем: вас или машину */
+/* mode: 0 — ничего не требуем; 1 — только пешком (в машине отказ); 2 — пешком или за рулём (тогда двигается МАШИНА вместе с вами, пассажиру отказ).
+   Сама пишет в чат, почему не вышло. 1 — можно работать. */
+static int tpl_ctx_q(TplCtx* c, int mode, int quiet) {          /* quiet=1 — ничего не писать в чат (для списка точек) */
+    void* veh;
+    c->me = c->mv = c->etr = c->mtr = c->veh = c->tgt = NULL;
     if (!g_safe || !il2cpp_light()) { if (!quiet) chat_say("Телепорт: игра ещё грузится, подождите"); return 0; }
     ensure_attached();
     c->me = local_player();
     if (!c->me || !hm_obj_ok(c->me)) { if (!quiet) chat_say("Телепорт: вы не в игре (персонаж не создан)"); return 0; }
-    if (needOnFoot && ref_field_s(c->me, "Vehicle")) { if (!quiet) chat_say("Телепорт: в машине не работает — сначала выйдите"); return 0; }
-    c->etr = tpl_obj(c->me, "get_Transform");                    /* Entity.Transform */
-    if (!c->etr) c->etr = tpl_obj(c->me, "get_transform");       /* запасной вариант: Component.transform */
-    c->mv = tpl_movement(c->me);
-    if (c->mv && hm_obj_ok(c->mv)) c->mtr = tpl_obj(c->mv, "get_transform");
-    else c->mv = NULL;
+    c->tgt = c->me;
+    veh = ref_field_s(c->me, "Vehicle");                             /* Player.Vehicle: машина, в которой вы сидите */
+    if (veh && !hm_obj_ok(veh)) veh = NULL;
+    if (veh && mode == 1) { if (!quiet) chat_say("Телепорт: в машине тут не работает — сначала выйдите"); return 0; }
+    if (veh && mode == 2) {
+        void* drv = ref_field_s(veh, "m_Driver");                    /* BaseVehicle.m_Driver; не прочиталось — считаем водителем */
+        if (drv && drv != c->me) { if (!quiet) chat_say("Телепорт: вы пассажир — машину двигает водитель. Выйдите или сядьте за руль"); return 0; }
+        c->veh = veh; c->tgt = veh;
+    }
+    c->etr = tpl_obj(c->tgt, "get_Transform");                        /* Entity.Transform (у игрока или у машины) */
+    if (!c->etr) c->etr = tpl_obj(c->tgt, "get_transform");           /* запасной вариант: Component.transform */
+    if (!c->veh) {                                                    /* компонент движения — только у пешего игрока */
+        c->mv = tpl_movement(c->me);
+        if (c->mv && hm_obj_ok(c->mv)) c->mtr = tpl_obj(c->mv, "get_transform");
+        else c->mv = NULL;
+    }
     return 1;
 }
-static int tpl_ctx(TplCtx* c, int needOnFoot) { return tpl_ctx_q(c, needOnFoot, 0); }
+static int tpl_ctx(TplCtx* c, int mode) { return tpl_ctx_q(c, mode, 0); }
 /* Где я сейчас: 1 — Transform.position (основное), 2 — из пакета синхронизации (запасное), 0 — не прочиталось */
 static int tpl_cur_pos(const TplCtx* c, float* p) {
     if (c->etr && tpl_vec(c->etr, "get_position", p)) return 1;
     if (c->mtr && tpl_vec(c->mtr, "get_position", p)) return 1;
     return read_pos(c->me, p) ? 2 : 0;
 }
-/* Поставить игрока в точку. npE — позиция в системе Entity.Transform (для Player.SetPosition), npM — в системе transform движения
-   (для запасного способа); любой может быть NULL. findH — искать высоту по земле (только основной способ). Возврат: 1 основной, 2 запасной, 0 не вышло. */
+/* Обнулить скорость машины после переноса (чтобы не улетела дальше): Rigidbody.velocity / angularVelocity = 0. Если Rigidbody не нашёлся — молча пропускаем. */
+static void tpl_stop_vehicle(void* veh) {
+    void *rb, *m, *exc = NULL, *args[1]; float z[3];
+    z[0] = z[1] = z[2] = 0.0f;
+    rb = ref_field_s(veh, "m_Rigidbody");                            /* BaseVehicle.m_Rigidbody */
+    if (!rb || !hm_obj_ok(rb)) rb = ref_field_s(veh, "vehicleRigidbody");   /* Vehicle.vehicleRigidbody */
+    if (!rb || !hm_obj_ok(rb)) { dlog("/tpl: Rigidbody машины не найден — скорость не сбрасывал"); return; }
+    args[0] = z;
+    m = find_method(A.object_get_class(rb), "set_velocity", 1);
+    if (m) A.runtime_invoke(m, rb, args, &exc);
+    exc = NULL;
+    m = find_method(A.object_get_class(rb), "set_angularVelocity", 1);
+    if (m) A.runtime_invoke(m, rb, args, &exc);
+}
+/* Поставить игрока (или его машину) в точку. npE — позиция в системе Entity.Transform (для SetPosition игрока/машины), npM — в системе transform
+   движения (для запасного способа, только пешком); любой может быть NULL. findH — искать высоту по земле (только основной способ).
+   Возврат: 1 основной, 2 запасной, 3 — перенесена машина, 0 не вышло. */
 static int tpl_place(const TplCtx* c, const float* npE, const float* npM, u8 findH) {
+    if (c->veh) {                                                    /* за рулём: двигаем машину; запасной способ (/tpl alt) тут не нужен */
+        if (npE && tpl_call_set(c->veh, npE, findH, "машине")) { tpl_stop_vehicle(c->veh); return 3; }
+        return 0;
+    }
     if (!g_tpl_alt && npE) {
         if (tpl_call_set(c->me, npE, findH, "Player")) return 1;
         dlog("/tpl: основной способ не вышел, пробую запасной (через движение)");
@@ -216,7 +257,7 @@ static void tpl_fail(void) { chat_say("Телепорт: не вышло — п�
 /* ───────────── сдвиг в сторону ───────────── */
 static void tpl_go(int side, float dist, int clamped) {
     TplCtx c; float R[3], dir[3], eb[3], mb[3], ne[3], nm[3]; int src = 0, haveE, haveM, via; Buf b; char msg[240];
-    if (!tpl_ctx(&c, 1)) return;
+    if (!tpl_ctx(&c, 2)) return;
     if (!tpl_right_dir(c.etr ? c.etr : c.mtr, R, &src)) { chat_say("Телепорт: не удалось определить стороны (нет камеры и трансформа игрока)"); return; }
     tpl_side_dir(R, side, dir);
     haveE = c.etr && tpl_vec(c.etr, "get_position", eb);          /* Player.SetPosition: позиция — Entity.Transform */
@@ -230,6 +271,7 @@ static void tpl_go(int side, float dist, int clamped) {
     if (clamped) b_s(&b, " (максимум)");
     b_s(&b, src == 1 ? " (по камере)" : " (по повороту персонажа, камера не найдена)");
     if (via == 2) b_s(&b, " [через движение]");
+    if (via == 3) b_s(&b, " (вместе с машиной)");
     chat_say(msg);
     {
         char lg[220]; Buf x; b_init(&x, lg, sizeof lg);
@@ -270,21 +312,21 @@ static void tpl_show(void) {
     }
 }
 /* «/tpl to X Y Z» (nc = 3) или «/tpl to X Z» (nc = 2, высота по земле) */
-static void tpl_goto(const float* v, int nc, const char* label) {
+static int tpl_goto(const float* v, int nc, const char* label) {
     TplCtx c; float eb[3], mb[3], ne[3], nm[3]; int haveE, haveM, via, i; Buf b; char msg[240];
-    for (i = 0; i < nc; i++) if (!(v[i] == v[i]) || v[i] > TPL_MAX || v[i] < -TPL_MAX) { chat_say("Телепорт: координаты вне допустимого диапазона (±100000)"); return; }
-    if (!tpl_ctx(&c, 1)) return;
+    for (i = 0; i < nc; i++) if (!(v[i] == v[i]) || v[i] > TPL_MAX || v[i] < -TPL_MAX) { chat_say("Телепорт: координаты вне допустимого диапазона (±100000)"); return 0; }
+    if (!tpl_ctx(&c, 2)) return 0;
     haveE = c.etr && tpl_vec(c.etr, "get_position", eb);
     haveM = c.mtr && tpl_vec(c.mtr, "get_position", mb);
     if (nc == 3) { ne[0] = v[0]; ne[1] = v[1]; ne[2] = v[2]; }
     else {                                                         /* X Z: высоту берём текущую, а Player.SetPosition ищет землю */
-        if (!haveE && !haveM) { chat_say("Телепорт: не удалось прочитать вашу высоту — укажите все три числа: /tpl to X Y Z"); return; }
+        if (!haveE && !haveM) { chat_say("Телепорт: не удалось прочитать вашу высоту — укажите все три числа: /tpl to X Y Z"); return 0; }
         ne[0] = v[0]; ne[1] = haveE ? eb[1] : mb[1]; ne[2] = v[1];
     }
     nm[0] = ne[0]; nm[1] = ne[1]; nm[2] = ne[2];
     if (haveE && haveM) { nm[0] += mb[0] - eb[0]; nm[1] += mb[1] - eb[1]; nm[2] += mb[2] - eb[2]; }   /* перевод в систему transform движения */
     via = tpl_place(&c, ne, nm, nc == 2 ? 1 : 0);
-    if (!via) { tpl_fail(); return; }
+    if (!via) { tpl_fail(); return 0; }
     b_init(&b, msg, sizeof msg);
     b_s(&b, "Телепорт на ");
     if (label) { b_s(&b, "точку «"); b_s(&b, label); b_s(&b, "»: "); }
@@ -295,8 +337,10 @@ static void tpl_goto(const float* v, int nc, const char* label) {
         b_s(&b, ", это в "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 1); b_s(&b, " м от вас");
     }
     if (via == 2) b_s(&b, " [через движение]");
+    if (via == 3) b_s(&b, " (вместе с машиной)");
     chat_say(msg);
     dlog2("/tpl: ", msg);
+    return 1;
 }
 
 /* ───────────── призрак (/tpl ghost) и интерьер (/tpl int) ───────────── */
@@ -528,8 +572,19 @@ static void tpl_status_extra(void) {
 }
 
 /* «/tpl int N»: сменить интерьер на N (только номер). have=0 — номер не указан, показать текущий */
+/* Вызвать LocalPlayer.SetInterior(byte). 1 — вызвалось без исключения. Он сам сообщает серверу и включает/выключает «комнатное» освещение. */
+static int tpl_do_interior(void* me, int id) {
+    void *m, *exc = NULL, *args[1]; u8 v; char et[240];
+    m = find_method(A.object_get_class(me), "SetInterior", 1);
+    if (!m) { dlog("/tpl int: LocalPlayer.SetInterior не найден"); return 0; }
+    v = (u8)id; args[0] = &v;
+    A.runtime_invoke(m, me, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("/tpl int: SetInterior бросил исключение: ", et); return 0; }
+    return 1;
+}
+/* «/tpl int N»: сменить интерьер на N (только номер). have=0 — номер не указан, показать текущий */
 static void tpl_cmd_int(int id, int have) {
-    TplCtx c; Buf b; char msg[240]; void *m, *exc = NULL, *args[1]; u8 v; char et[240];
+    TplCtx c; Buf b; char msg[300];
     if (!tpl_ctx(&c, 0)) return;
     if (!have) {
         int cur = int_field(c.me, "m_Interior", "m_Interior", NULL, -1);
@@ -540,14 +595,11 @@ static void tpl_cmd_int(int id, int have) {
         return;
     }
     if (id < 0 || id > 255) { chat_say("Интерьер: номер от 0 до 255 (0 — улица)"); return; }
-    m = find_method(A.object_get_class(c.me), "SetInterior", 1);
-    if (!m) { chat_say("Интерьер: метод SetInterior не найден (подробности в konstt.log)"); dlog("/tpl int: LocalPlayer.SetInterior не найден"); return; }
-    v = (u8)id; args[0] = &v;
-    A.runtime_invoke(m, c.me, args, &exc);
-    if (exc) { exc_text(exc, et, sizeof et); dlog2("/tpl int: SetInterior бросил исключение: ", et); chat_say("Интерьер: не вышло — подробности в konstt.log"); return; }
+    if (!tpl_do_interior(c.me, id)) { chat_say("Интерьер: не вышло — подробности в konstt.log"); return; }
     b_init(&b, msg, sizeof msg);
-    b_s(&b, "Интерьер: "); b_int(&b, id); b_s(&b, id == 0 ? " (улица)" : "");
-    b_s(&b, ". Игра сама сообщила об этом серверу. Позиция не менялась");
+    b_s(&b, "Интерьер: "); b_int(&b, id);
+    if (id == 0) b_s(&b, " (улица): дневной свет, серверу сообщено");
+    else b_s(&b, ": включено освещение «в помещении», серверу сообщено. Сам мир не менялся — номер это метка, а не место. Вернуть улицу: /tpl int 0");
     chat_say(msg);
     dlog2("/tpl int: ", msg);
 }
@@ -705,7 +757,7 @@ static void tpl_parse(void* arr, TplArgs* a) {
 }
 
 /* ───────────── сохранённые точки ───────────── */
-typedef struct { char name[TPL_NAME]; float p[3]; } TplPt;
+typedef struct { char name[TPL_NAME]; float p[3]; int in; } TplPt;      /* in — номер интерьера точки (-1 — не известен, интерьер не трогаем) */
 static TplPt g_tpl_pts[TPL_MAXP];
 static int g_tpl_np, g_tpl_loaded;
 
@@ -720,23 +772,25 @@ static int tpl_pts_path(char* out, int cap) {
     b_s(&b, TPL_PTS_FILE);
     return 1;
 }
-/* одна строка файла «имя x y z» → точка; 1 — разобрано (лишнее и мусор пропускаются) */
+/* одна строка файла «имя x y z» или «имя x y z N» (N — номер интерьера) → точка; 1 — разобрано (лишнее и мусор пропускаются) */
 static int tpl_pts_line(const char* line, TplPt* out) {
-    char tok[4][40]; int n = 0, i = 0; float v[3];
-    while (line[i] && n < 5) {
+    char tok[6][40]; int n = 0, i = 0, in = -1; float v[3], fi;
+    while (line[i] && n < 6) {
         int q = 0;
         while (line[i] == ' ' || line[i] == '\t' || line[i] == '\r') i++;
         if (!line[i]) break;
-        if (n == 4) return 0;                                       /* пятое слово — не наша строка */
+        if (n == 5) return 0;                                       /* шестое слово — не наша строка */
         while (line[i] && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') { if (q < 39) tok[n][q++] = line[i]; i++; }
         tok[n][q] = 0; n++;
     }
-    if (n != 4) return 0;
+    if (n != 4 && n != 5) return 0;
     if (!tpl_snum(tok[1], &v[0]) || !tpl_snum(tok[2], &v[1]) || !tpl_snum(tok[3], &v[2])) return 0;
     if (!tpl_finite(v)) return 0;
+    if (n == 5) { if (!tpl_num(tok[4], &fi) || fi < 0.0f || fi > 255.0f) return 0; in = (int)(fi + 0.5f); }
     tpl_copy_name(out->name, tok[0], TPL_NAME);
     tpl_fold(out->name);                                            /* файл правят руками: «Дом» = «дом» */
     out->p[0] = v[0]; out->p[1] = v[1]; out->p[2] = v[2];
+    out->in = in;
     return out->name[0] ? 1 : 0;
 }
 static void tpl_pts_load(void) {
@@ -776,6 +830,7 @@ static int tpl_pts_save(void) {
     for (i = 0; i < g_tpl_np; i++) {
         b_s(&b, g_tpl_pts[i].name); b_ch(&b, ' ');
         b_fix(&b, g_tpl_pts[i].p[0], 3); b_ch(&b, ' '); b_fix(&b, g_tpl_pts[i].p[1], 3); b_ch(&b, ' '); b_fix(&b, g_tpl_pts[i].p[2], 3);
+        if (g_tpl_pts[i].in >= 0) { b_ch(&b, ' '); b_int(&b, g_tpl_pts[i].in); }
         b_ch(&b, '\n');
     }
     b_init(&t, tmp, sizeof tmp); b_s(&t, path); b_s(&t, ".tmp");
@@ -806,9 +861,11 @@ static void tpl_cmd_save(const char* name) {
         tpl_copy_name(g_tpl_pts[i].name, name, TPL_NAME);
     }
     g_tpl_pts[i].p[0] = p[0]; g_tpl_pts[i].p[1] = p[1]; g_tpl_pts[i].p[2] = p[2];
+    g_tpl_pts[i].in = int_field(c.me, "m_Interior", "m_Interior", NULL, -1);      /* интерьер запоминаем вместе с местом */
     saved = tpl_pts_save();
     b_init(&b, msg, sizeof msg);
     b_s(&b, "Точка «"); b_s(&b, g_tpl_pts[i].name); b_s(&b, upd ? "» обновлена: " : "» сохранена: "); tpl_b_xyz(&b, p);
+    if (g_tpl_pts[i].in >= 0) { b_s(&b, ", интерьер "); b_int(&b, g_tpl_pts[i].in); }
     b_s(&b, ". Вернуться: /tpl go "); b_s(&b, g_tpl_pts[i].name);
     if (tpl_name_shadowed(g_tpl_pts[i].name)) b_s(&b, " (коротко «/tpl имя» для этого слова не сработает)");
     if (!saved) b_s(&b, " — В ФАЙЛ ЗАПИСАТЬ НЕ УДАЛОСЬ, точка живёт до перезапуска игры");
@@ -825,7 +882,17 @@ static void tpl_cmd_go(const char* name) {
         b_s(&b, "Точки «"); b_s(&b, name); b_s(&b, "» нет. Список: /tpl list");
         chat_say(msg); return;
     }
-    tpl_goto(g_tpl_pts[i].p, 3, g_tpl_pts[i].name);
+    if (tpl_goto(g_tpl_pts[i].p, 3, g_tpl_pts[i].name) && g_tpl_pts[i].in >= 0) {      /* у точки известен интерьер — включаем его */
+        TplCtx c;
+        if (tpl_ctx_q(&c, 0, 1)) {
+            int cur = int_field(c.me, "m_Interior", "m_Interior", NULL, -1);
+            if (cur != g_tpl_pts[i].in && tpl_do_interior(c.me, g_tpl_pts[i].in)) {
+                char m2[120]; Buf b2; b_init(&b2, m2, sizeof m2);
+                b_s(&b2, "Интерьер точки: "); b_int(&b2, g_tpl_pts[i].in);
+                chat_say(m2);
+            }
+        }
+    }
 }
 static void tpl_cmd_del(const char* name) {
     int i, saved; char msg[160]; Buf b;
@@ -855,6 +922,7 @@ static void tpl_cmd_list(int page) {
     for (i = from; i < to; i++) {
         b_init(&b, msg, sizeof msg);
         b_s(&b, "«"); b_s(&b, g_tpl_pts[i].name); b_s(&b, "»: "); tpl_b_xyz(&b, g_tpl_pts[i].p);
+        if (g_tpl_pts[i].in > 0) { b_s(&b, " [инт "); b_int(&b, g_tpl_pts[i].in); b_ch(&b, ']'); }
         if (haveMe) {
             double dx = g_tpl_pts[i].p[0] - me[0], dy = g_tpl_pts[i].p[1] - me[1], dz = g_tpl_pts[i].p[2] - me[2];
             b_s(&b, " — в "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 0); b_s(&b, " м");
@@ -868,7 +936,7 @@ static void tpl_cmd_list(int page) {
 static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
-    chat_usage("/tpl ghost [on|off|back] — призрак: сервер и NPC не видят, что вы двигаетесь;  /tpl int N — сменить интерьер (только номер, 0 — улица)");
+    chat_usage("/tpl ghost [on|off|back] — призрак: сервер и NPC не видят, что вы двигаетесь;  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
