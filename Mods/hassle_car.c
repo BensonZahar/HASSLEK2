@@ -10,6 +10,7 @@
  *   /vtune reset              вернуть этой машине оригинальные значения
  *   /vtune save               запомнить отличия текущей машины от оригинала как ПРОФИЛЬ её МОДЕЛИ (по ID модели, не по экземпляру)
  *   /vtune model 123 speed x1.8   задать профиль модели 123 вручную (машина не нужна); /vtune model 123 del — удалить профиль
+ *   /vtune from 522           взять хендлинг модели 522 (Handlings.CommonData[VehicleDefinition.Handling]) и поставить на вашу машину; from 522 all — вся структура; reset вернёт своё
  *   /vtune list               все профили;   /vtune auto on|off — автоматически применять профиль, когда вы садитесь за руль этой модели
  *
  * Какие ID бывают (из дампа IL2CPP):
@@ -359,19 +360,23 @@ static void car_mdl_cb(void* it, void* ctx) {
     g_car_nmdl++;
 }
 static int car_mdl_load(void) {
-    void *cls, *f, *dict = NULL, *arr; int i, j;
+    void *cls, *f, *dict = NULL, *arr; int i, j, cnt;
     g_car_nmdl = 0;
-    if (!g_safe || !il2cpp_light() || !g_img) return 0;
+    if (!g_safe || !il2cpp_light() || !g_img) { dlog("car: список моделей: IL2CPP ещё не готов"); return 0; }
     ensure_attached();
     cls = A.class_from_name(g_img, "Hassle.Definitions", "DefinitionDatabase");
-    f = cls ? A.class_get_field_from_name(cls, "DefinitionsByID") : NULL;
-    if (!f) return 0;
+    if (!cls) { dlog("car: список моделей: класс Hassle.Definitions.DefinitionDatabase не найден"); return 0; }
+    f = A.class_get_field_from_name(cls, "DefinitionsByID");
+    if (!f) { dlog("car: список моделей: поле DefinitionsByID не найдено"); return 0; }
     A.field_static_get_value(f, &dict);
-    if (!dict || !hm_obj_ok(dict)) return 0;
+    if (!dict || !hm_obj_ok(dict)) { dlog("car: список моделей: DefinitionsByID пуст или нечитаем (определения ещё не загружены?)"); return 0; }
     arr = ref_field_s(dict, "_entries");
     if (!arr) arr = ref_field_s(dict, "entries");
-    if (!arr) return 0;
-    walk_struct_array(arr, int_field(dict, "_count", "count", NULL, -1), "value", car_mdl_cb, NULL);
+    if (!arr) { dlog("car: список моделей: у словаря нет _entries"); return 0; }
+    cnt = int_field(dict, "_count", "count", NULL, -1);
+    dlog_i("car: список моделей: записей в словаре ", cnt);
+    walk_struct_array(arr, cnt, "value", car_mdl_cb, NULL);
+    dlog_i("car: список моделей: найдено машин ", g_car_nmdl);
     for (i = 1; i < g_car_nmdl; i++) {                               /* сортировка по ID (вставками) */
         CarMdl t = g_car_mdl[i];
         for (j = i - 1; j >= 0 && g_car_mdl[j].id > t.id; j--) g_car_mdl[j + 1] = g_car_mdl[j];
@@ -453,6 +458,7 @@ static void car_help(void) {
     chat_usage("/vtune reset — вернуть оригинал;  /vtune save — запомнить как профиль этой МОДЕЛИ (по ID модели);  /vtune model ID параметр значение — профиль вручную;  /vtune model ID del");
     chat_usage("/vtune cars [N | текст] — список всех моделей машин (ID, имя, хендлинг); потолок скорости: speed xN + power xN + drag x0.3, при упоре — gear x0.6");
     chat_usage("/vtune list — профили;  /vtune auto on|off — применять профиль автоматически, когда садитесь за руль этой модели");
+    chat_usage("/vtune from ID [all] — взять хендлинг МОДЕЛИ ID (из /vtune cars) и поставить на вашу машину (all — вся структура);  /vtune reset вернёт свой");
 }
 static void car_list(void) {
     int i, k; char line[200]; Buf b;
@@ -506,6 +512,125 @@ static void car_tick(void) {                             /* главный по�
     }
 }
 
+/* ───────────── /vtune from ID: хендлинг МОДЕЛИ ID → на вашу текущую машину ───────────── */
+/* VehicleDefinition(ID).Handling — имя набора; Handlings.CommonData[имя] — CommonVehicleHandling (структура внутри записи словаря).
+   Копируем её поля в BaseVehicle.m_Handling вашей машины (структура внутри объекта) и просим игру пересчитать физику. */
+static void* g_car_findDef; static int g_car_findId;
+static void car_find_cb(void* it, void* ctx) {
+    (void)ctx;
+    if (g_car_findDef || !hm_obj_ok(it)) return;
+    if (int_field(it, "ID", NULL, NULL, -1) == g_car_findId) g_car_findDef = it;
+}
+static void* car_def_by_id(int id) {                                /* определение с этим ID из DefinitionDatabase.DefinitionsByID (или NULL) */
+    void *cls, *f, *dict = NULL, *arr;
+    g_car_findDef = NULL; g_car_findId = id;
+    if (!g_safe || !il2cpp_light() || !g_img) return NULL;
+    ensure_attached();
+    cls = A.class_from_name(g_img, "Hassle.Definitions", "DefinitionDatabase");
+    f = cls ? A.class_get_field_from_name(cls, "DefinitionsByID") : NULL;
+    if (!f) { dlog("car: from: нет DefinitionDatabase.DefinitionsByID"); return NULL; }
+    A.field_static_get_value(f, &dict);
+    if (!dict || !hm_obj_ok(dict)) { dlog("car: from: DefinitionsByID пуст или нечитаем"); return NULL; }
+    arr = ref_field_s(dict, "_entries"); if (!arr) arr = ref_field_s(dict, "entries");
+    if (!arr) { dlog("car: from: у словаря нет _entries"); return NULL; }
+    walk_struct_array(arr, int_field(dict, "_count", "count", NULL, -1), "value", car_find_cb, NULL);
+    return g_car_findDef;
+}
+/* Handlings.CommonData[имя] → адрес структуры CommonVehicleHandling внутри записи словаря (и её класс в *scOut) */
+static char* car_hand_src(const char* hname, void** scOut) {
+    void *cls, *f, *dict = NULL, *arr, *ac, *ec, *fk, *fv, *fh; int esz, i, cnt, shift, offk, offv, offh = 0; long len; char* data;
+    cls = A.class_from_name(g_img, "Hassle.Vehicles", "Handlings");
+    f = cls ? A.class_get_field_from_name(cls, "CommonData") : NULL;
+    if (!f) { dlog("car: from: нет Handlings.CommonData"); return NULL; }
+    A.field_static_get_value(f, &dict);
+    if (!dict || !hm_obj_ok(dict)) { dlog("car: from: Handlings.CommonData пуст или нечитаем"); return NULL; }
+    arr = ref_field_s(dict, "_entries"); if (!arr) arr = ref_field_s(dict, "entries");
+    if (!arr || !hm_obj_ok(arr)) { dlog("car: from: у CommonData нет _entries"); return NULL; }
+    ac = A.object_get_class(arr); ec = A.class_get_element_class(ac); esz = arr_elem_size(ec);
+    fk = ec ? find_field(ec, "key") : NULL; fv = ec ? find_field(ec, "value") : NULL; fh = ec ? find_field(ec, "hashCode") : NULL;
+    if (!fk || !fv || esz <= 0) { dlog("car: from: не разобрать запись CommonData"); return NULL; }
+    shift = A.class_is_valuetype(ec) ? struct_shift(ec) : 0;
+    offk = A.field_get_offset(fk) - shift; offv = A.field_get_offset(fv) - shift; if (fh) offh = A.field_get_offset(fh) - shift;
+    *scOut = A.class_from_type(A.field_get_type(fv));
+    cnt = int_field(dict, "_count", "count", NULL, -1);
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 100000) return NULL;
+    if (cnt < 0 || cnt > len) cnt = (int)len;
+    dlog_i("car: from: наборов хендлинга в CommonData ", cnt);
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < cnt; i++) {
+        char* e = data + (uptr)i * (uptr)esz; void* key; char nm[64]; int n;
+        if (!hm_range_ok(e, esz)) break;
+        if (fh && *(int*)(e + offh) < 0) continue;
+        key = *(void**)(e + offk);
+        if (!key || !hm_obj_ok(key)) continue;
+        n = A.string_length(key); if (n <= 0 || n > 60) continue;
+        utf16_to_utf8(A.string_chars(key), n, nm, sizeof nm);
+        if (seq(nm, hname)) return e + offv;
+    }
+    return NULL;
+}
+static struct { void* veh; int id; int n; unsigned char b[256]; } g_car_hbak;    /* копия ВСЕЙ структуры хендлинга до /vtune from — для /vtune reset */
+/* mode 0 — скопировать поля src→dst; mode 1 — проверить и вернуть, если игра откатила. all=0 — только «ездовые» поля. Возврат: полей скопировано/откатилось */
+static int car_bytes_diff(const char* a, const char* b, int n) { int i; for (i = 0; i < n; i++) if (a[i] != b[i]) return 1; return 0; }
+static int car_copy_fields(char* src, char* dst, void* sc, int all, int mode, int* total_out) {
+    static const char* const want[] = { "DragMultiplier", "TractionMultiplier", "TractionLoss", "TractionBias", "NumberOfGears", "MaxGearVelocity",
+        "EngineAcceleration", "EngineInertia", "DriveType", "EngineType", "BrakeDeceleration", "BrakeBias", "SteeringLock", "MaxSpeedForward" };
+    void *it = NULL, *f; int sh = struct_shift(sc), offs[64], n = 0, i, k, res = 0, total;
+    while ((f = A.class_get_fields(sc, &it)) && n < 64) { if (A.field_get_flags(f) & 0x10) continue; offs[n++] = A.field_get_offset(f) - sh; }
+    total = A.class_instance_size ? A.class_instance_size(sc) - (int)HDR : 0;
+    if (total <= 0 || total > 255) { int mx = 0; for (i = 0; i < n; i++) if (offs[i] > mx) mx = offs[i]; total = mx + 4; }
+    if (total_out) *total_out = total;
+    it = NULL;
+    while ((f = A.class_get_fields(sc, &it))) {
+        int off, size, ok = all; const char* nm;
+        if (A.field_get_flags(f) & 0x10) continue;
+        off = A.field_get_offset(f) - sh; nm = A.field_get_name(f);
+        if (!ok && nm) for (k = 0; k < (int)(sizeof want / sizeof want[0]); k++) if (seq(nm, want[k])) { ok = 1; break; }
+        if (!ok) continue;
+        size = total - off;                                          /* до конца структуры или до ближайшего следующего поля */
+        for (i = 0; i < n; i++) if (offs[i] > off && offs[i] - off < size) size = offs[i] - off;
+        if (off < 0 || size <= 0 || size > 16) continue;
+        if (mode == 0) { memcpy(dst + off, src + off, (unsigned long)size); res++; }
+        else if (car_bytes_diff(dst + off, src + off, size)) { memcpy(dst + off, src + off, (unsigned long)size); res++; }
+    }
+    return res;
+}
+static void car_cmd_from(void* veh, int model, int all) {
+    void *def, *sc = NULL, *hf, *hsc; char hn[64], *src, *dst; int n, total = 0, back, i; char m[160]; Buf b; CarOrig* o;
+    if (!car_mdl_load()) { chat_say("vtune: список моделей не прочитался — подробности в konstt.log"); return; }
+    def = car_def_by_id(model);
+    if (!def) { chat_say("vtune: модель с таким ID не найдена (/vtune cars — список)"); return; }
+    if (!seq(A.class_get_name(A.object_get_class(def)), "VehicleDefinition")) { chat_say("vtune: этот ID — не машина (оружие/скин/предмет)"); return; }
+    car_str_field(def, "Handling", hn, sizeof hn);
+    if (!hn[0]) { chat_say("vtune: у этой модели не прочиталось имя хендлинга"); return; }
+    src = car_hand_src(hn, &sc);
+    if (!src || !sc) { dlog2("car: from: набор хендлинга не найден: ", hn); chat_say("vtune: набор хендлинга этой модели не найден в Handlings.CommonData (подробности в konstt.log)"); return; }
+    hf = find_field(A.object_get_class(veh), "m_Handling");
+    hsc = hf ? A.class_from_type(A.field_get_type(hf)) : NULL;
+    if (!hf || !hsc) { chat_say("vtune: у вашей техники нет m_Handling"); return; }
+    dst = (char*)veh + A.field_get_offset(hf);
+    n = 0; (void)car_copy_fields(src, dst, hsc, all, 1, &total);          /* только чтобы узнать размер структуры */
+    if (total <= 0 || total > 255 || !hm_range_ok(src, total) || !hm_range_ok(dst, total)) { chat_say("vtune: структура хендлинга нечитаема"); return; }
+    /* оригиналы: целиком (для reset) и по строкам таблицы (для save/auto) */
+    if (!(g_car_hbak.veh == veh && g_car_hbak.id == car_veh_id(veh) && g_car_hbak.n > 0)) { g_car_hbak.veh = veh; g_car_hbak.id = car_veh_id(veh); g_car_hbak.n = total; memcpy(g_car_hbak.b, dst, (unsigned long)total); }
+    o = car_orig_get(veh, 1);
+    for (i = 0; i < CAR_NROW; i++) if (g_car_rows[i].where == 1) { float* p = car_fptr(veh, 1, g_car_rows[i].field); if (p && !(o->have & (1u << i))) { o->orig[i] = *p; o->have |= (1u << i); } }
+    n = car_copy_fields(src, dst, hsc, all, 0, NULL);
+    car_call_update(veh);                                                 /* игра пересобирает физику из хендлинга */
+    back = car_copy_fields(src, dst, hsc, all, 1, NULL);                  /* если игра при пересчёте вернула старое — пишем обратно (физику не трогаем) */
+    for (i = 0; i < CAR_NROW; i++) if (g_car_rows[i].where == 1) { float* p = car_fptr(veh, 1, g_car_rows[i].field); if (p) { o->want[i] = *p; o->wset |= (1u << i); } }
+    if (back) car_call_update(veh);
+    g_car_lastVeh = veh; g_car_lastId = car_veh_id(veh);
+    b_init(&b, m, sizeof m);
+    b_s(&b, "vtune: хендлинг модели "); b_int(&b, model); b_s(&b, " («"); b_s(&b, hn); b_s(&b, "») применён к вашей машине, полей: "); b_int(&b, n);
+    if (back) { b_s(&b, ", игра откатила: "); b_int(&b, back); }
+    b_s(&b, all ? " (вся структура)" : "");
+    chat_say(m);
+    chat_say("vtune: /vtune — посмотреть значения; /vtune reset — вернуть свой хендлинг");
+    dlog2("car: from: набор ", hn);
+}
+
 static void native_car_cmd(void* self, void* args, void* mi) {
     char tok[8][32]; int nt, drv = 0, r, i; void* veh; float v; int mul;
     (void)self; (void)mi;
@@ -540,12 +665,25 @@ static void native_car_cmd(void* self, void* args, void* mi) {
     veh = car_my_vehicle(&drv);
     if (!veh) { chat_say("car: вы не в машине (или игра ещё грузится)"); return; }
     if (!drv) { chat_say("car: вы пассажир — настраивать может только водитель"); return; }
+    if (nt >= 2 && (seq(tok[0], "from") || seq(tok[0], "copy"))) {      /* /vtune from 522 [all] — хендлинг модели 522 на вашу машину */
+        float fid;
+        if (!car_num(tok[1], &fid)) { chat_usage("Формат: /vtune from ID_модели [all]  (ID — из /vtune cars; all — скопировать ВСЮ структуру хендлинга, иначе только ездовые поля)"); return; }
+        car_cmd_from(veh, (int)(fid + 0.5f), nt >= 3 && seq(tok[2], "all"));
+        return;
+    }
     if (nt == 0 || seq(tok[0], "info")) { car_info(veh); return; }
     if (seq(tok[0], "reset")) {
         CarOrig* o = car_orig_get(veh, 0); int n = 0;
-        if (!o) { chat_say("car: эта машина не менялась — сбрасывать нечего"); return; }
-        for (i = 0; i < CAR_NROW; i++) if (o->have & (1u << i)) { float* p = car_fptr(veh, g_car_rows[i].where, g_car_rows[i].field); if (p) { *p = o->orig[i]; n++; } }
-        o->wset = 0; car_call_update(veh);                         /* игра заново считает физику из вернувшегося хендлинга */
+        int hb = (g_car_hbak.veh == veh && g_car_hbak.id == car_veh_id(veh) && g_car_hbak.n > 0);
+        if (!o && !hb) { chat_say("car: эта машина не менялась — сбрасывать нечего"); return; }
+        if (hb) {                                                      /* вернуть ВСЮ структуру хендлинга, какой она была до /vtune from */
+            void* hf = find_field(A.object_get_class(veh), "m_Handling");
+            if (hf && hm_range_ok((char*)veh + A.field_get_offset(hf), g_car_hbak.n)) { memcpy((char*)veh + A.field_get_offset(hf), g_car_hbak.b, (unsigned long)g_car_hbak.n); n++; }
+            g_car_hbak.n = 0;
+        }
+        if (o) for (i = 0; i < CAR_NROW; i++) if (o->have & (1u << i)) { float* p = car_fptr(veh, g_car_rows[i].where, g_car_rows[i].field); if (p) { *p = o->orig[i]; n++; } }
+        if (o) o->wset = 0;
+        car_call_update(veh);                         /* игра заново считает физику из вернувшегося хендлинга */
         g_car_lastVeh = veh; g_car_lastId = car_veh_id(veh);       /* авто-режим не должен тут же вернуть профиль */
         { char m[80]; Buf b; b_init(&b, m, sizeof m); b_s(&b, "car: оригинал возвращён, полей: "); b_int(&b, n); chat_say(m); }
         return;

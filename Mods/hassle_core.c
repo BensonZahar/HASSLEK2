@@ -588,6 +588,18 @@ static void* local_player(void) {
 /* ───────────── перебор коллекции ───────────── */
 typedef void (*item_cb)(void* item, void* ctx);
 
+/* Размер ЭЛЕМЕНТА массива. il2cpp_class_array_element_size надо звать от класса ЭЛЕМЕНТА, а не от класса массива
+   (от класса массива вернётся 8 — размер ссылки, и обход записей Dictionary идёт с неверным шагом). */
+static int arr_elem_size(void* ec) {
+    int sz = 0;
+    if (!ec) return 0;
+    if (A.class_is_valuetype(ec) && A.class_instance_size) {
+        int is = A.class_instance_size(ec) - (int)HDR;               /* размер структуры без заголовка объекта */
+        if (is > 0) sz = is;
+    }
+    if (sz <= 0) sz = A.class_array_element_size(ec);
+    return sz;
+}
 static void walk_ref_array(void* arr, int count, int stride_is_ptr, item_cb cb, void* ctx) {
     int i; char* data;
     if (!arr) return;
@@ -609,7 +621,7 @@ static void walk_struct_array(void* arr, int count, const char* fld, item_cb cb,
     if (!arr) return;
     ac = A.object_get_class(arr);
     ec = A.class_get_element_class(ac);
-    esz = A.class_array_element_size(ac);
+    esz = arr_elem_size(ec);
     if (!ec || esz <= 0) return;
     f = find_field(ec, fld);
     if (!f) return;
@@ -786,7 +798,7 @@ static void dict_each(void* dict, kv_cb cb, void* ctx) {
     arr = ref_field(dict, "_entries"); if (!arr) arr = ref_field(dict, "entries");
     if (!arr) { if (g_cmdTrace) dlog("реестр: у словаря нет _entries"); return; }
     if (!hm_obj_ok(arr)) { if (g_cmdTrace) dlog("реестр: массив записей нечитаем"); return; }
-    ac = A.object_get_class(arr); ec = A.class_get_element_class(ac); esz = A.class_array_element_size(ac);
+    ac = A.object_get_class(arr); ec = A.class_get_element_class(ac); esz = arr_elem_size(ec);
     if (!ec || esz <= 0) return;
     fk = find_field(ec, "key"); fv = find_field(ec, "value"); fh = find_field(ec, "hashCode");
     if (!fk || !fv) return;
