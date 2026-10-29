@@ -1,4 +1,4 @@
-]/*
+/*
  * hassle_tpl.c — необязательный модуль «/tpl»: маленький телепорт в любую сторону от камеры (выбраться, когда NPC/игрок заглючил
  * и /nocol не помог).
  *
@@ -59,6 +59,14 @@
  *     это Transform машины. Лимита по дальности нет: большие прыжки сервер может откатить, а на далёкой точке карта может быть
  *     не загружена (можно провалиться) — это на ваше усмотрение. На сервере есть античит с проверкой телепорта (AC_TELEPORT) —
  *     и пешком, и на машине дальний прыжок может быть засчитан как телепорт: риск на вас.
+ *   • Прыжок МАШИНЫ асинхронный. Entity.SetPosition у машины (тот же вызов, что в RPC SetVehiclePos) сперва замораживает её (Rigidbody
+ *     kinematic), затем СОЗДАЁТ точку подгрузки мира в месте назначения (IsNeedLoadCollision у BaseVehicle всегда «да», радиус 300 м, если вы
+ *     внутри), ЖДЁТ загрузки коллизии (WorldStream.WaitForCollisionLoaded, с тайм-аутом) и только после этого ставит Rigidbody/Transform.position
+ *     и размораживает. Рядом коллизия уже загружена — всё проходит в одном вызове; на большое расстояние ожидание занимает время, и всё это
+ *     время машина стоит на старом месте. Поэтому мод НЕ пишет «готово» сразу, а запускает наблюдателя (tplw_*): раз в ~60 мс главному потоку
+ *     уходит «тик» (тот же приём, что у /route), наблюдатель дожидается прибытия, ТОГДА обнуляет скорость машины (до прибытия она заморожена и
+ *     сброс ничего не давал), сообщает в чат, сколько ждали карту, и ещё 3 с следит: если машину вернуло на прежнее место, он так и скажет
+ *     (значит, откат пришёл не из кода /tpl, мод к тому моменту уже поставил машину на точку). Подробности — в konstt.log.
  *   • Это не «клиентская» штука, как /nocol: позиция уходит на сервер как обычная, и другие игроки вас видят на новом месте
  *     (если не включён /tpl ghost — тогда позиция на сервер не уходит вовсе).
  *
@@ -260,6 +268,8 @@ static int tpl_place(const TplCtx* c, const float* npE, const float* npM, u8 fin
     return 0;
 }
 static void tpl_fail(void) { chat_say("Телепорт: не вышло — подробности в konstt.log. Попробуйте /tpl alt"); }
+static void native_tpl_cmd(void* self, void* args, void* mi);
+static int tplw_begin(const TplCtx* c, const float* from, const float* to);   /* наблюдатель за прыжком машины; 1 — машина ещё не на точке (ждёт карту) */
 
 /* ───────────── сдвиг в сторону ───────────── */
 static void tpl_go(int side, float dist, int clamped) {
@@ -278,7 +288,10 @@ static void tpl_go(int side, float dist, int clamped) {
     if (clamped) b_s(&b, " (максимум)");
     b_s(&b, src == 1 ? " (по камере)" : " (по повороту персонажа, камера не найдена)");
     if (via == 2) b_s(&b, " [через движение]");
-    if (via == 3) b_s(&b, " (вместе с машиной)");
+    if (via == 3) {
+        b_s(&b, " (вместе с машиной)");
+        if (haveE && tplw_begin(&c, eb, ne)) b_s(&b, " — машина двинется, когда подгрузится карта в точке");
+    }
     chat_say(msg);
     {
         char lg[220]; Buf x; b_init(&x, lg, sizeof lg);
@@ -344,7 +357,10 @@ static int tpl_goto(const float* v, int nc, const char* label) {
         b_s(&b, ", это в "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 1); b_s(&b, " м от вас");
     }
     if (via == 2) b_s(&b, " [через движение]");
-    if (via == 3) b_s(&b, " (вместе с машиной)");
+    if (via == 3) {
+        b_s(&b, " (вместе с машиной)");
+        if (haveE && tplw_begin(&c, eb, ne)) b_s(&b, " — машина двинется, когда подгрузится карта в точке");
+    }
     chat_say(msg);
     dlog2("/tpl: ", msg);
     return 1;
@@ -388,6 +404,133 @@ static int gh_hook(void* player, void* a1) {
     }
     __atomic_fetch_add(&g_gh_hits, 1u, __ATOMIC_RELAXED);
     return 1;
+}
+
+/* ───────────── наблюдатель за прыжком машины ─────────────
+   Зачем: Entity.SetPosition у машины возвращает управление сразу, а сам перенос делает позже (заморозка → подгрузка карты в точке → ожидание →
+   Rigidbody/Transform.position → разморозка). Раньше мод в тот же миг писал «готово» и обнулял скорость — на дальнем прыжке и то и другое было
+   неправдой (машина ещё стояла на старом месте, замороженная). Теперь: worker-поток раз в TPLW_TICK_US шлёт главному потоку «тик»
+   (UnitySynchronizationContext.Post, как у /route), а tplw_tick() на главном потоке смотрит, где машина. Фазы: 1 — ждём прибытия, 2 — следим
+   TPLW_WATCH мс после прибытия (не вернули ли назад). Всё только читает позицию (и один раз обнуляет скорость), движением не управляет. */
+#define TPLW_ARRIVE  12.0f                               /* м по горизонтали: «машина на точке» */
+#define TPLW_FAR     40.0f                               /* м: дальше этого от точки — машину увезло/она уехала сама */
+#define TPLW_BIG     100.0f                              /* м: на меньших прыжках откат не разбираем (не отличить от обычной езды) */
+#define TPLW_TIMEOUT 30000LL                             /* мс ожидания прибытия */
+#define TPLW_WATCH   3000LL                              /* мс наблюдения после прибытия */
+#define TPLW_TICK_US 60000
+
+static volatile int g_tplw_on;                           /* 0 — нет, 1 — ждём прибытия, 2 — наблюдаем после прибытия */
+static volatile int g_tplw_pending;                      /* тик отправлен и ещё не обработан */
+static volatile long long g_tplw_pendT;
+static int g_tplw_thread;
+static long long g_tplw_t0, g_tplw_tArr;
+static float g_tplw_from[3], g_tplw_to[3], g_tplw_total;
+
+static float tplw_dxz(const float* a, const float* b) {
+    double dx = (double)a[0] - (double)b[0], dz = (double)a[2] - (double)b[2];
+    return (float)__builtin_sqrt(dx * dx + dz * dz);
+}
+static void tplw_end(const char* why) {
+    __atomic_store_n(&g_tplw_on, 0, __ATOMIC_RELEASE);
+    dlog2("/tpl: наблюдение за машиной закончено: ", why);
+}
+/* worker-поток: положить в очередь главного потока вызов native_tpl_cmd со строкой-меткой вместо string[] */
+static void tplw_post(void) {
+    void *cb, *st, *a[2], *exc = NULL; char et[200];
+    if (!g_mt_ctx || !g_mt_postM || !g_mt_kCb) { g_tplw_pending = 0; return; }
+    ensure_attached();
+    cb = clone_cmd_delegate(g_mt_kCb, g_cmdSize, g_cmdOffMp, g_cmdOffIi, (uptr)native_tpl_cmd);
+    st = A.string_new("tpl-tick");
+    if (!cb || !st) { g_tplw_pending = 0; dlog("/tpl: не создался делегат для Post"); return; }
+    a[0] = cb; a[1] = st;
+    A.runtime_invoke(g_mt_postM, g_mt_ctx, a, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("/tpl: Post бросил исключение: ", et); g_tplw_pending = 0; }
+}
+static void* tplw_worker(void* arg) {
+    (void)arg;
+    for (;;) {
+        if (!__atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
+        if (!g_tplw_pending || gh_now_ms() - g_tplw_pendT > 1000) {      /* прошлый тик не дошёл (игра на паузе/грузится) — шлём новый */
+            g_tplw_pending = 1; g_tplw_pendT = gh_now_ms();
+            tplw_post();
+        }
+        usleep(TPLW_TICK_US);
+    }
+    return NULL;
+}
+/* Главный поток, сразу после успешного Entity.SetPosition у машины. from — где была, to — куда ставим. 1 — машина ещё не на точке */
+static int tplw_begin(const TplCtx* c, const float* from, const float* to) {
+    float cur[3]; int pending = 1, i; long long now = gh_now_ms();
+    mt_capture_ctx();                                                    /* нужен главный поток — мы как раз в нём (обработчик команды) */
+    if (!g_mt_ctx || !g_mt_postM || !g_mt_kCb) { dlog("/tpl: нет канала в главный поток — за машиной не слежу (сообщение «готово» может быть раньше переноса)"); return 0; }
+    if (!g_tplw_thread) {
+        unsigned long t = 0;
+        if (pthread_create(&t, NULL, tplw_worker, NULL) != 0) { dlog("/tpl: не создался поток наблюдателя"); return 0; }
+        g_tplw_thread = 1;
+    }
+    for (i = 0; i < 3; i++) { g_tplw_from[i] = from[i]; g_tplw_to[i] = to[i]; }
+    g_tplw_total = tplw_dxz(from, to);
+    g_tplw_t0 = now; g_tplw_tArr = now;
+    if (tpl_cur_pos(c, cur) && tplw_dxz(cur, to) <= TPLW_ARRIVE) pending = 0;      /* близкий прыжок: коллизия была загружена, перенос уже случился */
+    g_tplw_pending = 0;
+    __atomic_store_n(&g_tplw_on, pending ? 1 : 2, __ATOMIC_RELEASE);
+    {
+        char lg[200]; Buf x; b_init(&x, lg, sizeof lg);
+        b_s(&x, "/tpl: слежу за машиной, горизонтально "); b_fix(&x, g_tplw_total, 0); b_s(&x, " м, "); b_s(&x, pending ? "ещё не на точке (ждём подгрузку карты)" : "уже на точке");
+        dlog(lg);
+    }
+    return pending;
+}
+/* Главный поток, по тику */
+static void tplw_tick(void) {
+    TplCtx c; float p[3]; long long now = gh_now_ms(); int st; Buf b; char msg[300];
+    g_tplw_pending = 0;
+    st = __atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE);
+    if (!st) return;
+    if (!tpl_ctx_q(&c, 2, 1) || !c.veh) { tplw_end("вы уже не за рулём"); return; }
+    if (!tpl_cur_pos(&c, p)) { if (now - g_tplw_t0 > TPLW_TIMEOUT) tplw_end("позицию машины прочитать не удалось"); return; }
+    if (st == 1) {
+        float dTo = tplw_dxz(p, g_tplw_to);
+        if (dTo <= TPLW_ARRIVE) {
+            long long dt = now - g_tplw_t0;
+            tpl_stop_vehicle(c.veh);                                     /* машина уже разморожена и стоит на точке: теперь сброс скорости имеет смысл */
+            g_tplw_tArr = now;
+            __atomic_store_n(&g_tplw_on, 2, __ATOMIC_RELEASE);
+            { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: машина на точке, ждали мс: "); b_int(&x, (int)dt); dlog(lg); }
+            if (dt > 500) {
+                b_init(&b, msg, sizeof msg);
+                b_s(&b, "Машина на точке (подгрузка карты заняла "); b_fix(&b, (double)dt / 1000.0, 1); b_s(&b, " с)");
+                chat_say(msg);
+            }
+        } else if (now - g_tplw_t0 > TPLW_TIMEOUT) {
+            b_init(&b, msg, sizeof msg);
+            b_s(&b, "Телепорт машины: за 30 с машина не дошла до точки (осталось "); b_fix(&b, dTo, 0); b_s(&b, " м) — карта в точке не подгрузилась? Подробности в konstt.log");
+            chat_say(msg);
+            tplw_end("не дошла до точки за тайм-аут");
+        }
+        return;
+    }
+    {   /* st == 2: наблюдаем */
+        float dFrom = tplw_dxz(p, g_tplw_from), dTo = tplw_dxz(p, g_tplw_to); long long dt = now - g_tplw_tArr;
+        if (g_tplw_total > TPLW_BIG && dFrom <= TPLW_ARRIVE) {
+            b_init(&b, msg, sizeof msg);
+            b_s(&b, "Машину вернуло на прежнее место через "); b_int(&b, (int)dt);
+            b_s(&b, " мс после прибытия. К этому моменту /tpl уже поставил её на точку, так что откат пришёл не из кода мода — похоже на серверную проверку телепорта у машин");
+            chat_say(msg);
+            { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: ОТКАТ машины на старое место через мс: "); b_int(&x, (int)dt); dlog(lg); }
+            tplw_end("машину вернуло назад");
+            return;
+        }
+        if (dTo > TPLW_FAR) {                                            /* уехала (вы за рулём) или увезло в другое место — в чат не пишем */
+            { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: машина ушла от точки, м: "); b_int(&x, (int)dTo); dlog(lg); }
+            tplw_end("машина ушла от точки");
+            return;
+        }
+        if (dt >= TPLW_WATCH) {
+            if (g_tplw_total > TPLW_BIG) chat_say("Машина удержалась на точке (3 с)");
+            tplw_end("удержалась");
+        }
+    }
 }
 
 static int gh_fail(const char* why) {
@@ -984,6 +1127,8 @@ static void tpl_usage(void) {
 static void native_tpl_cmd(void* self, void* args, void* mi) {
     TplArgs a;
     (void)self; (void)mi;
+    if (args && seq(A.class_get_name(A.object_get_class(args)), "String")) { tplw_tick(); return; }   /* тик наблюдателя из Post (строка), а не команда (string[]) */
+    mt_capture_ctx();                                                /* главный поток: запоминаем контекст для тиков наблюдателя */
     tpl_parse(args, &a);
     if (a.bad && a.unkN == 1) {                                     /* одно незнакомое слово — возможно, имя точки */
         if ((a.mode == 3 || a.mode == 4 || a.mode == 6) && !a.nameSet) {            /* «/tpl дом save» — имя стоит перед командой */
