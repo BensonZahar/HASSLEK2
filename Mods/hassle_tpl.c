@@ -32,6 +32,13 @@
  *                        Номер никуда не переносит; чтобы оказаться внутри, нужно оказаться в его координатах. Поэтому «/tpl save» запоминает
  *                        точку ВМЕСТЕ с номером интерьера, а «/tpl go» переносит и включает тот же интерьер. Если застряла тёмная
  *                        «комнатная» картинка на улице — «/tpl int 0».
+ *   /tpl gps             телепорт на метку, поставленную на карте (/gps → точка/маршрут). Высота — по земле. Метки нет, а сервер показал маркер (чекпоинт) — на маркер.
+ *                        Синонимы: /tpl метка, /tpl гпс, /tpl mark, /tpl wp
+ *   /tpl pick            пикапы и маркеры РЯДОМ с вами (их присылает сервер, и клиент держит только тех, что в зоне стрима) — список по расстоянию, у каждого
+ *                        свой номер 1, 2, 3 … (ID пикапа, расстояние, название — если рядом есть 3D-подпись, и координаты). Синонимы: /tpl пикап, /tpl маркеры, /tpl pk
+ *   /tpl pick N          телепорт к номеру N из ПОСЛЕДНЕГО списка (номера остаются, пока не вызовете «/tpl pick» заново — можно ходить по ним подряд).
+ *                        Встаёте ровно в точку пикапа, поэтому он срабатывает как при касании (раздевалка, вход и т.п.).
+ *   /tpl pick list [стр] список по 10 на странице; «list 2» листает прежний снимок, не пересобирая
  *   В машине (вы за рулём) все команды телепорта (/tpl 5 вперёд, /tpl to …, /tpl go …) переносят МАШИНУ вместе с вами.
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
  *
@@ -69,6 +76,18 @@
  *     (значит, откат пришёл не из кода /tpl, мод к тому моменту уже поставил машину на точку). Подробности — в konstt.log.
  *   • Это не «клиентская» штука, как /nocol: позиция уходит на сервер как обычная, и другие игроки вас видят на новом месте
  *     (если не включён /tpl ghost — тогда позиция на сервер не уходит вовсе).
+ *
+ * «Метка GPS» и «пикапы» (/tpl gps, /tpl pick) — по дампу IL2CPP и дизассемблированию libil2cpp.so (RVA из dump.cs)
+ *   • Метка с карты: JS зовёт getNavigationPath(x, y, z) в системе SAMP (x, y — плоскость, z — высота), а MiniMap.<GetNavigationPath>d__41.MoveNext кладёт в
+ *     MiniMap.m_NavigationPoint (Vector3 @0x84) значение (x, z, y), т.е. уже мировые координаты Unity — те же, что у Transform.position и /tpl to. Это поле и читаем
+ *     (MiniMap берём через статический UI.get_MiniMap). Высоту метки сервер знает не всегда (у метки по тапу на карте она может быть 0), поэтому на метку встаём как
+ *     «/tpl to X Z»: Player.SetPosition(…, findHeight=true), а высота метки — лишь точка, откуда искать землю вниз. m_IsNavigationActive читаем для сообщений.
+ *   • Пикапы: Pools.Pickups (PickupPool : BasePool<Pickup>, словарь m_Items, как у NPC в /air); у Pickup есть только m_ID и Transform — тип и модель клиент не хранит.
+ *     Название берём из 3D-подписей сервера: Pools.Text3DLables (sic) → Text3DLabel.m_CreateParams.Text / Position (Position — мировая точка: LateUpdate отдаёт её в
+ *     Camera.WorldToViewportPoint); ближайшая подпись не дальше 4 м от пикапа становится его названием.
+ *   • Маркер (чекпоинт) — статические Checkpoint.Simple / Checkpoint.Race (SetCheckpoint / SetRaceCheckpoint от сервера); он у игрока один, виден в списке, пока активен.
+ *   • ВАЖНО: клиент знает только тех, кого сервер подгрузил рядом (зона стрима), весь список сервера из клиента не достать. Код не запускался на устройстве —
+ *     собран и проверен компилятором и тестом разбора команд; если «/tpl gps» не находит метку или «/tpl pick» пуст — смотрите HLOG/konstt.log (строки «tpl:»).
  *
  * «Призрак» (/tpl ghost)
  *   • Позицию на сервер шлёт LocalPlayer.SendSyncData → SendOnFootFullSyncData (пакет «пешком», в нём Position), а камеру/прицел —
@@ -331,8 +350,9 @@ static void tpl_show(void) {
         dlog2("/tpl pos: ", msg);
     }
 }
-/* «/tpl to X Y Z» (nc = 3) или «/tpl to X Z» (nc = 2, высота по земле) */
-static int tpl_goto(const float* v, int nc, const char* label) {
+/* «/tpl to X Y Z» (nc = 3) или «/tpl to X Z» (nc = 2, высота по земле).  findH — искать высоту по земле (для nc = 2 всегда; для nc = 3 — когда Y лишь
+   «откуда искать вниз»: так /tpl gps ставит на метку, у которой точной высоты нет) */
+static int tpl_goto_ex(const float* v, int nc, const char* label, int findH) {
     TplCtx c; float eb[3], mb[3], ne[3], nm[3]; int haveE, haveM, via, i; Buf b; char msg[240];
     for (i = 0; i < nc; i++) if (!(v[i] == v[i]) || v[i] > TPL_MAX || v[i] < -TPL_MAX) { chat_say("Телепорт: координаты вне допустимого диапазона (±100000)"); return 0; }
     if (!tpl_ctx(&c, 2)) return 0;
@@ -345,13 +365,13 @@ static int tpl_goto(const float* v, int nc, const char* label) {
     }
     nm[0] = ne[0]; nm[1] = ne[1]; nm[2] = ne[2];
     if (haveE && haveM) { nm[0] += mb[0] - eb[0]; nm[1] += mb[1] - eb[1]; nm[2] += mb[2] - eb[2]; }   /* перевод в систему transform движения */
-    via = tpl_place(&c, ne, nm, nc == 2 ? 1 : 0);
+    via = tpl_place(&c, ne, nm, findH ? 1 : 0);
     if (!via) { tpl_fail(); return 0; }
     b_init(&b, msg, sizeof msg);
     b_s(&b, "Телепорт на ");
     if (label) { b_s(&b, "точку «"); b_s(&b, label); b_s(&b, "»: "); }
     tpl_b_xyz(&b, ne);
-    if (nc == 2) b_s(&b, " (высота по земле)");
+    if (findH) b_s(&b, " (высота по земле)");
     if (haveE) {
         double dx = ne[0] - eb[0], dy = ne[1] - eb[1], dz = ne[2] - eb[2];
         b_s(&b, ", это в "); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 1); b_s(&b, " м от вас");
@@ -365,6 +385,8 @@ static int tpl_goto(const float* v, int nc, const char* label) {
     dlog2("/tpl: ", msg);
     return 1;
 }
+
+static int tpl_goto(const float* v, int nc, const char* label) { return tpl_goto_ex(v, nc, label, nc == 2); }
 
 /* ───────────── призрак (/tpl ghost) и интерьер (/tpl int) ───────────── */
 #if defined(__aarch64__)
@@ -788,8 +810,8 @@ static void tpl_cmd_int(int id, int have) {
 }
 
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet; float dist, rawNum; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
-/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int.
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList; float dist, rawNum; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
+/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick).
    gsub (для ghost): 0 — переключить, 1 on, 2 off, 3 back, 4 unhook;  iid/iidSet — номер интерьера;  rawNum — число до подрезки по TPL_MIN (для «/tpl 0 int»).  name — имя точки (слово после save/go/del);
    unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
 
@@ -807,7 +829,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -825,6 +847,9 @@ static int tpl_word(const char* t) {
     if (seq(t, "del") || seq(t, "delete") || seq(t, "rm") || seq(t, "remove") || seq(t, "удали") || seq(t, "удалить")) return 18;
     if (seq(t, "ghost") || seq(t, "gh") || seq(t, "призрак") || seq(t, "невидимка") || seq(t, "hide")) return 19;
     if (seq(t, "int") || seq(t, "interior") || seq(t, "инт") || seq(t, "интерьер")) return 20;
+    if (seq(t, "gps") || seq(t, "гпс") || seq(t, "метка") || seq(t, "mark") || seq(t, "waypoint") || seq(t, "wp")) return 21;
+    if (seq(t, "pick") || seq(t, "pickup") || seq(t, "pickups") || seq(t, "pk") || seq(t, "пикап") || seq(t, "пикапы") ||
+        seq(t, "маркер") || seq(t, "маркеры") || seq(t, "marker") || seq(t, "markers") || seq(t, "mk")) return 22;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -860,6 +885,7 @@ static int tpl_snum(const char* t, float* out) {
     return 1;
 }
 static void tpl_apply_word(int w, TplArgs* a) {
+    if (a->mode == 10 && (w == 14 || w == 16 || w == 17)) { if (w == 17) a->pkList = 1; return; }   /* «pick list», «pick go N» — не смена команды */
     if (w >= 0 && w <= 3) { a->side = w; a->sideSet = 1; }
     else if (w == 10) a->alt = 1;
     else if (w == 11) a->status = 1;
@@ -872,6 +898,8 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 18) a->mode = 6;
     else if (w == 19) a->mode = 7;
     else if (w == 20) a->mode = 8;
+    else if (w == 21) a->mode = 9;
+    else if (w == 22) { if (a->mode == 5) a->pkList = 1; a->mode = 10; }
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -908,7 +936,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
     a->bad = 1;
 }
 static void tpl_args_init(TplArgs* a) {
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = 0; a->dist = TPL_DEF; a->rawNum = -1.0f;
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = 0; a->dist = TPL_DEF; a->rawNum = -1.0f;
     a->c[0] = a->c[1] = a->c[2] = 0.0f; a->name[0] = a->unk[0] = 0;
 }
 /* аргументы: string[] */
@@ -1116,12 +1144,242 @@ static void tpl_cmd_list(int page) {
     if (page < pages) { b_init(&b, msg, sizeof msg); b_s(&b, "Дальше: /tpl list "); b_int(&b, page + 1); chat_usage(msg); }
 }
 
+/* ───────────── метка GPS и пикапы/маркеры (/tpl gps, /tpl pick) ───────────── */
+#define TPL_PKMAX 200                                    /* пикапов и маркеров в снимке списка */
+#define TPL_LBMAX 256                                    /* 3D-подписей, которые читаем, чтобы назвать пикап */
+#define TPL_LBNEAR 4.0f                                  /* м: подпись не дальше этого от пикапа считается его названием */
+typedef struct { int id, kind; float p[3], d; char lab[56]; } TplPk;   /* kind: 0 — пикап, 1 — маркер (чекпоинт), 2 — гоночный маркер */
+typedef struct { float p[3]; char t[56]; } TplLb;
+static TplPk g_tpl_pk[TPL_PKMAX]; static int g_tpl_npk;       /* снимок списка: номера в «/tpl pick N» — это индексы отсюда (с единицы) */
+static TplLb g_tpl_lb[TPL_LBMAX]; static int g_tpl_nlb;
+static float g_tpl_pkRef[3];
+
+static float tpl_d3(const float* a, const float* b) {
+    double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return (float)__builtin_sqrt(dx * dx + dy * dy + dz * dz);
+}
+static void* tpl_pool(const char* field) {                          /* Pools.<field>; NULL — не прочиталось */
+    void *cls, *f, *pool = NULL;
+    if (!g_safe || !il2cpp_light() || !g_img) return NULL;
+    ensure_attached();
+    cls = A.class_from_name(g_img, "Hassle.Global.Pooling", "Pools");
+    f = cls ? A.class_get_field_from_name(cls, field) : NULL;
+    if (!f) return NULL;
+    A.field_static_get_value(f, &pool);
+    return (pool && hm_obj_ok(pool)) ? pool : NULL;
+}
+/* UI.MiniMap (статический геттер, запасной путь — UI.m_Instance.m_MiniMap) */
+static void* tpl_minimap(void) {
+    void *cls, *m, *exc = NULL, *r, *f, *inst = NULL;
+    if (!g_safe || !il2cpp_light() || !g_img) return NULL;
+    ensure_attached();
+    cls = A.class_from_name(g_img, "Hassle.Graphics.UserInterfaces", "UI");
+    if (!cls) return NULL;
+    m = find_method(cls, "get_MiniMap", 0);
+    if (m) { r = A.runtime_invoke(m, NULL, NULL, &exc); if (!exc && r && hm_obj_ok(r)) return r; }
+    f = A.class_get_field_from_name(cls, "m_Instance");
+    if (f) {
+        A.field_static_get_value(f, &inst);
+        if (inst && hm_obj_ok(inst)) { r = ref_field(inst, "m_MiniMap"); if (r && hm_obj_ok(r)) return r; }
+    }
+    return NULL;
+}
+/* MiniMap.m_NavigationPoint — точка GPS в мировых координатах Unity (x, высота, z). Её пишет MiniMap.GetNavigationPath(x, y, z) как (x, z, y):
+   JS и сервер говорят в системе SAMP (x, y — плоскость, z — высота), а Unity — x, z плоскость, y высота. active: m_IsNavigationActive (-1 — поля нет). */
+static int tpl_nav_point(void* mm, float* p, int* active) {
+    void* k = A.object_get_class(mm); void* f = find_field(k, "m_NavigationPoint"); void* fa; const float* v;
+    if (active) *active = -1;
+    if (!f) return 0;
+    v = (const float*)((char*)mm + A.field_get_offset(f));
+    if (!hm_readable(v, 12) || !tpl_finite(v)) return 0;
+    p[0] = v[0]; p[1] = v[1]; p[2] = v[2];
+    fa = find_field(k, "m_IsNavigationActive");
+    if (fa && active) { const u8* bp = (const u8*)mm + A.field_get_offset(fa); if (hm_readable(bp, 1)) *active = *bp ? 1 : 0; }
+    return 1;
+}
+/* GameObject.activeInHierarchy у компонента; не прочиталось — считаем активным */
+static int tpl_active(void* comp) {
+    void *go = tpl_obj(comp, "get_gameObject"), *m, *exc = NULL, *r;
+    if (!go) return 0;
+    m = find_method(A.object_get_class(go), "get_activeInHierarchy", 0);
+    if (!m) return 1;
+    r = A.runtime_invoke(m, go, NULL, &exc);
+    return (!exc && r && hm_readable((char*)r + HDR, 1)) ? (*((u8*)r + HDR) != 0) : 1;
+}
+/* Checkpoint.Simple / Checkpoint.Race — маркер, который сервер сейчас показал (SetPlayerCheckpoint / SetPlayerRaceCheckpoint); он один на игрока */
+static int tpl_chk_pos(const char* fld, float* out) {
+    void *cls, *f, *obj = NULL, *tr;
+    if (!g_safe || !il2cpp_light() || !g_img) return 0;
+    cls = A.class_from_name(g_img, "Hassle.Entities", "Checkpoint");
+    f = cls ? A.class_get_field_from_name(cls, fld) : NULL;
+    if (!f) return 0;
+    A.field_static_get_value(f, &obj);
+    if (!obj || !hm_obj_ok(obj) || !tpl_active(obj)) return 0;
+    tr = tpl_obj(obj, "get_transform");
+    if (!tr || !tpl_vec(tr, "get_position", out)) return 0;
+    return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);   /* спрятанный маркер уезжает в ноль */
+}
+/* текст подписи: без цветовых кодов {RRGGBB}, переводы строк и табы → пробел, обрезка не рвёт русскую букву */
+static void tpl_clean_text(const char* src, char* dst, int cap) {
+    char t[200]; int i = 0, k = 0, sp = 1;
+    while (src[i] && k < (int)sizeof t - 1) {
+        if (src[i] == '{') {
+            int j = i + 1;
+            while (src[j] && src[j] != '}' && j - i < 10) j++;
+            if (src[j] == '}') { i = j + 1; continue; }
+        }
+        if (src[i] == '\n' || src[i] == '\r' || src[i] == '\t' || src[i] == ' ') { if (!sp) t[k++] = ' '; sp = 1; i++; continue; }
+        t[k++] = src[i++]; sp = 0;
+    }
+    while (k > 0 && t[k - 1] == ' ') k--;
+    t[k] = 0;
+    tpl_copy_name(dst, t, cap);
+}
+/* 3D-подпись: Text3DLabel.m_CreateParams (Position — мировая точка: по LateUpdate её сразу отдают в Camera.WorldToViewportPoint; Text — строка) */
+static void tpl_lb_cb(void* it, void* ctx) {
+    void *sf, *sc, *pf, *tf, *s; char* sp; int shift, poff, toff, n; const u16* ch; char tmp[220]; TplLb* e;
+    (void)ctx;
+    if (g_tpl_nlb >= TPL_LBMAX || !hm_obj_ok(it)) return;
+    sf = find_field(A.object_get_class(it), "m_CreateParams");
+    if (!sf) return;
+    sc = A.class_from_type(A.field_get_type(sf));
+    if (!sc || !A.class_is_valuetype(sc)) return;
+    pf = find_field(sc, "Position"); tf = find_field(sc, "Text");
+    if (!pf || !tf) return;
+    sp = (char*)it + A.field_get_offset(sf);
+    shift = struct_shift(sc);
+    poff = A.field_get_offset(pf) - shift; toff = A.field_get_offset(tf) - shift;
+    if (!hm_readable(sp, 48)) return;
+    s = *(void**)(sp + toff);
+    if (!s || !hm_obj_ok(s)) return;
+    n = A.string_length(s); ch = A.string_chars(s);
+    if (n <= 0 || n > 400 || !ch) return;
+    if (n > 160) n = 160;
+    utf16_to_utf8(ch, n, tmp, sizeof tmp);
+    e = &g_tpl_lb[g_tpl_nlb];
+    e->p[0] = ((float*)(sp + poff))[0]; e->p[1] = ((float*)(sp + poff))[1]; e->p[2] = ((float*)(sp + poff))[2];
+    if (!tpl_finite(e->p)) return;
+    tpl_clean_text(tmp, e->t, sizeof e->t);
+    if (e->t[0]) g_tpl_nlb++;
+}
+/* вставить в снимок по расстоянию от g_tpl_pkRef; подпись — ближайшая 3D-подпись не дальше TPL_LBNEAR */
+static void tpl_pk_add(int id, int kind, const float* p) {
+    int i, j, bi = -1; float d, bd = TPL_LBNEAR + 0.001f; TplPk* e;
+    d = tpl_d3(p, g_tpl_pkRef);
+    for (i = 0; i < g_tpl_npk && g_tpl_pk[i].d <= d; i++) {}
+    if (i >= TPL_PKMAX) return;
+    for (j = (g_tpl_npk < TPL_PKMAX ? g_tpl_npk : TPL_PKMAX - 1); j > i; j--) g_tpl_pk[j] = g_tpl_pk[j - 1];
+    e = &g_tpl_pk[i];
+    e->id = id; e->kind = kind; e->d = d; e->p[0] = p[0]; e->p[1] = p[1]; e->p[2] = p[2]; e->lab[0] = 0;
+    for (j = 0; j < g_tpl_nlb; j++) { float dl = tpl_d3(p, g_tpl_lb[j].p); if (dl < bd) { bd = dl; bi = j; } }
+    if (bi >= 0) tpl_copy_name(e->lab, g_tpl_lb[bi].t, (int)sizeof e->lab);
+    if (g_tpl_npk < TPL_PKMAX) g_tpl_npk++;
+}
+static void tpl_pk_cb(void* it, void* ctx) {
+    float p[3]; void* tr;
+    (void)ctx;
+    if (!hm_obj_ok(it)) return;
+    tr = tpl_obj(it, "get_transform");
+    if (!tr || !tpl_vec(tr, "get_position", p)) return;
+    tpl_pk_add((int)num_field(it, "m_ID", NULL), 0, p);
+}
+/* Собрать снимок: пикапы (Pools.Pickups) + текущий маркер сервера. 1 — пул пикапов прочитался */
+static int tpl_pk_scan(void) {
+    TplCtx c; void *pool, *dict, *arr; int total, ok = 0; float cp[3];
+    g_tpl_pkRef[0] = g_tpl_pkRef[1] = g_tpl_pkRef[2] = 0.0f;
+    if (tpl_ctx_q(&c, 0, 1)) { float me[3]; if (tpl_cur_pos(&c, me) == 1) { g_tpl_pkRef[0] = me[0]; g_tpl_pkRef[1] = me[1]; g_tpl_pkRef[2] = me[2]; } }
+    g_tpl_npk = 0; g_tpl_nlb = 0;
+    pool = tpl_pool("Text3DLables");                                /* (sic) так поле называется в игре */
+    dict = pool ? ref_field_s(pool, "m_Items") : NULL;
+    arr = dict ? ref_field_s(dict, "_entries") : NULL;
+    if (arr) { total = int_field(dict, "_count", "count", NULL, -1); walk_struct_array(arr, total, "value", tpl_lb_cb, NULL); }
+    pool = tpl_pool("Pickups");
+    dict = pool ? ref_field_s(pool, "m_Items") : NULL;
+    arr = dict ? ref_field_s(dict, "_entries") : NULL;
+    if (arr) { total = int_field(dict, "_count", "count", NULL, -1); walk_struct_array(arr, total, "value", tpl_pk_cb, NULL); ok = 1; }
+    if (tpl_chk_pos("Simple", cp)) tpl_pk_add(0, 1, cp);
+    if (tpl_chk_pos("Race", cp)) tpl_pk_add(0, 2, cp);
+    return ok;
+}
+static void tpl_pk_line(int i) {
+    Buf b; char msg[260]; const TplPk* e = &g_tpl_pk[i];
+    b_init(&b, msg, sizeof msg);
+    b_int(&b, i + 1); b_s(&b, ". ");
+    if (e->kind == 0) { b_s(&b, "пикап ID "); b_int(&b, e->id); } else b_s(&b, e->kind == 2 ? "гоночный маркер" : "маркер");
+    b_s(&b, " — "); b_fix(&b, e->d, 0); b_s(&b, " м");
+    if (e->lab[0]) { b_s(&b, "  «"); b_s(&b, e->lab); b_s(&b, "»"); }
+    b_s(&b, "  ("); tpl_b_xyz(&b, e->p); b_ch(&b, ')');
+    chat_say(msg);
+}
+/* «/tpl pick» — обновить и показать список ближайших; «/tpl pick list [стр]» — то же (стр > 1 листает прежний снимок, не пересобирая);
+   «/tpl pick N» — телепорт к N-му из последнего списка (если списка ещё не было — покажет его). num < 0 — числа не было. */
+static void tpl_cmd_pick(int num, int list) {
+    TplCtx c; int i, from, to, pages, page = 1, rescan = 1; Buf b; char msg[220];
+    if (!tpl_ctx(&c, 0)) return;
+    if (num >= 0 && !list && g_tpl_npk) {
+        char lb[100]; Buf x;
+        if (num < 1 || num > g_tpl_npk) {
+            b_init(&b, msg, sizeof msg); b_s(&b, "Пикап/маркер №"); b_int(&b, num); b_s(&b, " — такого номера нет, в списке 1…"); b_int(&b, g_tpl_npk);
+            b_s(&b, " (обновить список: /tpl pick)"); chat_say(msg); return;
+        }
+        b_init(&x, lb, sizeof lb); b_ch(&x, '#'); b_int(&x, num);
+        if (g_tpl_pk[num - 1].lab[0]) { b_ch(&x, ' '); b_s(&x, g_tpl_pk[num - 1].lab); }
+        tpl_goto_ex(g_tpl_pk[num - 1].p, 3, lb, 0);
+        return;
+    }
+    if (list && num > 1 && g_tpl_npk) { page = num; rescan = 0; }
+    if (rescan) {
+        int ok = tpl_pk_scan();
+        if (!ok && !g_tpl_npk) { chat_say("Пикапы: пул не прочитался — подробности в konstt.log"); dlog("tpl: pick: нет Pools.Pickups.m_Items._entries"); return; }
+        if (list && num > 1) page = num;
+    }
+    if (!g_tpl_npk) { chat_say("Пикапов и маркеров рядом нет: сервер подгружает их только вблизи — подойдите к нужному месту и повторите /tpl pick"); return; }
+    pages = (g_tpl_npk + TPL_PAGE - 1) / TPL_PAGE;
+    if (page < 1) page = 1;
+    if (page > pages) page = pages;
+    from = (page - 1) * TPL_PAGE; to = from + TPL_PAGE; if (to > g_tpl_npk) to = g_tpl_npk;
+    b_init(&b, msg, sizeof msg); b_s(&b, "Пикапы и маркеры рядом: "); b_int(&b, g_tpl_npk);
+    if (pages > 1) { b_s(&b, ", страница "); b_int(&b, page); b_s(&b, " из "); b_int(&b, pages); }
+    chat_say(msg);
+    for (i = from; i < to; i++) tpl_pk_line(i);
+    b_init(&b, msg, sizeof msg); b_s(&b, "Телепорт по номеру: /tpl pick N");
+    if (page < pages) { b_s(&b, ";  дальше: /tpl pick list "); b_int(&b, page + 1); }
+    chat_usage(msg);
+}
+/* «/tpl gps» — телепорт на метку, поставленную на карте (/gps). Метка — MiniMap.m_NavigationPoint; если её нет, а сервер показывает маркер (чекпоинт) — на него */
+static void tpl_cmd_gps(void) {
+    TplCtx c; void* mm; float np[3], cp[3], me[3], v[3]; int act = -1, haveN = 0, nz = 0, haveMe, useChk = 0, staleN = 0;
+    if (!tpl_ctx(&c, 0)) return;
+    haveMe = tpl_cur_pos(&c, me) == 1;
+    mm = tpl_minimap();
+    if (mm) haveN = tpl_nav_point(mm, np, &act);
+    nz = haveN && (np[0] != 0.0f || np[1] != 0.0f || np[2] != 0.0f);
+    if (!(nz && act != 0)) {                                         /* GPS-метки нет или она снята — смотрим маркер сервера */
+        if (tpl_chk_pos("Race", cp) || tpl_chk_pos("Simple", cp)) useChk = 1;
+        else if (nz) staleN = 1;                                     /* снята, но координаты остались — телепортируем на последнюю */
+    }
+    if (!useChk && !nz) {
+        chat_say(mm ? "Метки нет: откройте карту (/gps), поставьте метку или маршрут и повторите /tpl gps" : "/tpl gps: карта (MiniMap) не нашлась — подробности в konstt.log");
+        if (!mm) dlog("tpl: gps: UI.MiniMap не прочитался");
+        else if (!haveN) dlog("tpl: gps: у MiniMap нет поля m_NavigationPoint");
+        return;
+    }
+    if (useChk) { tpl_goto_ex(cp, 3, "маркер сервера", 0); return; } /* у маркера высота точная — встаём ровно на него */
+    v[0] = np[0]; v[2] = np[2];
+    if (np[1] > -50.0f && np[1] < 3000.0f && np[1] != 0.0f) v[1] = np[1] + 1.5f;       /* высота метки (если сервер её знает) — только точка, откуда искать землю вниз */
+    else if (haveMe) v[1] = me[1];
+    else { chat_say("/tpl gps: не удалось прочитать вашу высоту — используйте /tpl to X Z с координатами метки"); return; }
+    tpl_goto_ex(v, 3, staleN ? "последняя метка GPS (уже снята)" : "метка GPS", 1);
+    { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "tpl: gps: m_NavigationPoint = "); tpl_b_xyz(&x, np); b_s(&x, ", активна "); b_int(&x, act); dlog(lg); }
+}
+
 /* ───────────── команда ───────────── */
 static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
     chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
+    chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
 static void native_tpl_cmd(void* self, void* args, void* mi) {
@@ -1167,8 +1425,10 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         tpl_cmd_int(id, have);
         return;
     }
+    if (a.mode == 9) { tpl_cmd_gps(); return; }
+    if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList); return; }
     if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
-    if (a.mode == 3 || a.mode == 4 || a.mode == 6) {
+    if (a.mode == 3 || a.mode == 4 || a.mode == 6) {gp
         if (!a.nameSet) { chat_usage(a.mode == 3 ? "Укажите имя точки: /tpl save дом" : a.mode == 4 ? "Укажите имя точки: /tpl go дом (список: /tpl list)" : "Укажите имя точки: /tpl del дом (список: /tpl list)"); return; }
         if (a.mode == 3) tpl_cmd_save(a.name); else if (a.mode == 4) tpl_cmd_go(a.name); else tpl_cmd_del(a.name);
         return;
@@ -1182,7 +1442,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N | gps | pick [N]");
     return NULL;
 }
 #ifndef KONSTT_TEST
