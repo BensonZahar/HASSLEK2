@@ -11,7 +11,7 @@
  *   Кнопки (как в airbrake из SAMP, только на экране): джойстик — лететь; кнопка ПРЫЖОК (держите) — вверх; ПРИСЕД (двойное касание джойстика и
  *                         удержание, так игра включает присед) — вниз. Камерой вверх/вниз тоже можно (режим 3d). /air keys — выключить/включить эти кнопки.
  *   /air up [м]  /air down [м]   сместиться вверх/вниз сразу на N метров (по умолчанию 1 м)
- *   /air speed N          скорость полёта, м/с (по умолчанию 6, до 40)
+ *   /air speed N          скорость полёта, м/с (по умолчанию 6, до 1000)
  *   /air flat | 3d        flat — по джойстику летите только горизонтально (высота — командами up/down);
  *                         3d (по умолчанию) — вперёд летите туда, куда смотрит камера, в т.ч. вверх/вниз: посмотрели вниз на кучу — и опускаетесь к ней
  *   /air stand            вкл/выкл (по умолчанию ВКЛ): в полёте персонаж держит обычную анимацию (стоит/идёт по джойстику), а не падает с раскинутыми руками
@@ -65,7 +65,7 @@ extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct t
 #define AIR_LIFT 2.5f
 #define AIR_MAXLIFT 60.0f
 #define AIR_SPEED 6.0f
-#define AIR_MAXSPEED 40.0f
+#define AIR_MAXSPEED 1000.0f
 #define AIR_TICK_US 8000                          /* период рабочего потока; реально тик идёт раз в кадр (пока прошлый не отработал, новый не шлём) */
 #define AIR_NEAR 8
 #define AIR_JUMP 6.0f                             /* если игра сама сдвинула вас дальше, чем на столько метров за кадр — считаем это перестановкой и берём новую точку */
@@ -784,7 +784,7 @@ static void native_air_cmd(void* self, void* args, void* mi) {
         return;
     }
     if (seq(tok[0], "speed") || seq(tok[0], "скорость")) {
-        if (nt < 2 || !air_num(tok[1], &v)) { b_init(&b, m, sizeof m); b_s(&b, "/air: скорость сейчас "); b_fix(&b, g_air_speed, 1); b_s(&b, " м/с. Задать: /air speed 12 (до 40)"); chat_say(m); return; }
+        if (nt < 2 || !air_num(tok[1], &v)) { b_init(&b, m, sizeof m); b_s(&b, "/air: скорость сейчас "); b_fix(&b, g_air_speed, 1); b_s(&b, " м/с. Задать: /air speed 12 (до 1000)"); chat_say(m); return; }
         if (v < 0.5f) v = 0.5f;
         if (v > AIR_MAXSPEED) v = AIR_MAXSPEED;
         g_air_speed = v;
