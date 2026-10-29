@@ -14,6 +14,7 @@
  *   /air speed N          скорость полёта, м/с (по умолчанию 6, до 40)
  *   /air flat | 3d        flat — по джойстику летите только горизонтально (высота — командами up/down);
  *                         3d (по умолчанию) — вперёд летите туда, куда смотрит камера, в т.ч. вверх/вниз: посмотрели вниз на кучу — и опускаетесь к ней
+ *   /air stand            вкл/выкл (по умолчанию ВКЛ): в полёте персонаж держит обычную анимацию (стоит/идёт по джойстику), а не падает с раскинутыми руками
  *   /air npc              ближайшие NPC: ID, расстояние, на сколько выше/ниже вас (ID — те же, что в /vtune find npc и в серверном коде)
  *   /air npc ID  |  /air to ID    перелететь на 3 м над NPC с этим ID (включит полёт сам)
  *   /air watch            вкл/выкл: пока летите, мод пишет в чат ID ближайшего NPC, когда он меняется (подлетели к другому — увидите, кто это)
@@ -44,6 +45,18 @@
  *     (Player.SetPosition(pos, findHeight=true) — тот же вызов, что у «/tpl to X Z»), чтобы не разбиться; /air land делает это всегда.
  *   • В машине режим не работает (при посадке выключается сам). Если игра переставила вас далеко (сервер вернул/телепортировал) — держим новую точку.
  *
+ * «Как на ровном» (/air stand) — по дампу IL2CPP и дизассемблированию libil2cpp.so (RVA из dump.cs)
+ *   • Левитация в кадре — это способность Fall (клип m_FallDownClip, руки в стороны). Fall.CanStartAbility = «не isOnGround И FindGround(m_MinFallHeight) ничего не нашёл»
+ *     (интерфейсные слоты ICharacterMovement 10 — isOnGround, 20 — FindGround(out, maxDistance); дальше читается байт hitGround результата). Пока Fall жив, Moving остановлен.
+ *   • Moving.CanStartAbility земли НЕ проверяет — это обычная анимация «стоит/идёт» (LinearMixer, параметр от Character.IsMoving и клавиш). Значит достаточно не пускать Fall.
+ *   • Поэтому мод на время полёта ставит у способности Fall поле m_MinFallHeight = 500 (Character.m_Abilities → элемент класса Fall): под персонажем всегда «есть земля»,
+ *     Fall не стартует, остаётся Moving. Исходное значение возвращается при выключении. Если Fall всё же успел стартовать (например, вы ниже поверхности земли и под вами пусто),
+ *     каждый тик его принудительно останавливаем (Ability.StopAbility(force)).
+ *   • Присед (Crouch) и прыжок (Jump) требуют isOnWalkableGround, в воздухе они не стартуют — как и раньше, анимации приседа в полёте нет; вниз вы летите по состоянию кнопки.
+ *
+ * Спуск по приседу: двойной тап по джойстику включает «<Keyboard>/c» и держит его, пока палец не отпущен (Hud.js: touchStart / touchEnd). Пока кнопка зажата, высота
+ * уменьшается на speed·dt каждый кадр, нижней границы нет (земля не держит: constrainToGround и коллизии выключены), так что можно уходить и под поверхность — к NPC, застрявшим в текстурах.
+ *
  * ВАЖНО: код не запускался на устройстве — собран только компилятором. Если что-то не сработало, /air status и HLOG/konstt.log (строки «air:»).
  */
 #pragma once
@@ -58,6 +71,7 @@ extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct t
 #define AIR_NEAR 8
 #define AIR_JUMP 6.0f                             /* если игра сама сдвинула вас дальше, чем на столько метров за кадр — считаем это перестановкой и берём новую точку */
 #define AIR_AUTOLAND 5.0f                         /* выше этого над точкой включения при выключении ставим на землю */
+#define AIR_FALLH 500.0f                          /* Fall.m_MinFallHeight на время полёта: «земля под ногами есть всегда» */
 #define AIR_TAP_STEP 0.5f                         /* короткий тап по ПРЫЖКУ/ПРИСЕДУ сразу сдвигает на столько метров (иначе тап длиной в 2-3 кадра почти не виден) */
 
 static volatile int g_air_on;
@@ -79,6 +93,9 @@ static void* g_air_ctrl;                          /* контроллер, к к
 static int g_air_oCg = -1, g_air_oDc = -1, g_air_oRb = -1, g_air_saved;     /* исходные значения флагов (-1 — не прочиталось, считаем «включено») */
 static int g_air_jumps;
 static int g_air_watchId = -1; static long long g_air_watchT;
+static int g_air_stand = 1;                       /* 1 — не пускаем Fall (левитацию), держим обычную анимацию */
+static void* g_air_fall;                          /* способность Fall текущего персонажа */
+static float g_air_oFallH; static int g_air_fallSaved;
 static float g_air_rawIn[3];                      /* последние сырые значения ввода — для /air status */
 
 /* ───────────── мелкие помощники ───────────── */
@@ -185,6 +202,44 @@ static void air_zero_vel(void* mv) {
     A.runtime_invoke(m, mv, args, &exc);
 }
 
+
+/* float-поле по имени (в самом объекте). 1 — записали */
+static int air_field_f(void* obj, const char* name, float v, float* old) {
+    void* f = find_field(A.object_get_class(obj), name); float* p;
+    if (!f || (A.field_get_flags(f) & 0x10)) return 0;
+    p = (float*)((char*)obj + A.field_get_offset(f));
+    if (!hm_readable(p, 4)) return 0;
+    if (old) *old = *p;
+    *p = v;
+    return 1;
+}
+/* способность персонажа по имени класса (Character.m_Abilities — List<Ability>) */
+static void* air_find_ability(void* ctrl, const char* cls) {
+    void *list, *items; int n, i; long len; char* data;
+    list = ctrl ? ref_field_s(ctrl, "m_Abilities") : NULL;
+    if (!list || !hm_obj_ok(list)) return NULL;
+    items = ref_field_s(list, "_items");
+    if (!items || !hm_obj_ok(items)) return NULL;
+    n = int_field(list, "_size", "size", NULL, -1);
+    len = *(long*)((char*)items + 3 * sizeof(void*));
+    if (len <= 0 || len > 64) return NULL;
+    if (n < 0 || n > len) n = (int)len;
+    data = (char*)items + 4 * sizeof(void*);
+    for (i = 0; i < n; i++) {
+        void* a = *(void**)(data + (uptr)i * sizeof(void*));
+        if (!a || !hm_obj_ok(a)) continue;
+        if (seq(A.class_get_name(A.object_get_class(a)), cls)) return a;
+    }
+    return NULL;
+}
+static void air_stop_ability(void* ab) {                           /* Ability.StopAbility(bool force) */
+    void *m, *exc = NULL, *args[1]; u8 force = 1;
+    m = find_method(A.object_get_class(ab), "StopAbility", 1);
+    if (!m) return;
+    args[0] = &force;
+    A.runtime_invoke(m, ab, args, &exc);
+}
+
 /* ───────────── контекст: игрок и его компоненты (главный поток) ───────────── */
 typedef struct { void *me, *ctrl, *mv, *rb, *etr, *mtr, *veh; } AirCtx;
 static int air_ctx(AirCtx* c, int quiet) {
@@ -217,9 +272,30 @@ static int air_mypos(const AirCtx* c, float* mP, float* eP) {
     return ok;
 }
 
+
+/* ───────────── «как на ровном»: не даём стартовать Fall ───────────── */
+static void air_stand(const AirCtx* c, int on) {
+    if (on) {
+        float old = 0.0f;
+        if (!g_air_stand || !c->ctrl) return;
+        g_air_fall = air_find_ability(c->ctrl, "Fall");
+        if (!g_air_fall) { dlog("air: у персонажа не найдена способность Fall — анимацию «как на ровном» не включить"); return; }
+        if (air_field_f(g_air_fall, "m_MinFallHeight", AIR_FALLH, &old)) {
+            if (!g_air_fallSaved) { g_air_oFallH = old; g_air_fallSaved = 1; }
+            dlog_i("air: Fall.m_MinFallHeight поднят, было (×100) ", (long)(old * 100.0f));
+        } else dlog("air: Fall.m_MinFallHeight не записался");
+        if (air_get_bool(g_air_fall, "get_IsActive", 0)) air_stop_ability(g_air_fall);     /* уже падали — остановить */
+    } else {
+        void* f = c->ctrl ? air_find_ability(c->ctrl, "Fall") : NULL;
+        if (f && g_air_fallSaved) air_field_f(f, "m_MinFallHeight", g_air_oFallH, NULL);
+        g_air_fall = NULL; g_air_fallSaved = 0;
+    }
+}
+
 /* ───────────── флаги «сквозь всё» ───────────── */
 static void air_flags(const AirCtx* c, int on) {
     int cgOk = 0, dcOk = 0, rbOk = 0;
+    air_stand(c, on);
     if (!c->mv) return;
     if (on && !g_air_saved) {                                        /* исходные значения запоминаем один раз за включение */
         int old = -1;
@@ -539,7 +615,7 @@ static int air_enter(float lift, const float* target /* NULL — поднять�
 static void air_exit(const char* why, int land) {
     AirCtx c; float eP[3]; int doLand = land;
     if (!__atomic_load_n(&g_air_on, __ATOMIC_ACQUIRE) && !g_air_saved) return;
-    if (g_air_hold[1] - g_air_y0 > AIR_AUTOLAND) doLand = 1;
+    if (g_air_hold[1] - g_air_y0 > AIR_AUTOLAND || g_air_y0 - g_air_hold[1] > 1.0f) doLand = 1;    /* высоко над точкой включения или ниже неё (спустились под землю) — ставим на поверхность */
     __atomic_store_n(&g_air_on, 0, __ATOMIC_RELEASE);
     if (air_ctx(&c, 1)) {
         air_flags(&c, 0);
@@ -554,7 +630,7 @@ static void air_exit(const char* why, int land) {
                 if (exc) { exc_text(exc, et, sizeof et); dlog2("air: посадка: SetPosition бросил исключение: ", et); }
             }
         }
-    } else { g_air_saved = 0; g_air_ctrl = NULL; }
+    } else { g_air_saved = 0; g_air_ctrl = NULL; g_air_fall = NULL; g_air_fallSaved = 0; }
     dlog2("air: выключен: ", why);
 }
 
@@ -566,6 +642,7 @@ static void air_tick(void) {
     if (!air_ctx(&c, 1) || !c.mv) { air_exit("персонаж недоступен", 0); chat_say("/air: персонаж пропал (смерть/смена мира) — полёт выключен"); return; }
     if (c.veh) { air_exit("вы сели в машину", 0); chat_say("/air: вы в машине — полёт выключен"); return; }
     if (c.ctrl != g_air_ctrl) air_flags(&c, 1);                      /* персонаж пересоздан: флаги — на новые объекты */
+    if (g_air_stand && g_air_fall && hm_obj_ok(g_air_fall) && air_get_bool(g_air_fall, "get_IsActive", 0)) air_stop_ability(g_air_fall);   /* Fall всё же стартовал (под вами пусто) — гасим */
     if (!air_mypos(&c, cur, NULL)) return;
     now = air_now_ns();
     dt = (float)((double)(now - g_air_tPrev) / 1e9);
@@ -648,7 +725,7 @@ static int air_tokens(void* arr, char tok[][32], int maxn) {
 }
 static void air_usage(void) {
     chat_usage("/air — полёт вкл/выкл. Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику, второй тап держать) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
-    chat_usage("/air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
+    chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
     char m[300]; Buf b; AirCtx c; float p[3];
@@ -656,6 +733,7 @@ static void air_status(void) {
     b_s(&b, "/air: "); b_s(&b, g_air_on ? "ВКЛ" : "выкл");
     b_s(&b, ", скорость "); b_fix(&b, g_air_speed, 1); b_s(&b, " м/с, режим "); b_s(&b, g_air_look3d ? "3d (куда смотрит камера)" : "flat (горизонтально)");
     b_s(&b, ", слежка за NPC: "); b_s(&b, g_air_watch ? "да" : "нет");
+    b_s(&b, ", как на ровном: "); b_s(&b, g_air_stand ? (g_air_fall ? "да (Fall найден)" : "да") : "нет");
     chat_say(m);
     if (g_air_on && air_ctx(&c, 1) && air_mypos(&c, p, NULL)) {
         b_init(&b, m, sizeof m); b_s(&b, "  держу "); air_b_xyz(&b, g_air_hold); b_s(&b, ", сейчас "); air_b_xyz(&b, p);
@@ -728,6 +806,13 @@ static void native_air_cmd(void* self, void* args, void* mi) {
     if (seq(tok[0], "keys") || seq(tok[0], "кнопки")) {
         g_air_keys = !g_air_keys;
         chat_say(g_air_keys ? "/air: кнопки включены — ПРЫЖОК (держать) вверх, ПРИСЕД (двойной тап по джойстику и держать) вниз" : "/air: кнопки вверх/вниз выключены (высота — камерой в 3d или /air up|down)");
+        return;
+    }
+    if (seq(tok[0], "stand") || seq(tok[0], "ровно2") || seq(tok[0], "анимация")) {
+        AirCtx c;
+        g_air_stand = !g_air_stand;
+        if (g_air_on && air_ctx(&c, 1)) air_stand(&c, g_air_stand);
+        chat_say(g_air_stand ? "/air: анимация «как на ровном» включена (в полёте идёте/стоите, а не падаете с раскинутыми руками)" : "/air: анимация «как на ровном» выключена — в полёте обычная анимация падения");
         return;
     }
     if (seq(tok[0], "watch") || seq(tok[0], "слежка")) {
