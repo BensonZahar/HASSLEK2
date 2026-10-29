@@ -1,4 +1,4 @@
-/*
+]/*
  * hassle_tpl.c — необязательный модуль «/tpl»: маленький телепорт в любую сторону от камеры (выбраться, когда NPC/игрок заглючил
  * и /nocol не помог).
  *
@@ -24,6 +24,8 @@
  *                        считают, что вы стоите там, где включили режим, а вы свободно ходите и телепортируетесь (/tpl …) в другом месте.
  *                        Без аргумента — переключить. «off» — выключить (сервер получит настоящую позицию: вы «появитесь» на новом месте),
  *                        «back» — вернуться на точку включения и выключить. «/tpl ghost unhook» — вернуть код игры в исходный вид.
+ *                        «/tpl ghost tap [сек]» — на несколько секунд (по умолчанию 4, до 60) ПУСТИТЬ пакеты: чтобы наступить на метку/маркер
+ *                        (переодеться, взять работу и т.п.). Потом призрак включается сам. Пока окно открыто, сервер видит вас там, где вы стоите.
  *   /tpl int N           сменить интерьер на номер N (0..255, 0 — улица). Только номер, координаты не нужны и тело не двигается.
  *                        «/tpl int» без номера — показать текущий (он же в строке «/tpl pos»). ВАЖНО: номер — это ТОЛЬКО метка (освещение
  *                        «в помещении» + сообщение серверу), а не место: сам интерьер — обычный участок карты со своими координатами.
@@ -69,6 +71,11 @@
  *     4 затираемые инструкции не зависят от адреса; иначе ничего не трогаем. Только arm64.
  *   • Сервер при этом просто не получает пакеты: он помнит последнюю позицию (ту, где вы включили режим) и показывает вас там
  *     всем (и NPC, и игрокам). Это РАССИНХРОН, а не невидимость: игроки видят вас стоящим на старом месте.
+ *   • Почему в призраке нельзя наступить на метку: метки/чекпоинты/зоны на этом сервере проверяет СЕРВЕР по позиции, которую он знает
+ *     (в его коде это SetPlayerCheckpoint, CreateDynamicCP/Sphere, IsPlayerInRangeOfPoint…), а в призраке он знает старую точку.
+ *     Значит, чтобы метка сработала, серверу нужно показать позицию у метки — это и делает «tap». Всё, что видит сервер, видят и его NPC,
+ *     поэтому на время окна вас видно: лучше открывать его, пока рядом нет NPC. Окно закрывается само: заглушка сравнивает время при
+ *     каждой отправке (g_gh_on = 2 — окно, 1 — призрак, 0 — выкл.).
  *   • Чего НЕ перехватываем: пакеты машины (Drive/Passenger) и выстрела (SendBulletSyncData). В машине и при стрельбе сервер
  *     узнает настоящую позицию — в призраке не садитесь в машину и не стреляйте. Любая серверная проверка рассинхрона позиций
  *     может кикнуть или забанить: режим на ваш риск.
@@ -356,7 +363,9 @@ extern long pwrite(int, const void*, unsigned long, long);
 static const char* const g_gh_siteName[GH_SITES] = { "SendOnFootFullSyncData", "SendAimSyncData" };
 static const int g_gh_siteArgc[GH_SITES] = { 1, 0 };     /* SendOnFootFullSyncData(bool force), SendAimSyncData() */
 
-static volatile int g_gh_on;                             /* 1 — пакеты позиции и прицела не уходят */
+extern int clock_gettime(int, void*);                    /* как в mem/route: struct timespec = два long */
+static volatile int g_gh_on;                             /* 0 — выкл.; 1 — призрак (пакеты позиции и прицела не уходят); 2 — окно «tap»: пакеты идут до g_gh_until */
+static volatile long long g_gh_until;                    /* конец окна, мс по CLOCK_MONOTONIC */
 static volatile unsigned g_gh_hits;                      /* сколько пакетов хук проглотил — по нему видно, что перехват живой */
 static float g_gh_pos[3];                                /* где вы были в момент включения (где сервер вас «помнит») */
 static int g_gh_havePos;
@@ -364,10 +373,19 @@ static int g_gh_state;                                   /* 1 — перехва
 static char g_gh_err[160];
 
 /* Зовётся из заглушки в начале SendOnFootFullSyncData / SendAimSyncData (главный поток). 1 — метод пропустить. Только атомики, без вызовов IL2CPP. */
+static long long gh_now_ms(void) { long ts[2]; ts[0] = 0; ts[1] = 0; clock_gettime(1, ts); return (long long)ts[0] * 1000 + ts[1] / 1000000; }
 __attribute__((noinline, used))
 static int gh_hook(void* player, void* a1) {
+    int s = __atomic_load_n(&g_gh_on, __ATOMIC_ACQUIRE);
     (void)player; (void)a1;
-    if (!__atomic_load_n(&g_gh_on, __ATOMIC_ACQUIRE)) return 0;
+    if (s == 0) return 0;
+    if (s == 2) {
+        if (gh_now_ms() < __atomic_load_n(&g_gh_until, __ATOMIC_ACQUIRE)) return 0;       /* окно открыто — пакет уходит как обычно */
+        {
+            int exp = 2;
+            __atomic_compare_exchange_n(&g_gh_on, &exp, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);   /* окно кончилось — снова призрак */
+        }
+    }
     __atomic_fetch_add(&g_gh_hits, 1u, __ATOMIC_RELAXED);
     return 1;
 }
@@ -526,16 +544,38 @@ static int gh_install(void) { return gh_fail("поддерживается то�
 static void gh_unhook(void) { __atomic_store_n(&g_gh_on, 0, __ATOMIC_RELEASE); }
 #endif
 
-static void tpl_cmd_ghost(int sub) {
-    TplCtx c; Buf b; char msg[300];
+static void tpl_cmd_ghost(int sub, float secs) {            /* secs — для «tap»: -1 — не указано */
+    TplCtx c; Buf b; char msg[300]; int st = __atomic_load_n(&g_gh_on, __ATOMIC_ACQUIRE);
     if (sub == 4) {
         gh_unhook();
         chat_say(g_gh_state ? "Призрак: выключен, но вернуть код игры не удалось (см. konstt.log)" : "Призрак: выключен, перехваты сняты, код игры в исходном виде");
         return;
     }
-    if (sub == 0) sub = g_gh_on ? 2 : 1;
+    if (sub == 5) {                                                  /* tap: окно синхронизации — чтобы наступить на метку */
+        long long ms; float cur[3];
+        if (!st) { chat_say("Призрак выключен — окно не нужно, сервер и так видит вас. Включить: /tpl ghost on"); return; }
+        if (secs < 0) secs = 4.0f;
+        if (secs < 1.0f) secs = 1.0f;
+        if (secs > 60.0f) secs = 60.0f;
+        ms = (long long)(secs * 1000.0f + 0.5f);
+        if (tpl_ctx(&c, 0) && tpl_cur_pos(&c, cur)) { g_gh_pos[0] = cur[0]; g_gh_pos[1] = cur[1]; g_gh_pos[2] = cur[2]; g_gh_havePos = 1; }   /* сервер запомнит это место */
+        __atomic_store_n(&g_gh_until, gh_now_ms() + ms, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_gh_on, 2, __ATOMIC_RELEASE);
+        b_init(&b, msg, sizeof msg);
+        b_s(&b, "Окно синхронизации "); b_fix(&b, secs, 1); b_s(&b, " с: сервер и NPC видят вас там, где вы стоите. Наступите на метку и не уходите с неё");
+        chat_say(msg);
+        chat_usage("Потом призрак включится сам (сервер запомнит это место). Закрыть раньше: /tpl ghost on");
+        dlog2("/tpl ghost: ", msg);
+        return;
+    }
+    if (sub == 0) sub = st ? 2 : 1;
     if (sub == 1) {
-        if (g_gh_on) { chat_say("Призрак уже включён (выключить: /tpl ghost off, вернуться: /tpl ghost back)"); return; }
+        if (st == 2) {                                               /* «on» во время окна — закрыть его досрочно */
+            __atomic_store_n(&g_gh_on, 1, __ATOMIC_RELEASE);
+            chat_say("Окно синхронизации закрыто, призрак снова включён");
+            return;
+        }
+        if (st) { chat_say("Призрак уже включён (выключить: /tpl ghost off, вернуться: /tpl ghost back, наступить на метку: /tpl ghost tap)"); return; }
         if (!tpl_ctx(&c, 1)) return;                                 /* пешком: пакеты машины мы не перехватываем */
         if (!tpl_cur_pos(&c, g_gh_pos)) { chat_say("Призрак: не удалось прочитать вашу позицию (подробности в konstt.log)"); return; }
         g_gh_havePos = 1;
@@ -544,11 +584,11 @@ static void tpl_cmd_ghost(int sub) {
         b_init(&b, msg, sizeof msg);
         b_s(&b, "Призрак ВКЛЮЧЁН: сервер и NPC считают, что вы стоите здесь: "); tpl_b_xyz(&b, g_gh_pos);
         chat_say(msg);
-        chat_usage("Теперь двигайтесь или телепортируйтесь (/tpl …). Не садитесь в машину и не стреляйте — это выдаст позицию. Выключить: /tpl ghost off, вернуться на место: /tpl ghost back");
+        chat_usage("Теперь двигайтесь или телепортируйтесь (/tpl …). Не садитесь в машину и не стреляйте — это выдаст позицию. Метки в призраке не срабатывают: /tpl ghost tap. Выключить: /tpl ghost off, вернуться: /tpl ghost back");
         dlog2("/tpl ghost: ", msg);
         return;
     }
-    if (!g_gh_on) { chat_say("Призрак и так выключен"); return; }
+    if (!st) { chat_say("Призрак и так выключен"); return; }
     if (sub == 3) {
         if (!g_gh_havePos) { chat_say("Призрак: точка включения неизвестна — выключаю без возврата"); }
         else {
@@ -565,7 +605,7 @@ static void tpl_cmd_ghost(int sub) {
 }
 static void tpl_status_extra(void) {
     char m[200]; Buf b; b_init(&b, m, sizeof m);
-    b_s(&b, "Призрак: "); b_s(&b, g_gh_on ? "ВКЛЮЧЁН" : "выключен");
+    b_s(&b, "Призрак: "); b_s(&b, g_gh_on == 2 ? "окно синхронизации (tap)" : (g_gh_on ? "ВКЛЮЧЁН" : "выключен"));
     b_s(&b, g_gh_state ? ", перехват стоит" : ", перехват не поставлен");
     b_s(&b, ", пакетов не отправлено: "); b_int(&b, (long)g_gh_hits);
     chat_say(m);
@@ -644,12 +684,13 @@ static int tpl_word(const char* t) {
     if (seq(t, "int") || seq(t, "interior") || seq(t, "инт") || seq(t, "интерьер")) return 20;
     return -1;
 }
-/* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 0 — не оно */
+/* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
 static int tpl_gword(const char* t) {
-    if (seq(t, "on") || seq(t, "1") || seq(t, "вкл") || seq(t, "включить")) return 1;
-    if (seq(t, "off") || seq(t, "0") || seq(t, "выкл") || seq(t, "выключить")) return 2;
+    if (seq(t, "on") || seq(t, "вкл") || seq(t, "включить")) return 1;
+    if (seq(t, "off") || seq(t, "выкл") || seq(t, "выключить")) return 2;
     if (seq(t, "back") || seq(t, "назад") || seq(t, "вернись") || seq(t, "возврат") || seq(t, "return")) return 3;
     if (seq(t, "unhook") || seq(t, "снять")) return 4;
+    if (seq(t, "tap") || seq(t, "sync") || seq(t, "окно") || seq(t, "метка") || seq(t, "маркер")) return 5;
     return 0;
 }
 /* вся строка — число («2», «2.5», «2,5»)? */
@@ -696,7 +737,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
         tpl_copy_name(a->name, tok, TPL_NAME); a->nameSet = a->name[0] ? 1 : 0;
         return;
     }
-    if (a->mode == 7) { int g = tpl_gword(tok); if (g) { a->gsub = g; return; } }     /* после «ghost»: on / off / back / unhook */
+    if (a->mode == 7) { int g = tpl_gword(tok); if (g) { a->gsub = g; return; } }     /* после «ghost»: on / off / back / unhook / tap */
     if (a->mode == 8 && tpl_num(tok, &v)) { a->iid = (int)(v + 0.5f); a->iidSet = 1; return; }   /* после «int»: номер (0 — валидный, не подрезаем) */
     if (a->mode == 2 && tpl_snum(tok, &v)) {                       /* после «to» числа — это координаты (с минусом можно) */
         if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
@@ -936,7 +977,7 @@ static void tpl_cmd_list(int page) {
 static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
-    chat_usage("/tpl ghost [on|off|back] — призрак: сервер и NPC не видят, что вы двигаетесь;  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
+    chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
@@ -974,7 +1015,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         tpl_goto(a.c, a.nc, NULL);
         return;
     }
-    if (a.mode == 7) { tpl_cmd_ghost(a.gsub); return; }
+    if (a.mode == 7) { tpl_cmd_ghost(a.gsub, a.numSet ? a.rawNum : -1.0f); return; }       /* число после «ghost tap» — секунды окна */
     if (a.mode == 8) {
         int have = a.iidSet || a.numSet;
         int id = a.iidSet ? a.iid : (a.numSet ? (int)(a.rawNum + 0.5f) : 0);        /* «/tpl 5 int» — число стояло до слова int */
@@ -996,7 +1037,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back] | int N");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N");
     return NULL;
 }
 #ifndef KONSTT_TEST
