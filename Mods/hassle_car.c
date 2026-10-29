@@ -103,10 +103,12 @@ static int car_tokens(void* arr, char tok[][32], int maxn) {
         utf16_to_utf8(ch, cnt, tmp, sizeof tmp);
         for (k = 0; tmp[k]; k++) if (tmp[k] >= 'A' && tmp[k] <= 'Z') tmp[k] = (char)(tmp[k] + 32);
         while (tmp[p]) {
-            int q = 0;
+            char w[32]; int q = 0;
             while (tmp[p] == ' ') p++;
-            while (tmp[p] && tmp[p] != ' ') { if (q < 31 && n < maxn) tok[n][q++] = tmp[p]; p++; }
-            if (n < maxn && q) { tok[n][q] = 0; n++; }
+            while (tmp[p] && tmp[p] != ' ') { if (q < 31) w[q++] = tmp[p]; p++; }
+            w[q] = 0;
+            if (!q || w[0] == '/' || seq(w, "vtune")) continue;     /* сама команда может входить в массив (как у /tpl) */
+            if (n < maxn) { int z; for (z = 0; z <= q; z++) tok[n][z] = w[z]; n++; }
         }
     }
     return n;
