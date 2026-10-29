@@ -10,7 +10,7 @@
  *   /voice status    состояние: идёт ли запись, стоит ли перехват, сколько пакетов и файлов
  *   /voice folder    куда сохраняются файлы
  *   /voice unhook    вернуть код игры в исходный вид (запись выключается)
- *   /voice tg on     включить запись и слать каждую реплику в Telegram голосовым сообщением с подписью «🎙 Ник #id · рядом · 3.2 с»
+ *   /voice tg on     включить запись и слать каждую реплику в Telegram голосовым сообщением с подписью «🎙 Ник[id] · 📏 4.2 м · 3.2 с» (расстояние до говорящего, как в Code3/Near)
  *   /voice tg off    перестать слать в Telegram (запись в файлы не трогается)
  *   /voice tg test   отправить в Telegram последнюю записанную реплику (проверка токена и чата)
  *   /voice tg        состояние отправки: сколько ушло, сколько ошибок, последняя причина
@@ -288,6 +288,28 @@ static int vc_nick(int id, char* out, int cap) {
     return o > 0;
 }
 
+/* ───────────── расстояние до говорящего (3D, как «d» в /near) ─────────────
+   Позиции — из последних пакетов синхронизации: говорящий — PlayerPool.Get(id), вы — LocalPlayer (read_pos_k учитывает пешком/водитель/пассажир).
+   Зовётся только из писателя (как vc_nick). Нет пула, игрока или позиции — -1. */
+static float vc_dist(int id) {
+    void *pool, *kls, *m, *pl, *me, *exc = NULL; void* args[1]; int v = id;
+    float a[3], c[3]; double dx, dy, dz;
+    if (!g_img || !A.runtime_invoke) return -1.0f;
+    pool = current_pool();
+    if (!pool) return -1.0f;
+    kls = A.object_get_class(pool);
+    m = kls ? find_method(kls, "Get", 1) : NULL;
+    if (!m) return -1.0f;
+    args[0] = &v;
+    pl = A.runtime_invoke(m, pool, args, &exc);
+    if (exc || !pl) return -1.0f;
+    me = local_player();
+    if (!me || me == pl) return -1.0f;
+    if (!read_pos_k(pl, a, NULL) || !read_pos_k(me, c, NULL)) return -1.0f;
+    dx = (double)a[0] - c[0]; dy = (double)a[1] - c[1]; dz = (double)a[2] - c[2];
+    return (float)__builtin_sqrt(dx * dx + dy * dy + dz * dz);
+}
+
 /* ───────────── файлы ───────────── */
 typedef struct {
     void* st; int fd, active;
@@ -296,6 +318,7 @@ typedef struct {
     u32 serial, seq; int pkts;
     u8 held[VC_PKT_MAX]; int heldLen, heldSamples;  /* последний пакет ждёт следующего, чтобы последняя страница получила флаг конца потока */
     u16 pid; u8 use3d, attach, effect; int bass;
+    float dist;                                   /* 3D-расстояние до говорящего в начале реплики, м; < 0 — нет данных */
     char path[360], nick[48];
 } VcSess;
 static VcSess g_vc_sess[VC_SESS];
@@ -337,7 +360,7 @@ static const char* vc_kind(const VcPkt* p) {
 #define VC_TG_MIN_MS   400                   /* короче — щелчки и обрывки, не шлём */
 #define VC_UP_HEAD     2048                  /* место под заголовки multipart перед файлом */
 #define VC_UP_MAX      (3 * 1024 * 1024)     /* файл больше (>10 мин речи) не шлём; в .bss — память занимается только по факту записи */
-typedef struct { char path[360]; char nick[48]; const char* kind; int pid, durMs; } VcTgJob;   /* pid < 0 — не игрок */
+typedef struct { char path[360]; char nick[48]; const char* kind; int pid, durMs; float dist; } VcTgJob;   /* pid < 0 — не игрок; dist < 0 — расстояние неизвестно */
 static VcTgJob g_vc_tgq[VC_TG_Q];
 static volatile unsigned g_vc_tgHead, g_vc_tgTail;
 static VcTgJob g_vc_last;                    /* последняя закрытая реплика — для /voice tg test */
@@ -360,15 +383,18 @@ static void vc_html(Buf* b, const char* t) {
         if (*t == '&') b_s(b, "&amp;"); else if (*t == '<') b_s(b, "&lt;"); else if (*t == '>') b_s(b, "&gt;"); else b_ch(b, *t);
     }
 }
-/* Подпись (HTML): «[аккаунт] 🎙 Ник #id · рядом · 3.2 с» */
+/* Подпись (HTML): «[аккаунт] слышит:\n🎙 Ник[id] · 📏 4.2 м · 3.2 с». Вид «рядом» заменён расстоянием (формат как nearFmt в Code3: до 10 м — один знак, дальше — целое);
+   нет позиций — пишем «рядом»; рация/телефон/общий канал расстояния не имеют и остаются словом. */
 static void vc_tg_caption(const VcTgJob* j, const char* who, char* out, unsigned cap) {
     Buf b; b_init(&b, out, cap);
     if (who[0]) { b_s(&b, "<b>"); vc_html(&b, who); b_s(&b, "</b> слышит:\n"); }
     b_s(&b, "🎙 ");
-    if (j->nick[0]) { b_s(&b, "<b>"); vc_html(&b, j->nick); b_s(&b, "</b>"); if (j->pid >= 0) { b_s(&b, " #"); b_int(&b, j->pid); } }
-    else if (j->pid >= 0) { b_s(&b, "игрок #"); b_int(&b, j->pid); }
+    if (j->nick[0]) { b_s(&b, "<b>"); vc_html(&b, j->nick); b_s(&b, "</b>"); if (j->pid >= 0) { b_s(&b, "["); b_int(&b, j->pid); b_s(&b, "]"); } }
+    else if (j->pid >= 0) { b_s(&b, "игрок["); b_int(&b, j->pid); b_s(&b, "]"); }
     else b_s(&b, "голос");
-    b_s(&b, " · "); b_s(&b, vc_kind_ru(j->kind));
+    b_s(&b, " · ");
+    if (seq(j->kind, "near") && j->dist >= 0) { b_s(&b, "📏 "); b_fix(&b, j->dist, j->dist < 10 ? 1 : 0); b_s(&b, " м"); }
+    else b_s(&b, vc_kind_ru(j->kind));
     b_s(&b, " · "); b_int(&b, j->durMs / 1000); b_ch(&b, '.'); b_int(&b, (j->durMs % 1000) / 100); b_s(&b, " с");
 }
 
@@ -379,13 +405,13 @@ static void vc_tg_push(const VcTgJob* src) {
     __atomic_store_n(&g_vc_tgHead, h + 1, __ATOMIC_RELEASE);
 }
 /* Зовётся из писателя при закрытии файла (единственный поставщик очереди; из заявки /voice tg test — тоже он). */
-static void vc_tg_enqueue(const char* path, const char* nick, const char* kind, int pid, int durMs) {
+static void vc_tg_enqueue(const char* path, const char* nick, const char* kind, int pid, int durMs, float dist) {
     VcTgJob j; unsigned i;
     for (i = 0; path[i] && i < sizeof j.path - 1; i++) j.path[i] = path[i];
     j.path[i] = 0;
     for (i = 0; nick[i] && i < sizeof j.nick - 1; i++) j.nick[i] = nick[i];
     j.nick[i] = 0;
-    j.kind = kind; j.pid = pid; j.durMs = durMs;
+    j.kind = kind; j.pid = pid; j.durMs = durMs; j.dist = dist;
     g_vc_last = j; g_vc_haveLast = 1;
     if (!g_vc_tg || !g_vc_tgCfg || durMs < VC_TG_MIN_MS) return;
     vc_tg_push(&j);
@@ -622,7 +648,8 @@ static void vc_sess_close(VcSess* s) {
     s->fd = -1; s->active = 0;
     if (s->pkts > 0) {                             /* файл закрыт и целый — отдаём на отправку в Telegram (если включено) */
         VcPkt kp; kp.effect = s->effect; kp.use3d = s->use3d;
-        vc_tg_enqueue(s->path, s->nick, vc_kind(&kp), (s->use3d && s->attach == 2) ? (int)s->pid : -1, (int)(((s->gp > VC_PRESKIP ? s->gp - VC_PRESKIP : 0) * 1000) / 48000));
+        if (s->dist < 0 && s->use3d && s->attach == 2 && s->effect == 0) s->dist = vc_dist(s->pid);   /* в начале данных не было — пробуем ещё раз */
+        vc_tg_enqueue(s->path, s->nick, vc_kind(&kp), (s->use3d && s->attach == 2) ? (int)s->pid : -1, (int)(((s->gp > VC_PRESKIP ? s->gp - VC_PRESKIP : 0) * 1000) / 48000), s->dist);
     }
 }
 
@@ -653,6 +680,7 @@ static int vc_sess_open(VcSess* s, const VcPkt* p) {
     s->lastMs = s->startMs = p->ms;
     s->gp = VC_PRESKIP; s->seq = 0; s->pkts = 0; s->heldLen = 0; s->heldSamples = 0;
     s->pid = p->pid; s->use3d = p->use3d; s->attach = p->attach; s->effect = p->effect; s->bass = p->bass;
+    s->dist = (p->use3d && p->attach == 2 && p->effect == 0) ? vc_dist(p->pid) : -1.0f;   /* расстояние на момент начала фразы (как в Code3: на момент сообщения) */
     g_vc_serialSeed = g_vc_serialSeed * 1664525u + 1013904223u + (u32)p->ms;
     s->serial = g_vc_serialSeed;
     { u32 i; for (i = 0; path[i] && i < sizeof s->path - 1; i++) s->path[i] = path[i]; s->path[i] = 0;
