@@ -30,17 +30,19 @@
 #include "hassle_core.c"
 extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct timespec = два long */
 
-#define CAR_NROW 12
+#define CAR_NROW 15
 #define CAR_NORIG 8
 #define CAR_MAXMODELS 32
-#define CAR_MAXENT 12
+#define CAR_MAXENT 15
 #define CAR_FILE "car_profiles.txt"
 
-/* where: 0 — WheeledVehiclePhysics (BaseVehicle.m_Physics), 1 — CommonVehicleHandling (BaseVehicle.m_Handling), 2 — Engine (m_Physics.m_Engine) */
+/* where: 0 — WheeledVehiclePhysics (BaseVehicle.m_Physics), 1 — CommonVehicleHandling (BaseVehicle.m_Handling), 2 — Engine (m_Physics.m_Engine),
+   3 — Transmission (m_Physics.m_Transmission; только множителем) */
 typedef struct { const char* cmd; const char* key; int where; const char* field; } CarRow;
 static const CarRow g_car_rows[CAR_NROW] = {
     { "speed",   "speed",   0, "MaxSpeedForward" },
     { "speed",   "hspeed",  1, "MaxSpeedForward" },
+    { "speed",   "hgear",   1, "MaxGearVelocity" },     /* «максимальная скорость передач»: от неё, скорее всего, игра считает передаточные числа — это и есть потолок */
     { "reverse", "reverse", 0, "MaxSpeedReverse" },
     { "force",   "force",   0, "MaxDriveForce" },
     { "accel",   "haccel",  1, "EngineAcceleration" },
@@ -51,6 +53,8 @@ static const CarRow g_car_rows[CAR_NROW] = {
     { "power",   "power",   2, "m_MaxPower" },          /* мощность двигателя (Engine.SetPower) — прямой рычаг разгона */
     { "inertia", "inertia", 2, "m_Inertia" },           /* инерция двигателя: меньше — быстрее набирает обороты */
     { "traction","htract",  1, "TractionMultiplier" },  /* сцепление в хендлинге */
+    { "gear",    "finalgear", 3, "m_FinalGearRatio" },  /* главная передача: x0.5 — «длиннее», выше потолок скорости, слабее старт */
+    { "gear",    "totalgear", 3, "m_TotalGearRatio" },
 };
 
 typedef struct { void* veh; int id; unsigned have, wset; float orig[CAR_NROW], want[CAR_NROW]; } CarOrig;   /* orig — что было; want — что мы записали */
@@ -130,10 +134,10 @@ static float* car_fptr(void* veh, int where, const char* field) {
         if (tk != 12) return NULL;
         off = A.field_get_offset(f);
         p = (float*)((char*)host + off);
-    } else if (where == 2) {
+    } else if (where == 2 || where == 3) {
         void* ph = ref_field_s(veh, "m_Physics");
-        host = ph && hm_obj_ok(ph) ? ref_field_s(ph, "m_Engine") : NULL;
-        if (!host || !hm_obj_ok(host)) return NULL;       /* у техники нет двигателя (m_Engine не создан) */
+        host = ph && hm_obj_ok(ph) ? ref_field_s(ph, where == 2 ? "m_Engine" : "m_Transmission") : NULL;
+        if (!host || !hm_obj_ok(host)) return NULL;       /* у техники нет двигателя/коробки (объект не создан) */
         f = find_field(A.object_get_class(host), field);
         if (!f) return NULL;
         if (A.type_get_type(A.field_get_type(f)) != 12) return NULL;
@@ -194,6 +198,7 @@ static int car_write_row(void* veh, int row, float val, int mul) {
     float* p = car_fptr(veh, g_car_rows[row].where, g_car_rows[row].field);
     CarOrig* o; float nv;
     if (!p) return 0;
+    if (g_car_rows[row].where == 3 && !mul) return 0;            /* передаточные числа задают только множителем: /vtune gear x0.6 */
     o = car_orig_get(veh, 1);
     if (!(o->have & (1u << row))) { o->orig[row] = *p; o->have |= (1u << row); }
     nv = mul ? o->orig[row] * val : val;
@@ -225,6 +230,13 @@ static int car_post_update(void* veh) {
 /* параметр cmd → все его строки; хендлинг пишем первым, затем (если был хендлинг) пересчёт физики. n — сколько записано, *rev — сколько хендлинг-полей игра откатила */
 static int car_set_cmd(void* veh, const char* cmd, float v, int mul, int* rev) {
     int i, n = 0, hand = 0;
+    if (seq(cmd, "speed") && !mul) {                              /* «speed 200»: единицы физики/хендлинга/передач могут различаться — переводим в множитель от оригинала физики */
+        float* p0 = car_fptr(veh, g_car_rows[0].where, g_car_rows[0].field); CarOrig* o = car_orig_get(veh, 1);
+        if (!p0 || !o) return 0;
+        if (!(o->have & 1u)) { o->orig[0] = *p0; o->have |= 1u; }
+        if (o->orig[0] < 0.0001f) return 0;
+        v = v / o->orig[0]; mul = 1;
+    }
     for (i = 0; i < CAR_NROW; i++) if (g_car_rows[i].where == 1 && seq(g_car_rows[i].cmd, cmd)) { int w = car_write_row(veh, i, v, mul); n += w; hand += w; }
     for (i = 0; i < CAR_NROW; i++) if (g_car_rows[i].where != 1 && seq(g_car_rows[i].cmd, cmd)) n += car_write_row(veh, i, v, mul);
     if (rev) *rev = hand ? car_post_update(veh) : 0;
@@ -252,16 +264,18 @@ static void car_prof_del(int model) {
     int i;
     for (i = 0; i < g_car_np; i++) if (g_car_prof[i].model == model) { g_car_prof[i] = g_car_prof[g_car_np - 1]; g_car_np--; return; }
 }
-static int car_path(char* out, int cap) {
-    int i, last = -1; Buf b;
+static int car_path_f(char* out, int cap, const char* fname) {
+    int i, last = -1, fl = 0; Buf b;
     if (!g_flog[0]) return 0;
+    while (fname[fl]) fl++;
     for (i = 0; g_flog[i]; i++) if (g_flog[i] == '/') last = i;
-    if (last < 0 || last + (int)sizeof CAR_FILE + 8 > cap) return 0;
+    if (last < 0 || last + fl + 8 > cap) return 0;
     b_init(&b, out, (unsigned)cap);
     for (i = 0; i <= last; i++) b_ch(&b, g_flog[i]);
-    b_s(&b, CAR_FILE);
+    b_s(&b, fname);
     return 1;
 }
+static int car_path(char* out, int cap) { return car_path_f(out, cap, CAR_FILE); }
 static int car_write_all(const char* path, const char* data, unsigned n) {
     int fd = open(path, 0x241, 0666); long w;
     if (fd < 0) return 0;
@@ -323,6 +337,99 @@ static int car_apply_prof(void* veh, const CarProf* p) {
     return ok;
 }
 
+/* ───────────── список всех моделей машин ───────────── */
+/* DefinitionDatabase.DefinitionsByID (Dictionary<int, BaseDefinition>) — все определения (машины, пеши, оружие…); берём только VehicleDefinition */
+#define CAR_MAXMDL 1500
+typedef struct { int id, type; char name[40]; char hand[24]; } CarMdl;
+static CarMdl g_car_mdl[CAR_MAXMDL];
+static int g_car_nmdl;
+static const char* const g_car_typeName[9] = { "авто", "мото", "квадро", "вело", "самолёт", "вертолёт", "лодка", "поезд", "прицеп" };
+static void car_mdl_cb(void* it, void* ctx) {
+    CarMdl* m; void* f;
+    (void)ctx;
+    if (g_car_nmdl >= CAR_MAXMDL || !hm_obj_ok(it)) return;
+    if (!seq(A.class_get_name(A.object_get_class(it)), "VehicleDefinition")) return;
+    m = &g_car_mdl[g_car_nmdl];
+    m->id = int_field(it, "ID", NULL, NULL, -1);
+    car_str_field(it, "Name", m->name, sizeof m->name);
+    car_str_field(it, "Handling", m->hand, sizeof m->hand);
+    m->type = -1;
+    f = find_field(A.object_get_class(it), "Type");                  /* VehicleDefinition.Type — enum int32 */
+    if (f) { int off = A.field_get_offset(f); if (off > 0 && off < 0x400 && hm_readable((char*)it + off, 4)) m->type = *(int*)((char*)it + off); }
+    g_car_nmdl++;
+}
+static int car_mdl_load(void) {
+    void *cls, *f, *dict = NULL, *arr; int i, j;
+    g_car_nmdl = 0;
+    if (!g_safe || !il2cpp_light() || !g_img) return 0;
+    ensure_attached();
+    cls = A.class_from_name(g_img, "Hassle.Definitions", "DefinitionDatabase");
+    f = cls ? A.class_get_field_from_name(cls, "DefinitionsByID") : NULL;
+    if (!f) return 0;
+    A.field_static_get_value(f, &dict);
+    if (!dict || !hm_obj_ok(dict)) return 0;
+    arr = ref_field_s(dict, "_entries");
+    if (!arr) arr = ref_field_s(dict, "entries");
+    if (!arr) return 0;
+    walk_struct_array(arr, int_field(dict, "_count", "count", NULL, -1), "value", car_mdl_cb, NULL);
+    for (i = 1; i < g_car_nmdl; i++) {                               /* сортировка по ID (вставками) */
+        CarMdl t = g_car_mdl[i];
+        for (j = i - 1; j >= 0 && g_car_mdl[j].id > t.id; j--) g_car_mdl[j + 1] = g_car_mdl[j];
+        g_car_mdl[j + 1] = t;
+    }
+    return g_car_nmdl;
+}
+static int car_save_models(void) {                                  /* весь список — в HLOG/car_models.txt: «ID<tab>имя<tab>хендлинг<tab>тип» */
+    static char buf[90000]; char path[320]; Buf b; int i;
+    if (!car_path_f(path, sizeof path, "car_models.txt")) return 0;
+    b_init(&b, buf, sizeof buf);
+    for (i = 0; i < g_car_nmdl; i++) {
+        CarMdl* m = &g_car_mdl[i];
+        b_int(&b, m->id); b_ch(&b, '\t'); b_s(&b, m->name); b_ch(&b, '\t'); b_s(&b, m->hand); b_ch(&b, '\t');
+        b_s(&b, (m->type >= 0 && m->type < 9) ? g_car_typeName[m->type] : "?"); b_ch(&b, '\n');
+    }
+    return car_write_all(path, b.p, b.n);
+}
+static int car_has(const char* hay, const char* needle) {           /* подстрока без учёта регистра (ASCII) */
+    int i, j;
+    for (i = 0; hay[i]; i++) {
+        for (j = 0; needle[j]; j++) {
+            char a = hay[i + j], c = needle[j];
+            if (!a) return 0;
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (a != c) break;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+static void car_mdl_line(const CarMdl* m) {
+    char line[140]; Buf b; b_init(&b, line, sizeof line);
+    b_int(&b, m->id); b_s(&b, "  "); b_s(&b, m->name[0] ? m->name : "?"); b_s(&b, "  [");
+    b_s(&b, m->hand[0] ? m->hand : "?"); b_s(&b, ", "); b_s(&b, (m->type >= 0 && m->type < 9) ? g_car_typeName[m->type] : "?"); b_s(&b, "]");
+    chat_say(line);
+}
+/* /vtune cars [страница | текст-фильтр] */
+static void car_cmd_cars(const char* arg) {
+    int i, shown = 0, total, page = 1, pages; char head[140]; Buf b; float fv;
+    if (!car_mdl_load()) { chat_say("vtune: список моделей не прочитался (DefinitionDatabase ещё не загружена или поле не найдено) — подробности в konstt.log"); return; }
+    total = g_car_nmdl;
+    car_save_models();
+    b_init(&b, head, sizeof head);
+    if (arg && arg[0] && !car_num(arg, &fv)) {                       /* фильтр по имени модели или хендлинга */
+        for (i = 0; i < total && shown < 20; i++) if (car_has(g_car_mdl[i].name, arg) || car_has(g_car_mdl[i].hand, arg)) { car_mdl_line(&g_car_mdl[i]); shown++; }
+        b_s(&b, "Найдено по «"); b_s(&b, arg); b_s(&b, "»: "); b_int(&b, shown); b_s(&b, shown >= 20 ? "+ (показаны первые 20)" : "");
+        chat_usage(head);
+        return;
+    }
+    if (arg && arg[0]) page = (int)(fv + 0.5f);
+    pages = (total + 9) / 10; if (page < 1) page = 1; if (page > pages) page = pages;
+    for (i = (page - 1) * 10; i < total && i < page * 10; i++) car_mdl_line(&g_car_mdl[i]);
+    b_s(&b, "Моделей машин: "); b_int(&b, total); b_s(&b, ", страница "); b_int(&b, page); b_s(&b, "/"); b_int(&b, pages);
+    b_s(&b, ".  /vtune cars N — страница, /vtune cars текст — поиск. Весь список — файл HLOG/car_models.txt");
+    chat_usage(head);
+}
+
 /* ───────────── вывод ───────────── */
 static void car_info(void* veh) {
     char nm[64], hd[64], line[220]; Buf b; int i; void* mi = car_model_info(veh);
@@ -344,6 +451,7 @@ static void car_info(void* veh) {
 static void car_help(void) {
     chat_usage("/vtune — инфо о машине;  /vtune speed 90 | speed x1.5 — скорость (абсолют или множитель оригинала);  параметры: speed reverse force accel power inertia grip traction brake steer drag");
     chat_usage("/vtune reset — вернуть оригинал;  /vtune save — запомнить как профиль этой МОДЕЛИ (по ID модели);  /vtune model ID параметр значение — профиль вручную;  /vtune model ID del");
+    chat_usage("/vtune cars [N | текст] — список всех моделей машин (ID, имя, хендлинг); потолок скорости: speed xN + power xN + drag x0.3, при упоре — gear x0.6");
     chat_usage("/vtune list — профили;  /vtune auto on|off — применять профиль автоматически, когда садитесь за руль этой модели");
 }
 static void car_list(void) {
@@ -407,6 +515,7 @@ static void native_car_cmd(void* self, void* args, void* mi) {
     car_prof_load();
     if (nt >= 1 && (seq(tok[0], "help") || seq(tok[0], "?"))) { car_help(); return; }
     if (nt >= 1 && seq(tok[0], "list")) { car_list(); return; }
+    if (nt >= 1 && (seq(tok[0], "cars") || seq(tok[0], "models"))) { car_cmd_cars(nt >= 2 ? tok[1] : NULL); return; }
     if (nt >= 1 && seq(tok[0], "auto")) {
         int on = (nt >= 2) ? !(seq(tok[1], "off") || seq(tok[1], "0")) : !g_car_auto;
         __atomic_store_n(&g_car_auto, on, __ATOMIC_RELEASE); g_car_dirty = 1;
