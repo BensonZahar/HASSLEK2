@@ -18,7 +18,7 @@
  * Скрин из Telegram (кнопка «📸 Скрин» в меню «Управление» скрипта HassleB)
  *   • Свой крошечный HTTP-сервер на 127.0.0.1:17781..17790 (Near занимает 17771..17780 — не пересекаемся). Скрипт (WebView) ходит
  *     на него обычным XHR, как Near.js. Игровой поток сервер не трогает: только атомарные флаги и чтение файла.
- *       GET /screen/status        JSON: v, cap (2 — умеет Live: m=, kb=, live=1; нет поля — старая сборка), seq (номер последнего УДАЧНОГО снимка), fails (сколько снимков не вышло), w, h, bytes,
+ *       GET /screen/status        JSON: v, cap (2 — умеет Live: m=, kb=, live=1; 3 — ещё и метка окна; нет поля — старая сборка), id (метка окна — см. «/screen kt…» ниже), frames (счётчик кадров — растёт, пока окно рисуется), seq (номер последнего УДАЧНОГО снимка), fails (сколько снимков не вышло), w, h, bytes,
  *                                 pending, hooked, dead. Скрипт ждёт роста seq (готово) или fails (не вышло).
  *       GET /screen/shot?delay=N  заявка на снимок (по умолчанию 0 с). {"ok":true} | {"ok":false,"err":"busy"|"need_cmd"}.
  *                                 need_cmd — подписка на кадр ещё не сделана (первый раз после запуска игры): скрипт шлёт в чат «/screen 0».
@@ -28,6 +28,9 @@
  *                                 + &kb=<reply_markup JSON, urlencoded, только ASCII> — кнопки под фото; /screen/shot?live=1 — кадр на холст SCR_LIVE_W x SCR_LIVE_H.
  *       GET /screen/tgstatus      {"id","state":1 идёт|2 готово|3 ошибка,"mid" (message_id),"code","msg"} — результат отправки
  *                                 (в WebView игры XHR не умеет бинарные POST, поэтому отправка — на стороне мода)
+ *   • Несколько окон игры на одном эмуляторе (разделённый экран, клоны com.hassle.onlineN): localhost у них общий, порты 17781..17790 занимают по
+ *     очереди, и скрипту нельзя просто взять «первый ответивший». Поэтому скрипт придумывает метку «kt…» и шлёт в чат СВОЕЙ игры «/screen kt…»;
+ *     команда выполняется в этом же процессе и запоминает метку, а скрипт находит порт, у которого /screen/status.id совпал с его меткой.
  *   • Снимки по HTTP-заявке всегда пишутся в <HLOG>/shots/remote.png (перезаписывается), чтобы удалённый просмотр не копил файлы.
  *     Файл пишется во временный .tmp и переименовывается — читатель никогда не увидит недописанный PNG.
  */
@@ -63,6 +66,8 @@ static volatile int g_scr_fails;             /* сколько снимков н
 static volatile int g_scr_doneSeq;           /* номер последнего удачного снимка (0 — ещё не было) */
 static volatile long g_scr_lastLen;          /* длина PNG последнего удачного снимка */
 static int g_scr_httpPort;
+static char g_scr_id[40];                    /* метка процесса: скрипт этого окна присылает её командой «/screen kt…» (см. scr_take_id), чтобы найти СВОЙ порт среди чужих */
+static volatile int g_scr_frames;            /* сколько раз пришло событие конца кадра — по нему скрипт видит, что окно игры не рисуется (свёрнуто/на паузе) */
 static volatile int g_scr_remoteLive;        /* 1 — заявка по HTTP с live=1: снимаем на холст SCR_LIVE_W x SCR_LIVE_H */
 static void *g_scr_kTex, *g_scr_kRPM;
 static void *g_scr_mW, *g_scr_mH, *g_scr_mCtor, *g_scr_mRead, *g_scr_mPng, *g_scr_mDestroy;
@@ -253,6 +258,7 @@ done:
 /* Вызывается движком в главном потоке в конце кадра (аргументы не нужны, поэтому сигнатура делегата нам безразлична). */
 static void scr_frame_cb(void* self, void* a, void* b, void* c) {
     (void)self; (void)a; (void)b; (void)c;
+    g_scr_frames++;                                  /* пишет только главный поток; HTTP-поток только читает */
     if (!__atomic_load_n(&g_scr_pending, __ATOMIC_ACQUIRE)) return;
     if (time(NULL) < g_scr_due) return;
     if (__sync_lock_test_and_set(&g_scr_busy, 1)) return;
@@ -287,10 +293,37 @@ static int scr_hook(void) {
     return 1;
 }
 
+/* «/screen kt<буквы-цифры>» — привязка: запоминаем метку, которую скрипт этого окна придумал сам. Команда выполняется в ЭТОМ процессе игры,
+ * поэтому по метке в /screen/status скрипт узнаёт, какой из портов 17781..17790 — его (а не соседнего окна/клона на том же эмуляторе:
+ * localhost у всех приложений общий, порты занимают по очереди). Метка: «kt» + [a-z0-9], 6..36 символов; числом/«diag» не бывает. */
+static int scr_take_id(void* arr) {
+    long len; int i; char* data;
+    if (!arr) return 0;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 16) return 0;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)(data + (uptr)i * sizeof(void*));
+        char tmp[64]; int n, k, ok = 1; const u16* ch;
+        if (!s) continue;
+        n = A.string_length(s); ch = A.string_chars(s);
+        if (n < 6 || n > 36 || !ch) continue;
+        utf16_to_utf8(ch, n, tmp, sizeof tmp);
+        if (tmp[0] != 'k' || tmp[1] != 't') continue;
+        for (k = 0; tmp[k]; k++) if (!((tmp[k] >= 'a' && tmp[k] <= 'z') || (tmp[k] >= '0' && tmp[k] <= '9'))) { ok = 0; break; }
+        if (!ok) continue;
+        for (k = 0; tmp[k] && k < (int)sizeof g_scr_id - 1; k++) g_scr_id[k] = tmp[k];
+        g_scr_id[k] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 /* Вызывается игрой в главном потоке при вводе /screen [секунды] */
 static void native_screen_cmd(void* self, void* args, void* mi) {
     int diag = 0, t; Buf b; char msg[420];
     (void)self; (void)mi;
+    if (scr_take_id(args)) { dlog2("скрин: привязка к окну, метка ", g_scr_id); return; }   /* тихо: ни снимка, ни сообщения в чат */
     t = parse_cmd_args(args, &diag);
     dlog_i("нативная /screen: вызвана, секунд ", t);
     if (diag) {
@@ -300,6 +333,7 @@ static void native_screen_cmd(void* self, void* args, void* mi) {
         b_s(&b, ", снимков за запуск: "); b_int(&b, g_scr_seq);
         if (g_scr_lastOk) { b_s(&b, ", последний: "); b_s(&b, g_scr_lastPath); }
         b_s(&b, ", HTTP-порт: "); b_int(&b, g_scr_httpPort);
+        b_s(&b, ", метка: "); b_s(&b, g_scr_id[0] ? g_scr_id : "нет");
         chat_say(msg);
         return;
     }
@@ -620,9 +654,12 @@ static void scr_respond(int fd, const char* status, const char* ctype, const cha
 }
 
 static void scr_http_status(int c) {
-    char js[320]; Buf b;
+    char js[420], id[40]; Buf b; int k;
+    for (k = 0; k < (int)sizeof id - 1 && g_scr_id[k]; k++) id[k] = g_scr_id[k];     /* копия: команда может менять метку из главного потока */
+    id[k] = 0;
     b_init(&b, js, sizeof js);
-    b_s(&b, "{\"v\":1,\"cap\":2,\"seq\":"); b_int(&b, __atomic_load_n(&g_scr_doneSeq, __ATOMIC_ACQUIRE));
+    b_s(&b, "{\"v\":1,\"cap\":3,\"id\":\""); b_s(&b, id); b_s(&b, "\",\"frames\":"); b_int(&b, g_scr_frames);
+    b_s(&b, ",\"seq\":"); b_int(&b, __atomic_load_n(&g_scr_doneSeq, __ATOMIC_ACQUIRE));
     b_s(&b, ",\"fails\":"); b_int(&b, __atomic_load_n(&g_scr_fails, __ATOMIC_ACQUIRE));
     b_s(&b, ",\"w\":"); b_int(&b, g_scr_lastW); b_s(&b, ",\"h\":"); b_int(&b, g_scr_lastH);
     b_s(&b, ",\"bytes\":"); b_int(&b, g_scr_lastLen);
