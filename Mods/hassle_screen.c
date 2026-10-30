@@ -293,31 +293,8 @@ static int scr_hook(void) {
     return 1;
 }
 
-/* «/screen kt<буквы-цифры>» — привязка: запоминаем метку, которую скрипт этого окна придумал сам. Команда выполняется в ЭТОМ процессе игры,
- * поэтому по метке в /screen/status скрипт узнаёт, какой из портов 17781..17790 — его (а не соседнего окна/клона на том же эмуляторе:
- * localhost у всех приложений общий, порты занимают по очереди). Метка: «kt» + [a-z0-9], 6..36 символов; числом/«diag» не бывает. */
-static int scr_take_id(void* arr) {
-    long len; int i; char* data;
-    if (!arr) return 0;
-    len = *(long*)((char*)arr + 3 * sizeof(void*));
-    if (len < 0 || len > 16) return 0;
-    data = (char*)arr + 4 * sizeof(void*);
-    for (i = 0; i < len; i++) {
-        void* s = *(void**)(data + (uptr)i * sizeof(void*));
-        char tmp[64]; int n, k, ok = 1; const u16* ch;
-        if (!s) continue;
-        n = A.string_length(s); ch = A.string_chars(s);
-        if (n < 6 || n > 36 || !ch) continue;
-        utf16_to_utf8(ch, n, tmp, sizeof tmp);
-        if (tmp[0] != 'k' || tmp[1] != 't') continue;
-        for (k = 0; tmp[k]; k++) if (!((tmp[k] >= 'a' && tmp[k] <= 'z') || (tmp[k] >= '0' && tmp[k] <= '9'))) { ok = 0; break; }
-        if (!ok) continue;
-        for (k = 0; tmp[k] && k < (int)sizeof g_scr_id - 1; k++) g_scr_id[k] = tmp[k];
-        g_scr_id[k] = 0;
-        return 1;
-    }
-    return 0;
-}
+/* «/screen kt…» — привязка окна к скрипту (см. hm_take_tag в ядре): запоминаем метку, скрипт найдёт по ней свой порт среди 17781..17790 */
+static int scr_take_id(void* arr) { return hm_take_tag(arr, g_scr_id, (int)sizeof g_scr_id); }
 
 /* Вызывается игрой в главном потоке при вводе /screen [секунды] */
 static void native_screen_cmd(void* self, void* args, void* mi) {

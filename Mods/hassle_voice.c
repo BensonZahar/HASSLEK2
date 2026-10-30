@@ -1029,11 +1029,13 @@ static void vc_say_status(void) {
     chat_say(msg);
     if (g_vc_state != 1 && g_vc_err[0]) { b_init(&b, msg, sizeof msg); b_s(&b, "Voice: перехват не поставлен: "); b_s(&b, g_vc_err); chat_say(msg); }
 }
+static char g_vc_id[40];                 /* метка окна игры (команда «/voice kt…», см. hm_take_tag в ядре): по ней скрипт находит СВОЙ порт среди 17791..17800 */
 static int vc_cfg_load(void);
 static void vc_flag_set(const char* name, int on);
 static void native_voice_cmd(void* self, void* args, void* mi) {
     char t[4][24]; int n; char msg[420]; Buf b;
     (void)self; (void)mi;
+    if (hm_take_tag(args, g_vc_id, (int)sizeof g_vc_id)) { dlog2("voice: привязка к окну, метка ", g_vc_id); return; }   /* тихо: «/voice kt…» шлёт скрипт этого окна */
     n = vc_tokens(args, t);
     if (n == 0 || seq(t[0], "status") || seq(t[0], "diag")) { vc_say_status(); return; }
     if (seq(t[0], "on")) {
@@ -1194,11 +1196,14 @@ static void vc_respond(int fd, const char* status, const char* ctype, const char
     if (vc_send_all(fd, h, b.n) && blen) vc_send_all(fd, body, blen);
 }
 static void vc_http_status(int c) {
-    char js[640], m[200]; Buf b; unsigned i, k = 0;
+    char js[760], m[200], id[40]; Buf b; unsigned i, k = 0; int q;
+    for (q = 0; q < 39 && g_vc_id[q]; q++) id[q] = g_vc_id[q];
+    id[q] = 0;
     for (i = 0; g_vc_tgMsg[i] && k + 2 < sizeof m; i++) { char ch = g_vc_tgMsg[i]; m[k++] = (ch == '"' || ch == '\\' || (unsigned char)ch < 32) ? ' ' : ch; }
     m[k] = 0;
     b_init(&b, js, sizeof js);
-    b_s(&b, "{\"v\":1,\"on\":"); b_int(&b, g_vc_on ? 1 : 0);
+    b_s(&b, "{\"v\":1,\"id\":\""); b_s(&b, id);
+    b_s(&b, "\",\"on\":"); b_int(&b, g_vc_on ? 1 : 0);
     b_s(&b, ",\"hooked\":"); b_int(&b, g_vc_state == 1 ? 1 : 0);
     b_s(&b, ",\"mode\":\""); b_s(&b, g_vc_mode == VC_MODE_NEAR ? "near" : "all");
     b_s(&b, "\",\"tg\":"); b_int(&b, g_vc_tg ? 1 : 0);

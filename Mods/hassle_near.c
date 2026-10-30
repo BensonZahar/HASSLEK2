@@ -39,6 +39,7 @@ extern long send(int, const void*, unsigned long, int);
 #define NEAR_PORT_FIRST 17771
 #define NEAR_PORT_COUNT 10
 static int g_port;                  /* порт, на котором слушает HTTP-сервер */
+static char g_near_id[40];          /* метка окна игры (команда /nearid kt…): по ней скрипт находит СВОЙ порт среди 17771..17780 — GET /id */
 static int g_fieldsDumped;
 
 /* ───────────── перебор коллекции PlayersInStream ───────────── */
@@ -278,6 +279,12 @@ static void native_nearlog_cmd(void* self, void* args, void* mi) {
     dlog_i("нативная /nearlog: снимков ", t);
 }
 
+/* /nearid kt… — привязка окна к скрипту: запоминаем метку, которую скрипт этого окна придумал сам (см. hm_take_tag в ядре). Тихо, без сообщений в чат. */
+static void native_nearid_cmd(void* self, void* args, void* mi) {
+    (void)self; (void)mi;
+    if (hm_take_tag(args, g_near_id, (int)sizeof g_near_id)) dlog2("near: привязка к окну, метка ", g_near_id);
+}
+
 /* /nearlog регистрируется, как только ядро нашло образец делегата (раньше это делал сборщик вместе с /rec) */
 static int g_nearlogReg;
 static int g_near_modId = -1;                          /* номер в реестре модов: по нему на экране загрузки считается «Запускаем моды N/M» */
@@ -285,7 +292,7 @@ static void near_try_register(void) {
     int st = __atomic_load_n(&g_tplState, __ATOMIC_ACQUIRE);
     if (g_nearlogReg || !st) return;                     /* 0 — образец ещё ищется */
     g_nearlogReg = 1;
-    if (st == 1) cmd_register("nearlog", native_nearlog_cmd);
+    if (st == 1) { cmd_register("nearlog", native_nearlog_cmd); cmd_register("nearid", native_nearid_cmd); }
     else dlog("нативная /nearlog: образец делегата не найден, команды не будет");
 }
 
@@ -370,6 +377,7 @@ static void* server_main(void* arg) {
                 { static int hl; if (hl < 15) { char q[48]; int k; hl++; for (k = 0; k < 47 && rq[k] && rq[k] != '\r' && rq[k] != '\n'; k++) q[k] = rq[k]; q[k] = 0; dlog2("HTTP: запрос ", q); } }
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
                 else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
+                else if (sprefix(rq, "GET /id")) { char id[40]; int k; for (k = 0; k < 39 && g_near_id[k]; k++) id[k] = g_near_id[k]; id[k] = 0; respond(c, "200 OK", "text/plain", id, (unsigned)k); }   /* метка окна («» — ещё не привязано) */
                 else if (sprefix(rq, "GET /diag")) handle_diag(c);
                 else if (sprefix(rq, "GET /konstt")) { static const char kid[] = "KONSTT-CLIENT " HM_BUILD_ID; respond(c, "200 OK", "text/plain", kid, (unsigned)(sizeof kid - 1)); }   /* константа «это клиент konstt» — по ней Load.js решает, запускать ли скрипты */
                 else if (sprefix(rq, "GET /ping")) respond(c, "200 OK", "text/plain", "hassle-near", 11);

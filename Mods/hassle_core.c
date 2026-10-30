@@ -888,6 +888,33 @@ static int parse_cmd_args(void* arr, int* diag) {
     return t;
 }
 
+/* Метка окна игры: первый строковый аргумент команды вида «kt<a-z0-9>» (6..36 символов) → out (с нулём, cap включая 0). 1 — нашли.
+ * Зачем: на одном эмуляторе (разделённый экран, клоны) localhost общий у всех окон игры, и порты модов занимают по очереди — скрипт не знает,
+ * какой порт его. Он придумывает метку и шлёт её в чат СВОЕЙ игры («/screen kt…», «/nearid kt…», «/voice kt…»): команда выполняется только в этом
+ * процессе, мод запоминает метку и отдаёт её по HTTP (поле id / GET /id) — скрипт берёт порт с совпавшей меткой. Числом и «diag» метка не бывает. */
+static int hm_take_tag(void* arr, char* out, int cap) {
+    long len; int i; char* data;
+    if (!arr || cap < 8) return 0;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 16) return 0;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)(data + (uptr)i * sizeof(void*));
+        char tmp[64]; int n, k, ok = 1; const u16* ch;
+        if (!s) continue;
+        n = A.string_length(s); ch = A.string_chars(s);
+        if (n < 6 || n > 36 || !ch) continue;
+        utf16_to_utf8(ch, n, tmp, sizeof tmp);
+        if (tmp[0] != 'k' || tmp[1] != 't') continue;
+        for (k = 0; tmp[k]; k++) if (!((tmp[k] >= 'a' && tmp[k] <= 'z') || (tmp[k] >= '0' && tmp[k] <= '9'))) { ok = 0; break; }
+        if (!ok) continue;
+        for (k = 0; tmp[k] && k < cap - 1; k++) out[k] = tmp[k];
+        out[k] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void cmd_fail(const char* why) { __atomic_store_n(&g_tplState, -1, __ATOMIC_RELEASE); dlog2("реестр команд: не получилось. Причина: ", why); }
 static int cmd_put(void* dict, void* setitem, const char* key, void* del) {
     void* args[2]; void* exc = NULL; char et[256];
