@@ -44,6 +44,8 @@
  *                        больше секунд и нажмите клавишу, пока вы под полом. Только пикапы (не маркеры) и только пешком. Синонимы: under, dive, ниже, нырок.
  *   /tpl depth [м]       глубина нырка (0…10, по умолчанию 1; без числа — показать). Сервер принимает пикап в шаре: до 5 м от точки пикапа у обычных и до 1.3 м у пикапов
  *                        с клавишей (дом, вход), поэтому глубже 1.3 м работают только обычные, глубже 5 м — никакие. Действует до перезапуска игры.
+ *   /tpl up              вынырнуть СЕЙЧАС (если идёт нырок «pick N under»): не ждать секунд, вернуться на прежнее место немедленно. Синонимы: surface, наверх, вверх.
+ *                        Нырок можно запускать с запасом по времени («under 8»), а вынырнуть командой, как только сработал пикап (так делает Dress.js).
  *   /tpl pick list [стр] список по 10 на странице; «list 2» листает прежний снимок, не пересобирая
  *   В машине (вы за рулём) все команды телепорта (/tpl 5 вперёд, /tpl to …, /tpl go …) переносят МАШИНУ вместе с вами.
  *   Расстояние — любое от 0.3 м (меньше смысла нет); верхнего лимита нет, только страховка TPL_MAX = 100000 м от переполнения float.
@@ -976,7 +978,7 @@ static void tpl_fold(char* s) {
         else if (c >= 0x80 && s[1]) s++;                 /* прочие двухбайтные символы пропускаем целиком */
     }
 }
-/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; 23 under (нырок под пол); 24 depth (глубина нырка); -1 не знаем */
+/* слово → сторона 0..3; 10 alt; 11 status; 12 help; 13 pos; 14 to; 15 save; 16 go; 17 list; 18 del; 19 ghost; 20 int; 21 gps; 22 pick; 23 under (нырок под пол); 24 depth (глубина нырка); 25 up (вынырнуть сейчас); -1 не знаем */
 static int tpl_word(const char* t) {
     if (seq(t, "l") || seq(t, "left") || seq(t, "влево") || seq(t, "лево") || seq(t, "л")) return TPL_L;
     if (seq(t, "r") || seq(t, "right") || seq(t, "вправо") || seq(t, "право") || seq(t, "п")) return TPL_R;
@@ -999,6 +1001,7 @@ static int tpl_word(const char* t) {
         seq(t, "маркер") || seq(t, "маркеры") || seq(t, "marker") || seq(t, "markers") || seq(t, "mk")) return 22;
     if (seq(t, "under") || seq(t, "dive") || seq(t, "ниже") || seq(t, "нырок")) return 23;
     if (seq(t, "depth") || seq(t, "deep") || seq(t, "глубина") || seq(t, "глуб")) return 24;
+    if (seq(t, "up") || seq(t, "surface") || seq(t, "вынырнуть") || seq(t, "наверх") || seq(t, "вверх")) return 25;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -1051,6 +1054,7 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 22) { if (a->mode == 5) a->pkList = 1; a->mode = 10; }
     else if (w == 23) a->under = 1;
     else if (w == 24) a->mode = 11;
+    else if (w == 25) a->mode = 12;
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -1603,6 +1607,15 @@ static void tpl_cmd_pick(int num, int list, int under, float holdSec) {
     if (page < pages) { b_s(&b, ";  дальше: /tpl pick list "); b_int(&b, page + 1); }
     chat_usage(msg);
 }
+/* «/tpl up» — вынырнуть СЕЙЧАС: не ждать, пока выйдет hold у «/tpl pick N under [сек]». Dress.js ныряет с запасом по времени (например 8 с), а как только
+   сервер сменил скин — шлёт /tpl up, и возврат происходит в этом же вызове (главный поток, без ожидания тика в ≤ 60 мс).
+   Нырка нет (уже вернули по таймеру) — молча ничего не делаем (только строка в konstt.log), чтобы не засорять чат лишними сообщениями. */
+static void tpl_cmd_up(void) {
+    if (!__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) { dlog("/tpl up: нырка нет (уже вернулись)"); return; }
+    g_tplu_hold = 0;                                                 /* время «вышло» прямо сейчас */
+    dlog("/tpl up: возвращаем наверх немедленно");
+    tplu_tick(gh_now_ms());                                          /* тот же код возврата, что и по таймеру, включая повторы при неудаче */
+}
 /* «/tpl gps» — телепорт на метку, поставленную на карте (/gps). Метка — MiniMap.m_NavigationPoint; если её нет, а сервер показывает маркер (чекпоинт) — на него */
 static void tpl_cmd_gps(void) {
     TplCtx c; void* mm; float np[3], cp[3], me[3], v[3]; int act = -1, haveN = 0, nz = 0, haveMe, useChk = 0, staleN = 0;
@@ -1683,6 +1696,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         return;
     }
     if (a.mode == 9) { tpl_cmd_gps(); return; }
+    if (a.mode == 12) { tpl_cmd_up(); return; }
     if (a.under && a.mode != 10) { chat_usage("Нырок под пол — только к пикапу: /tpl pick N under [секунды]  (сначала /tpl pick — список с номерами)"); return; }
     if (a.mode == 11) { tpl_cmd_depth(a.numSet ? a.rawNum : -1.0f); return; }
     if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList, a.under, a.num2Set ? a.num2 : -1.0f); return; }
