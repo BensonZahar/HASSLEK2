@@ -6,7 +6,10 @@ build_konstt.py — сборка Android NDK.
   loader/hassle_loader.c -> libkonstt_loader_arm64.so / libkonstt_loader_arm32.so   (ЗАГРУЗЧИК: вшивается в APK один раз через patch_apk.py)
   manifest.txt                                                              (sha256 + размер бандла, по нему загрузчик понимает, что есть новая сборка)
 
-  python build_konstt.py [путь_к_NDK] [--url https://raw.githubusercontent.com/ВЛАДЕЛЕЦ/РЕПО/dist/] [--out out] [--no-loader] [--check]
+  python build_konstt.py [путь_к_NDK] [--url https://raw.githubusercontent.com/ВЛАДЕЛЕЦ/РЕПО/dist/] [--key-url https://raw.githubusercontent.com/ВЛАДЕЛЕЦ/РЕПО/main/key/keys.txt] [--out out] [--no-loader] [--check]
+
+  Доступ по ключу (HWID): загрузчик при каждом запуске скачивает --key-url (по умолчанию: ветка main, файл key/keys.txt того же репозитория,
+  берётся из --url / GITHUB_REPOSITORY) и пускает, только если ID устройства есть в списке. См. README.
 
 Как добавить новый мод: положите файл Mods/hassle_что_угодно.c, запушьте. Список модулей в бандле собирается автоматически
 (все Mods/*.c, кроме файлов на «_»). Файл должен начинаться с `#pragma once` и `#include "hassle_core.c"` (ядро; другие моды
@@ -32,6 +35,7 @@ def opt(name, default=None, flag=False):
 
 out_dir = os.path.abspath(opt('--out', os.path.join(here, 'out')))
 base_url = opt('--url', os.environ.get('HM_BASE_URL'))
+key_url = opt('--key-url', os.environ.get('HM_KEY_URL'))
 no_loader = opt('--no-loader', flag=True)
 check = opt('--check', flag=True)
 ndk_arg = args[0] if args else None
@@ -41,12 +45,18 @@ if not base_url and os.environ.get('GITHUB_REPOSITORY'):
     base_url = 'https://raw.githubusercontent.com/%s/dist/' % os.environ['GITHUB_REPOSITORY']
 if base_url and not base_url.endswith('/'):
     base_url += '/'
+if not key_url and base_url and base_url.endswith('/dist/'):
+    key_url = base_url[:-len('dist/')] + 'main/key/keys.txt'      # .../РЕПО/dist/ -> .../РЕПО/main/key/keys.txt
 if not no_loader and not check:
     if not base_url:
         sys.exit('Нужен адрес, откуда игра будет качать бандл: --url https://raw.githubusercontent.com/ВЛАДЕЛЕЦ/РЕПО/dist/  '
                  '(в GitHub Actions берётся автоматически из GITHUB_REPOSITORY). Либо --no-loader, если нужен только бандл.')
     if not base_url.startswith('https://'):
         sys.exit('Адрес должен быть https:// — загрузчик не принимает обычный http.')
+    if not key_url:
+        sys.exit('Не удалось вывести адрес списка ключей из --url: задайте --key-url https://raw.githubusercontent.com/ВЛАДЕЛЕЦ/РЕПО/main/key/keys.txt')
+    if not key_url.startswith('https://'):
+        sys.exit('--key-url должен быть https://')
 
 # ── список модулей ──
 mods = sorted(os.path.basename(f) for f in glob.glob(os.path.join(mods_dir, '*.c')) if not os.path.basename(f).startswith('_'))
@@ -80,7 +90,7 @@ if check:
             f.write('#define KONSTT_BUNDLE 1\n#include "%s"\n' % CORE)
             if m: f.write('#include "%s"\n' % m)
         jobs.append(('ядро + ' + title if m else title, cflags + [p]))
-    jobs.append(('загрузчик', [cc, '-shared', '-fPIC', '-O1', '-Wall', '-DHM_BASE_URL="https://example.invalid/"', loader_src]))
+    jobs.append(('загрузчик', [cc, '-shared', '-fPIC', '-O1', '-Wall', '-DHM_BASE_URL="https://example.invalid/"', '-DHM_KEY_URL="https://example.invalid/key/keys.txt"', loader_src]))
     for name, cmd in jobs:
         print('> check', name)
         if subprocess.run(cmd + ['-o', os.path.join(out_dir, 'check.so')]).returncode:
@@ -121,7 +131,7 @@ def sha256(p):
             h.update(chunk)
     return h.hexdigest()
 
-manifest = ['loader_min 1', 'build ' + build_id]
+manifest = ['loader_min 2', 'build ' + build_id]
 for name, tgt, extra in targets:
     bundle = os.path.join(out_dir, 'libkonstt_mods_%s.so' % name)
     cmd = [clang, '--target=' + tgt] + common + ['-Wl,-soname,libHassleMods.so', '-DHM_BUILD_ID="%s"' % build_id, '-I', mods_dir, bundle_c, '-o', bundle] + extra
@@ -133,7 +143,7 @@ for name, tgt, extra in targets:
 
     if not no_loader:
         so = os.path.join(out_dir, 'libkonstt_loader_%s.so' % name)
-        cmd = [clang, '--target=' + tgt] + common + ['-Wl,-soname,libHassleExtended.so', '-DHM_BASE_URL="%s"' % base_url, loader_src, '-o', so] + extra
+        cmd = [clang, '--target=' + tgt] + common + ['-Wl,-soname,libHassleExtended.so', '-DHM_BASE_URL="%s"' % base_url, '-DHM_KEY_URL="%s"' % key_url, loader_src, '-o', so] + extra
         print('> загрузчик', name)
         if subprocess.run(cmd).returncode: sys.exit('сборка загрузчика %s не удалась' % name)
         print('   ', so, os.path.getsize(so), 'байт')

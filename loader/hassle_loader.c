@@ -19,7 +19,7 @@
  *   Выключатель: файл konstt_off (как раньше) — тогда загрузчик ничего не качает и не грузит.
  *
  * Формат manifest.txt (его пишет build_konstt.py в CI):
- *   loader_min 1
+ *   loader_min 2
  *   build 20261023-134200-ab12cd3
  *   arm64 <sha256 hex> <размер> libkonstt_mods_arm64.so
  *   arm32 <sha256 hex> <размер> libkonstt_mods_arm32.so
@@ -39,7 +39,14 @@
 #define HM_ABI_KEY "arm32"
 #endif
 #endif
-#define HM_LOADER_VER 1
+#define HM_LOADER_VER 2                /* 2 = есть проверка ключа (HWID). build_konstt.py пишет loader_min 2: старые APK без проверки новые бандлы не берут */
+#ifndef HM_KEY_URL                     /* список разрешённых ID (txt/json) в репозитории; build_konstt.py подставляет из GITHUB_REPOSITORY */
+#define HM_KEY_URL "https://raw.githubusercontent.com/CHANGE_ME/CHANGE_ME/main/key/keys.txt"
+#endif
+#ifndef HM_KEY_GRACE_S                 /* если GitHub недоступен: пускаем, только если ключ подтверждался не раньше этого срока (сек) */
+#define HM_KEY_GRACE_S 86400
+#endif
+#define HM_MAX_KEYS (256u << 10)
 #define HM_MAX_BUNDLE (24u << 20)     /* бандл больше 24 МБ не принимаем */
 #define HM_MAX_MANIFEST 4096
 #define HM_NET_TIMEOUT_MS 10000
@@ -272,6 +279,7 @@ typedef unsigned char (*ExcCheckT)(void*);                                  /* 2
 #define J_FAIL(env, why) do { if (J_EXC(env)) JF(env, 17, ExcClearT)(env); lg("http: ", why); goto fail; } while (0)
 
 static void* g_vm;
+static volatile int g_httpCode;                            /* код последнего HTTP-ответа (0 — до ответа не дошло) */
 
 /* GET по http(s) через java.net.HttpURLConnection. Возвращает malloc-буфер (или NULL) и длину. */
 static u8* http_get(void* env, const char* url, unsigned long max, unsigned long* outn) {
@@ -280,7 +288,7 @@ static u8* http_get(void* env, const char* url, unsigned long max, unsigned long
     u8* buf = NULL; unsigned long len = 0, cap = 0; int code;
     FindClassT FindClass = JF(env, 6, FindClassT); GetMidT GetMid = JF(env, 33, GetMidT);
     CallObjT CallObj = JF(env, 34, CallObjT); CallIntT CallInt = JF(env, 49, CallIntT); CallVoidT CallVoid = JF(env, 61, CallVoidT);
-    *outn = 0;
+    *outn = 0; g_httpCode = 0;
     cURL = FindClass(env, "java/net/URL"); if (!cURL) J_FAIL(env, "нет класса java.net.URL");
     cConn = FindClass(env, "java/net/URLConnection"); if (!cConn) J_FAIL(env, "нет URLConnection");
     cHttp = FindClass(env, "java/net/HttpURLConnection"); if (!cHttp) J_FAIL(env, "нет HttpURLConnection");
@@ -301,6 +309,7 @@ static u8* http_get(void* env, const char* url, unsigned long max, unsigned long
     CallVoid(env, conn, mCT, HM_NET_TIMEOUT_MS); if (J_EXC(env)) J_FAIL(env, "setConnectTimeout");
     CallVoid(env, conn, mRT, HM_NET_TIMEOUT_MS); if (J_EXC(env)) J_FAIL(env, "setReadTimeout");
     code = CallInt(env, conn, mCode); if (J_EXC(env)) J_FAIL(env, "нет соединения (getResponseCode)");
+    g_httpCode = code;
     if (code != 200) { lgi("http: код ответа ", code); goto fail; }
     in = CallObj(env, conn, mGetIn); if (!in || J_EXC(env)) J_FAIL(env, "getInputStream не удался");
     arr = JF(env, 176, NewBytesT)(env, 65536); if (!arr) J_FAIL(env, "NewByteArray");
@@ -344,7 +353,9 @@ extern long send(int, const void*, unsigned long, int);
 
 #define HM_ST_PORT 17760
 #define HM_ST_PORTS 3
-enum { ST_CHECK = 1, ST_DOWNLOAD, ST_LOADED, ST_FAILED, ST_OFF };
+enum { ST_CHECK = 1, ST_DOWNLOAD, ST_LOADED, ST_FAILED, ST_OFF, ST_DENIED };
+static char g_hwid[17];                                    /* ID этого устройства (16 hex), пусто пока не определён */
+static volatile int g_denied;                              /* 1 — доступа нет */
 static volatile int g_stPhase = ST_CHECK;
 static const char* volatile g_stWhy;                       /* причина, если мод не загрузился (строка-литерал) */
 typedef int (*counts_fn)(int*, int*);
@@ -365,6 +376,12 @@ static void st_text(char* out, unsigned cap) {
         sapp(out, cap, "Моды не загружены");
         if (w && w[0]) { sapp(out, cap, ": "); sapp(out, cap, w); }
     } else if (ph == ST_OFF) sapp(out, cap, "Моды отключены");
+    else if (ph == ST_DENIED) {
+        const char* w = g_stWhy;
+        sapp(out, cap, "Нет доступа");
+        if (w && w[0]) { sapp(out, cap, " ("); sapp(out, cap, w); sapp(out, cap, ")"); }
+        if (g_hwid[0]) { sapp(out, cap, ". Ваш ID: "); sapp(out, cap, g_hwid); }
+    }
     else sapp(out, cap, "Загружаются моды...");
 }
 /* смена этапа; why — причина для ST_FAILED. Пишется в loader.log (без счётчика — он меняется сам) */
@@ -414,6 +431,7 @@ static void* st_server_thread(void* arg) {
         if (n > 0) {
             rq[n] = 0;
             if (sprefix(rq, "OPTIONS ")) st_respond(c, "204 No Content", "");
+            else if (sprefix(rq, "GET /hwid")) st_respond(c, "200 OK", g_hwid[0] ? g_hwid : "ещё не определён");
             else if (sprefix(rq, "GET /hmstatus")) { char txt[160]; st_text(txt, sizeof txt); st_respond(c, "200 OK", txt); }
             else st_respond(c, "404 Not Found", "no");
         }
@@ -596,10 +614,144 @@ static void wipe_cache(void) {
     lg("кеш мода стёрт (bundle.so, manifest.txt, strikes.txt)", "");
 }
 
+/* ───────────── доступ по ключу (HWID) ─────────────
+   ID устройства = первые 16 hex от sha256("konstt-hwid-v1|" + ANDROID_ID). Сам ANDROID_ID наружу не уходит, в публичном списке
+   на GitHub видны только эти хеши. ID создаётся один раз и хранится в files/hm/hwid.txt. Если ANDROID_ID достать не вышло —
+   берётся случайный (тогда после переустановки/очистки данных ID другой, и его надо прислать заново).
+   Список — файл key/keys.txt в репозитории (ветка main): по одному ID в строке, всё после # — комментарий; можно и JSON
+   (["id1","id2"]): загрузчик ищет в тексте 16-значные hex-слова вне комментариев. Убрали ID из файла — на следующем запуске
+   (если есть связь с GitHub) моды не загрузятся, игра запустится без них. */
+static int jx(void* env) { if (J_EXC(env)) { JF(env, 17, ExcClearT)(env); return 1; } return 0; }
+
+typedef jmethodID (*GetSMidT)(void*, jobject, const char*, const char*);   /* 113 */
+typedef jobject (*CallSObjT)(void*, jobject, jmethodID, ...);              /* 114 */
+typedef const char* (*GetUtfT)(void*, jobject, void*);                     /* 169 */
+typedef void (*RelUtfT)(void*, jobject, const char*);                      /* 170 */
+
+/* Settings.Secure.getString(ActivityThread.currentApplication().getContentResolver(), "android_id") */
+static int get_android_id(void* env, char* out, unsigned cap) {
+    FindClassT FindClass = JF(env, 6, FindClassT); GetMidT GetMid = JF(env, 33, GetMidT);
+    GetSMidT GetSMid = JF(env, 113, GetSMidT); CallSObjT CallSObj = JF(env, 114, CallSObjT);
+    CallObjT CallObj = JF(env, 34, CallObjT); NewUtfT NewUtf = JF(env, 167, NewUtfT);
+    jobject cAT, cCtx, cSec, app = NULL, cr = NULL, jkey, jid; jmethodID m;
+    out[0] = 0;
+    cAT = FindClass(env, "android/app/ActivityThread"); if (!cAT || jx(env)) return 0;
+    m = GetSMid(env, cAT, "currentApplication", "()Landroid/app/Application;"); if (!m || jx(env)) return 0;
+    app = CallSObj(env, cAT, m); if (!app || jx(env)) return 0;
+    cCtx = FindClass(env, "android/content/Context"); if (!cCtx || jx(env)) return 0;
+    m = GetMid(env, cCtx, "getContentResolver", "()Landroid/content/ContentResolver;"); if (!m || jx(env)) return 0;
+    cr = CallObj(env, app, m); if (!cr || jx(env)) return 0;
+    cSec = FindClass(env, "android/provider/Settings$Secure"); if (!cSec || jx(env)) return 0;
+    m = GetSMid(env, cSec, "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;"); if (!m || jx(env)) return 0;
+    jkey = NewUtf(env, "android_id"); if (!jkey) return 0;
+    jid = CallSObj(env, cSec, m, cr, jkey); if (!jid || jx(env)) return 0;
+    { const char* u = JF(env, 169, GetUtfT)(env, jid, NULL);
+      if (!u) return 0;
+      sapp(out, cap, u);
+      JF(env, 170, RelUtfT)(env, jid, u); }
+    return out[0] != 0;
+}
+static int is_hexc(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+static char lower_c(char c) { return (c >= 'A' && c <= 'F') ? (char)(c + 32) : c; }
+static void hwid_from_text(const char* src, char* out17) {
+    char buf[200], hex[65]; int i;
+    buf[0] = 0; sapp(buf, sizeof buf, "konstt-hwid-v1|"); sapp(buf, sizeof buf, src);
+    sha256_hex((const u8*)buf, slen(buf), hex);
+    for (i = 0; i < 16; i++) out17[i] = hex[i];
+    out17[16] = 0;
+}
+static void load_hwid(void* env) {
+    char p[340], aid[100]; unsigned long n = 0; u8* b; int i, tr;
+    if (g_hwid[0]) return;
+    path_of(p, sizeof p, "hwid.txt");
+    b = read_file(p, 64, &n);
+    if (b) {
+        int ok = n >= 16; for (i = 0; ok && i < 16; i++) if (!is_hexc((char)b[i])) ok = 0;
+        if (ok) { for (i = 0; i < 16; i++) g_hwid[i] = lower_c((char)b[i]); g_hwid[16] = 0; }
+        free(b);
+        if (g_hwid[0]) return;
+    }
+    if (env) {
+        for (tr = 0; tr < 20; tr++) {                      /* приложение может быть ещё не готово — подождём до ~10 с */
+            if (get_android_id(env, aid, sizeof aid)) { hwid_from_text(aid, g_hwid); lg("ID: получен из ANDROID_ID", ""); break; }
+            usleep(500000);
+        }
+    }
+    if (!g_hwid[0]) {                                      /* запасной вариант: случайный */
+        u8 rnd[32]; int fd = open("/dev/urandom", 0); long r = 0; char seed[80]; int k;
+        if (fd >= 0) { r = read(fd, rnd, sizeof rnd); close(fd); }
+        if (r < 16) { long t = (long)time(NULL); for (k = 0; k < 32; k++) rnd[k] = (u8)(t >> (k % 8)) ^ (u8)k; }
+        for (k = 0; k < 32; k++) { seed[k * 2] = "0123456789abcdef"[rnd[k] >> 4]; seed[k * 2 + 1] = "0123456789abcdef"[rnd[k] & 15]; }
+        seed[64] = 0;
+        hwid_from_text(seed, g_hwid);
+        lg("ID: ANDROID_ID недоступен, создан случайный", "");
+    }
+    { char t[20]; for (i = 0; i < 16; i++) t[i] = g_hwid[i]; t[16] = '\n'; t[17] = 0;
+      unlink(p);
+      { int fd = open(p, 0x241, 0600); if (fd >= 0) { write(fd, t, 17); close(fd); } } }
+}
+
+/* 1, если в тексте (txt/json) вне #-комментариев есть 16-значное hex-слово, равное id */
+static int key_has(const u8* d, unsigned long n, const char* id) {
+    unsigned long i; unsigned run = 0; int comment = 0; char tok[16];
+    for (i = 0; i <= n; i++) {
+        char c = i < n ? (char)d[i] : '\n';
+        int hexc = !comment && is_hexc(c);
+        if (hexc) { if (run < 16) tok[run] = lower_c(c); run++; continue; }
+        if (run == 16) { unsigned q; int ok = 1; for (q = 0; q < 16; q++) if (tok[q] != id[q]) ok = 0; if (ok) return 1; }
+        run = 0;
+        if (c == '\n') comment = 0; else if (c == '#') comment = 1;
+    }
+    return 0;
+}
+
+static void access_path(char* p, unsigned cap) { path_of(p, cap, "access.txt"); }
+/* 1 — доступ есть; 0 — нет (причина в g_stWhy, пусто = «ID нет в списке»). *confirmed = 1, если отказ подтверждён списком, а не отсутствием связи */
+static int check_access(void* env, int* confirmed) {
+    char url[400], p[340]; u8* kb = NULL; unsigned long kn = 0; long now = (long)time(NULL);
+    *confirmed = 0; g_stWhy = NULL;
+    load_hwid(env);
+    lg("ID этого устройства: ", g_hwid);
+    access_path(p, sizeof p);
+    if (env) {
+        url[0] = 0; sapp(url, sizeof url, HM_KEY_URL); sapp(url, sizeof url, "?t="); sapp_i(url, sizeof url, now);
+        lg("проверяю ключ: ", HM_KEY_URL);
+        kb = http_get(env, url, HM_MAX_KEYS, &kn);
+        if (kb) {
+            int ok = key_has(kb, kn, g_hwid); free(kb);
+            if (ok) {
+                char t[24]; t[0] = 0; sapp_i(t, sizeof t, now); sapp(t, sizeof t, "\n");
+                unlink(p); { int fd = open(p, 0x241, 0600); if (fd >= 0) { write(fd, t, slen(t)); close(fd); } }
+                lg("ключ найден: доступ есть", "");
+                return 1;
+            }
+            unlink(p); *confirmed = 1; lg("ID нет в списке ключей: доступа нет", "");
+            return 0;
+        }
+        if (g_httpCode == 404) { unlink(p); *confirmed = 1; lg("файл ключей не найден (404): доступа нет", ""); return 0; }
+    }
+    { unsigned long an = 0; u8* ab = read_file(p, 32, &an); long t = 0;
+      if (ab) { unsigned long j; for (j = 0; j < an && ab[j] >= '0' && ab[j] <= '9'; j++) t = t * 10 + (ab[j] - '0'); free(ab); }
+      if (t > 0 && now >= t && now - t < HM_KEY_GRACE_S) { lg("нет связи с GitHub, но ключ подтверждался недавно — пускаю", ""); return 1; } }
+    lg("нет связи с GitHub и нет свежего подтверждения ключа: доступа нет", "");
+    g_stWhy = "нет связи для проверки";
+    return 0;
+}
+
 static void run_loader(void* env) {
     char url[400], p[340]; u8* mf = NULL; unsigned long mn = 0; Manifest net, cache; int have_cache = 0, done = 0, force = 0;
     net.ok = 0; cache.ok = 0;
     if (!setup_dir()) { lg("нет папки для кеша (не определён пакет)", ""); st_set(ST_FAILED, "нет папки для кеша"); return; }
+#ifndef HM_TEST
+    { int confirmed = 0;
+      if (!check_access(env, &confirmed)) {
+          char bp[340];
+          if (confirmed) { path_of(bp, sizeof bp, "bundle.so"); unlink(bp); path_of(bp, sizeof bp, "manifest.txt"); unlink(bp); }   /* доступ отозван — кеш не оставляем */
+          g_denied = 1;
+          st_set(ST_DENIED, g_stWhy);
+          return;
+      } }
+#endif
     force = rv_wants_reinstall();
     /* 1) manifest из сети */
     net.ok = 0;
@@ -650,6 +802,7 @@ static void* loader_thread(void* arg) {
     if (!attached) lg("не удалось присоединить поток к JVM — только кеш", "");
     run_loader(env);
     if (attached) ((DetachT)(*(void***)g_vm)[5])(g_vm);
+    if (g_denied) return NULL;                              /* нет доступа: игра работает без модов, на экране загрузки — ID */
     if (g_loadedSha[0]) {                                   /* дожили до HM_ALIVE_S секунд — бандл считаем рабочим */
         int w; for (w = 0; w < HM_ALIVE_S; w++) usleep(1000000);
         strikes_set(g_loadedSha, 0, 0);
@@ -660,6 +813,8 @@ static void* loader_thread(void* arg) {
 
 #ifdef HM_TEST
 EXPORT void hm_test_run(void* vm) { g_vm = vm; loader_thread(NULL); }
+EXPORT int hm_test_key_has(const char* txt, unsigned long n, const char* id) { return key_has((const u8*)txt, n, id); }
+EXPORT void hm_test_hwid(const char* src, char* out17) { hwid_from_text(src, out17); }
 EXPORT void hm_test_sha(const u8* p, unsigned long n, char* out) { sha256_hex(p, n, out); }
 EXPORT void hm_test_st_start(void) { st_start(); }
 EXPORT void hm_test_st_set(int ph, const char* why) { st_set(ph, why); }
