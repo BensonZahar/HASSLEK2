@@ -378,7 +378,7 @@ static void st_text(char* out, unsigned cap) {
     } else if (ph == ST_OFF) sapp(out, cap, "Моды отключены");
     else if (ph == ST_DENIED) {
         const char* w = g_stWhy;
-        sapp(out, cap, "Нет доступа");
+        sapp(out, cap, "Нет доступа к модам");
         if (w && w[0]) { sapp(out, cap, " ("); sapp(out, cap, w); sapp(out, cap, ")"); }
         if (g_hwid[0]) { sapp(out, cap, ". Ваш ID: "); sapp(out, cap, g_hwid); }
     }
