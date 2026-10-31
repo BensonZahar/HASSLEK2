@@ -93,6 +93,11 @@
  *   • Пикапы: Pools.Pickups (PickupPool : BasePool<Pickup>, словарь m_Items, как у NPC в /air); у Pickup есть только m_ID и Transform — тип и модель клиент не хранит.
  *     Название берём из 3D-подписей сервера: Pools.Text3DLables (sic) → Text3DLabel.m_CreateParams.Text / Position (Position — мировая точка: LateUpdate отдаёт её в
  *     Camera.WorldToViewportPoint); ближайшая подпись не дальше 4 м от пикапа становится его названием.
+ *   • «/tpl pick N use» (или «/tpl use N») — «войти» в пикап, НЕ двигаясь с места. Зовём игровой Pickup.OnTriggerEnter(Collider) (RVA 0x1267BE0 в дампе от 20.10.2026).
+ *     По дизассемблированию он делает: other.gameObject.GetComponent<LocalPlayer>() → PacketData.Create(); Write(m_ID); Game.Network.SendRPC(131 = RPC_Type.PickedUpPickup,
+ *     HIGH_PRIORITY, RELIABLE_SEQUENCED, канал 0). Вместо коллайдера отдаём сам LocalPlayer (он MonoBehaviour, его gameObject — тот же, где LocalPlayer), так что игра сама шлёт
+ *     серверу ровно тот пакет, что при физическом входе. Пакет вручную не собираем: у PacketData.Write 8 перегрузок с одним аргументом, поиск по имени взял бы не ту.
+ *     Сервер проверяет расстояние до пикапа (обычный — до ~5 м), поэтому стоять нужно рядом; сам он вас не двигает и не возвращает. Не проверено на устройстве.
  *   • Маркер (чекпоинт) — статические Checkpoint.Simple / Checkpoint.Race (SetCheckpoint / SetRaceCheckpoint от сервера); он у игрока один, виден в списке, пока активен.
  *   • ВАЖНО: клиент знает только тех, кого сервер подгрузил рядом (зона стрима), весь список сервера из клиента не достать. Код не запускался на устройстве —
  *     собран и проверен компилятором и тестом разбора команд; если «/tpl gps» не находит метку или «/tpl pick» пуст — смотрите HLOG/konstt.log (строки «tpl:»).
@@ -959,8 +964,8 @@ static void tpl_cmd_int(int id, int have) {
 }
 
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList, under, num2Set; float dist, rawNum, num2; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
-/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick), 11 — depth (глубина нырка).
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList, under, num2Set, use; float dist, rawNum, num2; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
+/* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick; use — слово use: войти в пикап, не двигаясь), 11 — depth (глубина нырка).
    gsub (для ghost): 0 — переключить, 1 on, 2 off, 3 back, 4 unhook;  iid/iidSet — номер интерьера;  rawNum — число до подрезки по TPL_MIN (для «/tpl 0 int»).  name — имя точки (слово после save/go/del);
    unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
 
@@ -1002,6 +1007,7 @@ static int tpl_word(const char* t) {
     if (seq(t, "under") || seq(t, "dive") || seq(t, "ниже") || seq(t, "нырок")) return 23;
     if (seq(t, "depth") || seq(t, "deep") || seq(t, "глубина") || seq(t, "глуб")) return 24;
     if (seq(t, "up") || seq(t, "surface") || seq(t, "вынырнуть") || seq(t, "наверх") || seq(t, "вверх")) return 25;
+    if (seq(t, "use") || seq(t, "touch")) return 26;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -1055,6 +1061,7 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 23) a->under = 1;
     else if (w == 24) a->mode = 11;
     else if (w == 25) a->mode = 12;
+    else if (w == 26) { a->use = 1; a->mode = 10; }                 /* «use»: «/tpl use N» == «/tpl pick N use» */
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -1091,7 +1098,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
     a->bad = 1;
 }
 static void tpl_args_init(TplArgs* a) {
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = a->under = a->num2Set = 0; a->num2 = 0.0f; a->dist = TPL_DEF; a->rawNum = -1.0f;
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = a->under = a->num2Set = a->use = 0; a->num2 = 0.0f; a->dist = TPL_DEF; a->rawNum = -1.0f;
     a->c[0] = a->c[1] = a->c[2] = 0.0f; a->name[0] = a->unk[0] = 0;
 }
 /* аргументы: string[] */
@@ -1607,6 +1614,57 @@ static void tpl_cmd_pick(int num, int list, int under, float holdSec) {
     if (page < pages) { b_s(&b, ";  дальше: /tpl pick list "); b_int(&b, page + 1); }
     chat_usage(msg);
 }
+/* «/tpl pick N use» / «/tpl use N» — войти в пикап №N из последнего списка, не двигаясь: зовём игровой Pickup.OnTriggerEnter(other) с LocalPlayer вместо коллайдера.
+   Игра сама шлёт серверу RPC PickedUpPickup(m_ID) (см. шапку файла). Пикап ищем в Pools.Pickups по ID из снимка (номера могли сдвинуться, ID — нет). */
+typedef struct { int want; void* found; } TplUseCtx;
+static void tpl_use_cb(void* it, void* ctx) {
+    TplUseCtx* u = (TplUseCtx*)ctx;
+    if (u->found || !hm_obj_ok(it)) return;
+    if ((int)num_field(it, "m_ID", NULL) == u->want) u->found = it;
+}
+static void* tpl_pickup_by_id(int id) {
+    TplUseCtx u; void *pool, *dict, *arr; int total;
+    u.want = id; u.found = NULL;
+    pool = tpl_pool("Pickups");
+    dict = pool ? ref_field_s(pool, "m_Items") : NULL;
+    arr = dict ? ref_field_s(dict, "_entries") : NULL;
+    if (!arr) return NULL;
+    total = int_field(dict, "_count", "count", NULL, -1);
+    walk_struct_array(arr, total, "value", tpl_use_cb, &u);
+    return u.found;
+}
+static void tpl_cmd_use(int num) {
+    TplCtx c; TplPk pk; void *obj, *m, *exc = NULL, *args[1]; Buf b; char msg[300], et[240]; float me[3]; int haveMe;
+    if (!tpl_ctx(&c, 0)) return;
+    if (num < 1) { chat_usage("Войти в пикап, не двигаясь: /tpl pick N use (или /tpl use N). Номер N — из списка /tpl pick"); return; }
+    if (!g_tpl_npk) { chat_say("Списка пикапов ещё нет — подойдите к пикапу и выполните /tpl pick, потом /tpl pick N use"); return; }
+    if (num > g_tpl_npk) {
+        b_init(&b, msg, sizeof msg); b_s(&b, "Пикап №"); b_int(&b, num); b_s(&b, " — такого номера нет, в списке 1…"); b_int(&b, g_tpl_npk);
+        b_s(&b, " (обновить список: /tpl pick)"); chat_say(msg); return;
+    }
+    pk = g_tpl_pk[num - 1];
+    if (pk.kind != 0) { chat_say("«use» работает только с пикапами, не с маркерами. К маркеру: /tpl pick N"); return; }
+    obj = tpl_pickup_by_id(pk.id);
+    if (!obj) {
+        b_init(&b, msg, sizeof msg); b_s(&b, "Пикап №"); b_int(&b, num); b_s(&b, " (ID "); b_int(&b, pk.id); b_s(&b, ") уже не в зоне стрима — обновите список: /tpl pick");
+        chat_say(msg); return;
+    }
+    m = find_method(A.object_get_class(obj), "OnTriggerEnter", 1);
+    if (!m) { chat_say("/tpl use: у пикапа нет OnTriggerEnter — игра обновилась, нужна правка мода (подробности в konstt.log)"); dlog("/tpl use: Pickup.OnTriggerEnter не найден"); return; }
+    haveMe = tpl_cur_pos(&c, me) == 1;
+    args[0] = c.me;                                                  /* вместо Collider — LocalPlayer: игре нужен только его gameObject */
+    A.runtime_invoke(m, obj, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("/tpl use: OnTriggerEnter бросил исключение: ", et); chat_say("/tpl use: не вышло — подробности в konstt.log"); return; }
+    b_init(&b, msg, sizeof msg); b_s(&b, "Пикап №"); b_int(&b, num); b_s(&b, " (ID "); b_int(&b, pk.id); b_s(&b, "): вход отправлен серверу, вы остались на месте");
+    if (haveMe) {
+        float pp[3], d; pp[0] = pk.p[0]; pp[1] = pk.p[1] + TPL_SYNC_DY; pp[2] = pk.p[2];   /* сервер видит пикап на TPL_SYNC_DY выше Transform */
+        d = tpl_d3(me, pp);
+        b_s(&b, " (до пикапа ~"); b_fix(&b, d, 1); b_s(&b, " м)");
+        if (d > 4.5f) b_s(&b, ". Далеко: сервер принимает пикап только в радиусе ~5 м — подойдите ближе");
+    }
+    chat_say(msg);
+    dlog2("/tpl use: ", msg);
+}
 /* «/tpl up» — вынырнуть СЕЙЧАС: не ждать, пока выйдет hold у «/tpl pick N under [сек]». Dress.js ныряет с запасом по времени (например 8 с), а как только
    сервер сменил скин — шлёт /tpl up, и возврат происходит в этом же вызове (главный поток, без ожидания тика в ≤ 60 мс).
    Нырка нет (уже вернули по таймеру) — молча ничего не делаем (только строка в konstt.log), чтобы не засорять чат лишними сообщениями. */
@@ -1648,6 +1706,7 @@ static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
     chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
+    chat_usage("/tpl pick N use (или /tpl use N) — войти в пикап №N, не двигаясь с места (стойте рядом, до ~5 м): клиент сам шлёт серверу вход в пикап. Раздевалка: /dress use");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
     chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место;  /tpl depth [м] — глубина нырка (по умолчанию 1)");
 }
@@ -1699,6 +1758,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
     if (a.mode == 12) { tpl_cmd_up(); return; }
     if (a.under && a.mode != 10) { chat_usage("Нырок под пол — только к пикапу: /tpl pick N under [секунды]  (сначала /tpl pick — список с номерами)"); return; }
     if (a.mode == 11) { tpl_cmd_depth(a.numSet ? a.rawNum : -1.0f); return; }
+    if (a.mode == 10 && a.use) { tpl_cmd_use(a.numSet ? (int)(a.rawNum + 0.5f) : -1); return; }   /* use важнее under и list */
     if (a.mode == 10) { tpl_cmd_pick(a.numSet ? (int)(a.rawNum + 0.5f) : -1, a.pkList, a.under, a.num2Set ? a.num2 : -1.0f); return; }
     if (a.mode == 5) { tpl_cmd_list(a.numSet ? (int)(a.dist + 0.5f) : 1); return; }
     if (a.mode == 3 || a.mode == 4 || a.mode == 6) {
