@@ -1657,7 +1657,7 @@ static void tpl_cmd_use(int num) {
     if (exc) { exc_text(exc, et, sizeof et); dlog2("/tpl use: OnTriggerEnter бросил исключение: ", et); chat_say("/tpl use: не вышло — подробности в konstt.log"); return; }
     b_init(&b, msg, sizeof msg); b_s(&b, "Пикап №"); b_int(&b, num); b_s(&b, " (ID "); b_int(&b, pk.id); b_s(&b, "): вход отправлен серверу, вы остались на месте");
     if (haveMe) {
-        float pp[3], d; pp[0] = pk.p[0]; pp[1] = pk.p[1] + TPL_SYNC_DY; pp[2] = pk.p[2];   /* сервер видит пикап на TPL_SYNC_DY выше Transform */
+        float pp[3], d; pp[0] = pk.p[0]; pp[1] = pk.p[1] - TPL_SYNC_DY; pp[2] = pk.p[2];   /* сервер видит ВАС на TPL_SYNC_DY выше вашего Transform, а пикап — в его Transform; сравниваем me с точкой пикапа минус TPL_SYNC_DY */
         d = tpl_d3(me, pp);
         b_s(&b, " (до пикапа ~"); b_fix(&b, d, 1); b_s(&b, " м)");
         if (d > 4.5f) b_s(&b, ". Далеко: сервер принимает пикап только в радиусе ~5 м — подойдите ближе");
