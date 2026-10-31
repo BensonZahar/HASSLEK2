@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
-    paths-ignore: ['**.md']
+    paths-ignore: ['**.md', 'key/**']      # правка списка ключей не должна пересобирать бандл
 
 permissions:
   contents: write          # нужно, чтобы опубликовать ветку dist
