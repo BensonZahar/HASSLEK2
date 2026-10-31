@@ -26,7 +26,10 @@
  *                        «back» — вернуться на точку включения и выключить. «/tpl ghost unhook» — вернуть код игры в исходный вид.
  *                        «/tpl ghost tap [сек]» — на несколько секунд (по умолчанию 4, до 60) ПУСТИТЬ пакеты: чтобы наступить на метку/маркер
  *                        (переодеться, взять работу и т.п.). Потом призрак включается сам. Пока окно открыто, сервер видит вас там, где вы стоите.
- *   /tpl sync N [метры] [сек]  подмена позиции в sync-пакете: сервер на время окна видит вас в «метры» (по умолчанию 2.2, от 1.7 до 4.5) от пикапа №N из списка /tpl pick,
+ *   /tpl sync N [метры] [сек] [far]  подмена позиции в sync-пакете. БЕЗ «метры» (или 0) — авто, минимум нужного: вы уже в 1.9–4.2 м от пикапа №N — подмена не нужна,
+ *                        пакет не трогаем вовсе («Sync-подмена: не нужна»); ближе — сервер видит вас в 2.2 м (сдвиг по земле, ≤ ~2.2 м); дальше 4.2 м — отказ («далеко»),
+ *                        пока не добавлено слово «far» (тогда придвигаем сервер к пикапу до 4.0 м: для сервера это прыжок на «сдвиг» м). С «метры» (1.7…4.5) — прежний режим:
+ *                        сервер на время окна видит вас в «метры» (от пикапа №N из списка /tpl pick),
  *                        а вы физически стоите там же, где стояли (хоть вплотную к пикапу) — НИКАКОГО телепорта, тестовые NPC не двигаются. Окно закрывается само
  *                        через «сек» (по умолчанию 3, до 15) или по «/tpl sync off». Дальше — «/tpl pick N use» (Dress.js делает это сам: /dressu).
  *                        «/tpl sync unhook» — вернуть код игры. Только пешком; при включённом /tpl ghost не нужна (пакеты и так не уходят).
@@ -1111,7 +1114,7 @@ static void tpl_cmd_int(int id, int have) {
 }
 
 /* ───────────── разбор аргументов ───────────── */
-typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList, under, num2Set, use; float dist, rawNum, num2; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
+typedef struct { int side, sideSet, alt, status, help, numSet, bad, clamped, mode, nc, nameSet, unkN, gsub, iid, iidSet, pkList, under, num2Set, use, far; float dist, rawNum, num2; float c[3]; char name[TPL_NAME], unk[TPL_NAME]; } TplArgs;
 /* mode: 0 — сдвиг, 1 — pos, 2 — to X Y Z, 3 — save имя, 4 — go имя, 5 — list, 6 — del имя, 7 — ghost, 8 — int, 9 — gps, 10 — pick (pkList — слово list после pick; use — слово use: войти в пикап, не двигаясь), 11 — depth (глубина нырка), 12 — up, 13 — sync (подмена позиции в пакете: числа в c[0..nc-1] — N, метры, секунды; gsub 2 — off, 4 — unhook).
    gsub (для ghost): 0 — переключить, 1 on, 2 off, 3 back, 4 unhook;  iid/iidSet — номер интерьера;  rawNum — число до подрезки по TPL_MIN (для «/tpl 0 int»).  name — имя точки (слово после save/go/del);
    unk/unkN — первое неизвестное слово и сколько их было: это может быть имя точки («/tpl дом», «/tpl дом save») */
@@ -1156,6 +1159,7 @@ static int tpl_word(const char* t) {
     if (seq(t, "up") || seq(t, "surface") || seq(t, "вынырнуть") || seq(t, "наверх") || seq(t, "вверх")) return 25;
     if (seq(t, "use") || seq(t, "touch")) return 26;
     if (seq(t, "sync") || seq(t, "spoof") || seq(t, "подмена") || seq(t, "синк")) return 27;
+    if (seq(t, "far") || seq(t, "далеко") || seq(t, "издалека")) return 28;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -1210,6 +1214,7 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 24) a->mode = 11;
     else if (w == 25) a->mode = 12;
     else if (w == 26) { a->use = 1; a->mode = 10; }                 /* «use»: «/tpl use N» == «/tpl pick N use» */
+    else if (w == 28) a->far = 1;                                   /* «far»: «/tpl sync N 0 far» — разрешить подмену издалека (прыжок позиции для сервера) */
     else if (w == 27) a->mode = 13;                                 /* «sync»: «/tpl sync N [метры] [сек]», «/tpl sync off» */
 }
 static void tpl_token(const char* tok, TplArgs* a) {
@@ -1252,7 +1257,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
     a->bad = 1;
 }
 static void tpl_args_init(TplArgs* a) {
-    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = a->under = a->num2Set = a->use = 0; a->num2 = 0.0f; a->dist = TPL_DEF; a->rawNum = -1.0f;
+    a->side = TPL_L; a->sideSet = a->alt = a->status = a->help = a->numSet = a->bad = a->clamped = a->mode = a->nc = a->nameSet = a->unkN = a->gsub = a->iid = a->iidSet = a->pkList = a->under = a->num2Set = a->use = a->far = 0; a->num2 = 0.0f; a->dist = TPL_DEF; a->rawNum = -1.0f;
     a->c[0] = a->c[1] = a->c[2] = 0.0f; a->name[0] = a->unk[0] = 0;
 }
 /* аргументы: string[] */
@@ -1824,13 +1829,41 @@ static void tpl_cmd_use(int num) {
    предел GS_MAX_S) или по «/tpl sync off». Так клиент не нарушает стойку NPC: никакого телепорта, только пакет. Сервер сам снимает у себя флаг «игрок на пикапе»,
    когда видит вас дальше ~1.5 м, поэтому после паузы (~0.5–0.7 с) «/tpl pick N use» проходит с того места, где вы стоите. Дальше ~5 м от пикапа use сервер не принимает.
    sub: 0 — включить, 2 — «off» (выключить окно), 4 — «unhook» (вернуть код игры). num < 0 / meters < 0 / secs < 0 — не указано. */
+#define GS_OK_MIN 1.9f                                   /* авто-режим: сервер видит вас дальше этого от пикапа — флаг «на пикапе» уже снят, подмена не нужна */
+#define GS_OK_MAX 4.2f                                   /* ...и ближе этого — use ещё принимается (радиус ~5 м, запас на шум координат) */
+#define GS_NEAR_T 2.2f                                   /* вы ближе GS_OK_MIN: отодвигаем сервер до этого расстояния (2.2 м проверено в игре) */
+#define GS_FAR_T  4.0f                                   /* вы дальше GS_OK_MAX (режим far): придвигаем сервер только до этого расстояния */
 #define GS_DEF_M 2.2f                                    /* м от пикапа, которые увидит сервер: выше порога «вышел с пикапа» (~1.5 м) с запасом, ниже 5 м приёма use */
 #define GS_MIN_M 1.7f
 #define GS_MAX_M 4.5f
 #define GS_DEF_S 3.0f                                    /* окно по умолчанию, сек */
 #define GS_MAX_S 15.0f
-static void tpl_cmd_sync(int num, float meters, float secs, int sub) {
-    TplCtx c; TplPk pk; Buf b; char msg[320]; float me[3], dx, dz, len, tg[3]; long long ms;
+/* Минимальная подмена. R — позиция, в которой сервер видит вас сейчас (в пакете: Transform + 1 м), K — точка пикапа (как у сервера).
+   Возврат: 0 — подмена не нужна (вы уже в окне GS_OK_MIN…GS_OK_MAX; tg = R); 1 — вы слишком близко: отодвигаем; 2 — слишком далеко: придвигаем.
+   tg — что слать серверу, *dist — настоящее расстояние до пикапа (3D, шар — как проверяет сервер), *shift — на сколько метров tg отличается от R.
+   Двигаем только по земле, настоящая высота остаётся (так сервер не видит вертикального рывка); высота сильно разная — тогда по прямой к пикапу. */
+static int gs_plan(const float* R, const float* K, float* tg, float* dist, float* shift) {
+    float dx = R[0] - K[0], dy = R[1] - K[1], dz = R[2] - K[2];
+    float h = __builtin_sqrtf(dx * dx + dz * dz), d = __builtin_sqrtf(h * h + dy * dy), want, ex, ey, ez;
+    *dist = d; *shift = 0.0f;
+    tg[0] = R[0]; tg[1] = R[1]; tg[2] = R[2];
+    if (d >= GS_OK_MIN && d <= GS_OK_MAX) return 0;
+    want = d < GS_OK_MIN ? GS_NEAR_T : GS_FAR_T;
+    if (dy < want - 0.3f && dy > -(want - 0.3f)) {
+        float hh = __builtin_sqrtf(want * want - dy * dy), ux, uz;
+        if (h < 0.15f) { ux = 1.0f; uz = 0.0f; } else { ux = dx / h; uz = dz / h; }   /* стоите ровно над/под пикапом — направление не определить, берём +X */
+        tg[0] = K[0] + ux * hh; tg[2] = K[2] + uz * hh;
+    } else {
+        float ux = 1.0f, uy = 0.0f, uz = 0.0f;
+        if (d >= 0.15f) { ux = dx / d; uy = dy / d; uz = dz / d; }
+        tg[0] = K[0] + ux * want; tg[1] = K[1] + uy * want; tg[2] = K[2] + uz * want;
+    }
+    ex = tg[0] - R[0]; ey = tg[1] - R[1]; ez = tg[2] - R[2];
+    *shift = __builtin_sqrtf(ex * ex + ey * ey + ez * ez);
+    return d < GS_OK_MIN ? 1 : 2;
+}
+static void tpl_cmd_sync(int num, float meters, float secs, int sub, int far) {
+    TplCtx c; TplPk pk; Buf b; char msg[420]; float me[3], R[3], dx, dz, len, tg[3], realD = 0.0f, shift = 0.0f, seen; long long ms; int src, plan = 0;
     if (sub == 4) {
         gs_unhook();
         chat_say(g_gs_state ? "Sync-подмена: выключена, но вернуть код игры не удалось (см. konstt.log)" : "Sync-подмена: выключена, перехват снят, код игры в исходном виде");
@@ -1843,7 +1876,7 @@ static void tpl_cmd_sync(int num, float meters, float secs, int sub) {
         if (was) chat_say(msg); else dlog2("/tpl sync off: окна не было. ", msg);
         return;
     }
-    if (num < 1) { chat_usage("Sync-подмена: /tpl sync N [метры] [сек] — N из списка /tpl pick; /tpl sync off — выключить. Потом /tpl pick N use"); return; }
+    if (num < 1) { chat_usage("Sync-подмена: /tpl sync N [метры|0] [сек] [far] — N из списка /tpl pick; без метров — авто (не нужна, если вы в 1.9–4.2 м от пикапа); /tpl sync off — выключить. Потом /tpl pick N use"); return; }
     if (!g_tpl_npk) { chat_say("Sync-подмена: ошибка — списка пикапов ещё нет, сначала /tpl pick"); return; }
     if (num > g_tpl_npk) {
         b_init(&b, msg, sizeof msg); b_s(&b, "Sync-подмена: ошибка — номера "); b_int(&b, num); b_s(&b, " нет, в списке 1…"); b_int(&b, g_tpl_npk); b_s(&b, " (обновить: /tpl pick)");
@@ -1853,20 +1886,46 @@ static void tpl_cmd_sync(int num, float meters, float secs, int sub) {
     if (pk.kind != 0) { chat_say("Sync-подмена: ошибка — нужен пикап, а не маркер"); return; }
     if (__atomic_load_n(&g_gh_on, __ATOMIC_ACQUIRE) == 1) { chat_say("Sync-подмена: ошибка — включён /tpl ghost (пакеты и так не уходят). Выключите: /tpl ghost off"); return; }
     if (!tpl_ctx(&c, 1)) return;                                     /* пешком: пакет машины (Drive/Passenger) мы не меняем */
-    if (!tpl_cur_pos(&c, me)) { chat_say("Sync-подмена: ошибка — не удалось прочитать вашу позицию (подробности в konstt.log)"); return; }
-    if (meters < 0.0f) meters = GS_DEF_M;
-    if (meters < GS_MIN_M) { meters = GS_MIN_M; chat_usage("Sync-подмена: ближе 1.7 м сервер ещё считает вас на пикапе — взял 1.7"); }
-    if (meters > GS_MAX_M) { meters = GS_MAX_M; chat_usage("Sync-подмена: дальше 4.5 м use у сервера не пройдёт (радиус ~5 м, у пикапов с клавишей меньше) — взял 4.5"); }
+    src = tpl_cur_pos(&c, me);
+    if (!src) { chat_say("Sync-подмена: ошибка — не удалось прочитать вашу позицию (подробности в konstt.log)"); return; }
+    R[0] = me[0]; R[1] = me[1] + (src == 1 ? TPL_SYNC_DY : 0.0f); R[2] = me[2];          /* то, что сервер видит сейчас: Transform + 1 м (из пакета — уже с метром) */
     if (secs < 0.0f) secs = GS_DEF_S;
     if (secs < 0.5f) secs = 0.5f;
     if (secs > GS_MAX_S) secs = GS_MAX_S;
-    dx = me[0] - pk.p[0]; dz = me[2] - pk.p[2];
-    len = __builtin_sqrtf(dx * dx + dz * dz);
-    if (len < 0.15f) { dx = 1.0f; dz = 0.0f; len = 1.0f; }          /* стоите ровно на пикапе — направление не определить, берём +X */
-    tg[0] = pk.p[0] + dx / len * meters;
-    tg[1] = pk.p[1];                                                 /* пакет: Transform.y + 1.0, пикап: свой Transform — сервер сравнивает именно эти числа */
-    tg[2] = pk.p[2] + dz / len * meters;
-    if (!tpl_finite(tg) || !tpl_finite(me)) { chat_say("Sync-подмена: ошибка — координаты пикапа или ваши нечитаемы"); return; }
+    if (!tpl_finite(R) || !tpl_finite(pk.p)) { chat_say("Sync-подмена: ошибка — координаты пикапа или ваши нечитаемы"); return; }
+    if (meters > 0.0f) {                                             /* явные метры: прежний режим — сервер видит вас ровно в «метры» от пикапа, с нашей стороны */
+        if (meters < GS_MIN_M) { meters = GS_MIN_M; chat_usage("Sync-подмена: ближе 1.7 м сервер ещё считает вас на пикапе — взял 1.7"); }
+        if (meters > GS_MAX_M) { meters = GS_MAX_M; chat_usage("Sync-подмена: дальше 4.5 м use у сервера не пройдёт (радиус ~5 м, у пикапов с клавишей меньше) — взял 4.5"); }
+        dx = R[0] - pk.p[0]; dz = R[2] - pk.p[2];
+        len = __builtin_sqrtf(dx * dx + dz * dz);
+        if (len < 0.15f) { dx = 1.0f; dz = 0.0f; len = 1.0f; }      /* стоите ровно на пикапе — направление не определить, берём +X */
+        tg[0] = pk.p[0] + dx / len * meters;
+        tg[1] = pk.p[1];                                             /* пакет: Transform.y + 1.0, пикап: свой Transform — сервер сравнивает именно эти числа */
+        tg[2] = pk.p[2] + dz / len * meters;
+        realD = tpl_d3(R, pk.p); shift = tpl_d3(R, tg);
+    } else {                                                         /* авто (метры не указаны или 0): минимум того, что нужно серверу */
+        plan = gs_plan(R, pk.p, tg, &realD, &shift);
+        if (plan == 0) {
+            int was = __atomic_exchange_n(&g_gs_on, 0, __ATOMIC_ACQ_REL);          /* окно от прежней команды (если было) закрываем: оно уже не нужно */
+            b_init(&b, msg, sizeof msg);
+            b_s(&b, "Sync-подмена: не нужна — вы в "); b_fix(&b, realD, 1); b_s(&b, " м от пикапа №"); b_int(&b, num);
+            b_s(&b, " (окно приёма "); b_fix(&b, GS_OK_MIN, 1); b_s(&b, "–"); b_fix(&b, GS_OK_MAX, 1); b_s(&b, " м): сервер и так видит вас там, где вы стоите, позиция не меняется");
+            if (was) b_s(&b, " (прежнее окно подмены закрыто)");
+            chat_say(msg);
+            dlog2("/tpl sync: ", msg);
+            return;
+        }
+        if (plan == 2 && !far) {
+            b_init(&b, msg, sizeof msg);
+            b_s(&b, "Sync-подмена: далеко — вы в "); b_fix(&b, realD, 1); b_s(&b, " м от пикапа №"); b_int(&b, num);
+            b_s(&b, ", а сервер принимает вход до "); b_fix(&b, GS_OK_MAX, 1); b_s(&b, " м. Подойдите ближе или разрешите прыжок позиции для сервера (сдвиг "); b_fix(&b, shift, 1);
+            b_s(&b, " м, NPC рядом могут сдвинуться): /tpl sync "); b_int(&b, num); b_s(&b, " 0 far");
+            chat_say(msg);
+            dlog2("/tpl sync: ", msg);
+            return;
+        }
+    }
+    if (!tpl_finite(tg)) { chat_say("Sync-подмена: ошибка — координаты пикапа или ваши нечитаемы"); return; }
     if (!gs_install()) { b_init(&b, msg, sizeof msg); b_s(&b, "Sync-подмена: ошибка — перехват не поставлен: "); b_s(&b, g_gs_err); chat_say(msg); return; }
     g_gs_pos[0] = tg[0]; g_gs_pos[1] = tg[1]; g_gs_pos[2] = tg[2];
     ms = (long long)(secs * 1000.0f + 0.5f);
@@ -1880,10 +1939,11 @@ static void tpl_cmd_sync(int num, float meters, float secs, int sub) {
         else dlog("/tpl sync: поле m_LastSendSyncTick не найдено — первый пакет с подменой может уйти до 0.5 с позже");
     }
     b_init(&b, msg, sizeof msg);
-    b_s(&b, "Sync-подмена: включена на "); b_fix(&b, secs, 1); b_s(&b, " с — сервер видит вас в "); b_fix(&b, meters, 1); b_s(&b, " м от пикапа №"); b_int(&b, num);
-    b_s(&b, " (ID "); b_int(&b, pk.id); b_s(&b, "), вы стоите на месте");
+    seen = tpl_d3(tg, pk.p);
+    b_s(&b, "Sync-подмена: включена на "); b_fix(&b, secs, 1); b_s(&b, " с — сервер видит вас в "); b_fix(&b, seen, 1); b_s(&b, " м от пикапа №"); b_int(&b, num);
+    b_s(&b, " (ID "); b_int(&b, pk.id); b_s(&b, "), вы стоите на месте; настоящее расстояние "); b_fix(&b, realD, 1); b_s(&b, " м, сдвиг для сервера "); b_fix(&b, shift, 1); b_s(&b, " м");
     chat_say(msg);
-    { char lg[260]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl sync: пакет «пешком» → позиция "); tpl_b_xyz(&x, tg); b_s(&x, "; ваша настоящая "); tpl_b_xyz(&x, me); b_s(&x, "; пикап "); tpl_b_xyz(&x, pk.p); dlog(lg); }
+    { char lg[260]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl sync: пакет «пешком» → позиция "); tpl_b_xyz(&x, tg); b_s(&x, "; ваша настоящая (пакет) "); tpl_b_xyz(&x, R); b_s(&x, "; пикап "); tpl_b_xyz(&x, pk.p); dlog(lg); }
 }
 /* «/tpl up» — вынырнуть СЕЙЧАС: не ждать, пока выйдет hold у «/tpl pick N under [сек]». Dress.js ныряет с запасом по времени (например 8 с), а как только
    сервер сменил скин — шлёт /tpl up, и возврат происходит в этом же вызове (главный поток, без ожидания тика в ≤ 60 мс).
@@ -1927,7 +1987,7 @@ static void tpl_usage(void) {
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
     chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("/tpl pick N use (или /tpl use N) — войти в пикап №N, не двигаясь с места (стойте рядом, до ~5 м): клиент сам шлёт серверу вход в пикап. Раздевалка: /dress use");
-    chat_usage("/tpl sync N [метры] [сек] — подмена позиции в sync-пакете: сервер видит вас в N метрах от пикапа №N (по умолчанию 2.2 м), а вы стоите вплотную; потом /tpl pick N use. /tpl sync off — выключить");
+    chat_usage("/tpl sync N [метры|0] [сек] [far] — подмена позиции в sync-пакете; авто (без метров): стоите в 1.9–4.2 м от пикапа — не нужна, ближе — сервер видит вас в 2.2 м, дальше — только с far; потом /tpl pick N use. /tpl sync off — выключить");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
     chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место;  /tpl depth [м] — глубина нырка (по умолчанию 1)");
 }
@@ -1982,7 +2042,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         if (a.numSet && nn < 3) nv[nn++] = a.rawNum;
         if (a.num2Set && nn < 3) nv[nn++] = a.num2;
         for (k = 0; k < a.nc && nn < 3; k++) nv[nn++] = a.c[k];
-        tpl_cmd_sync(nn > 0 ? (int)(nv[0] + 0.5f) : -1, nn > 1 ? nv[1] : -1.0f, nn > 2 ? nv[2] : -1.0f, a.gsub);
+        tpl_cmd_sync(nn > 0 ? (int)(nv[0] + 0.5f) : -1, nn > 1 ? nv[1] : -1.0f, nn > 2 ? nv[2] : -1.0f, a.gsub, a.far);
         return;
     }
     if (a.under && a.mode != 10) { chat_usage("Нырок под пол — только к пикапу: /tpl pick N under [секунды]  (сначала /tpl pick — список с номерами)"); return; }
