@@ -1,0 +1,4 @@
+loader_min 2
+build 20261031-183054-4b88ac6
+arm64 5755e6bdfb15665a48c4758c3baf056b682b00ad51f75ead30630fd9fd0abcbb 603504 libkonstt_mods_arm64.so
+arm32 1542845431f0fb7a7f70fab2bd535ef11781e1e8e77db83ea3588c7da1dbc2f5 909592 libkonstt_mods_arm32.so
