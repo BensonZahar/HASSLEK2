@@ -29,6 +29,7 @@ static void b_jstr(Buf* b, const char* s) {            /* JSON-строка (s �
 }
 
 /* ───────────── сокеты (нужны только HTTP-серверу) ───────────── */
+extern int clock_gettime(int, void*);
 extern int socket(int, int, int);
 extern int setsockopt(int, int, int, const void*, unsigned);
 extern int bind(int, const void*, unsigned);
@@ -73,12 +74,67 @@ static int walk_collection(void* coll, item_cb cb, void* ctx) {
 /* ───────────── чтение игроков ───────────── */
 typedef struct {
     int id; int hasPos; float x, y, z; double hp, ar, ping, score; int veh; int src; char label[96]; char nick[64]; int labelId;
+    int hasVel; float vx, vy, vz;                  /* скорость м/с — по смещению позиции между опросами */
 } PInfo;
 #define MAXP 256
 static PInfo g_pl[MAXP];
 static int g_np;
 static void* g_local;
 static int g_meKind;                           /* какой пакет синхронизации у вас самих: 1 пешком, 2 водитель, 3 пассажир */
+
+/* ───────────── время и скорость ─────────────
+   Скорость считаем сами: разность позиций между двумя опросами / время между ними (единицы MoveSpeed из пакета заранее неизвестны, а так — всегда м/с).
+   Near.js по ней двигает позицию цели на возраст данных + RTT (прогноз на момент прихода команды/сообщения на сервер).
+   Позиция не менялась дольше VEL_HOLD_MS — игрок стоит, скорость 0. Запись истории живёт по ID; ключ -2 — это вы сами. */
+static long mono_ms(void) {
+    struct { long s; long ns; } ts;
+    if (clock_gettime(1, &ts) != 0) return 0;
+    return ts.s * 1000L + ts.ns / 1000000L;
+}
+#define VEL_HOLD_MS 700
+#define VEL_MAX 60.0f                                  /* больше — это телепорт/скачок, а не скорость */
+typedef struct { int id; float x, y, z, vx, vy, vz; long tSeen, tMove; } VelRec;
+static VelRec g_vel[MAXP + 1];
+static int g_nvel;
+static void vel_track(int id, const float* pos, long now, float* v) {
+    int i, k = -1; VelRec* r;
+    v[0] = v[1] = v[2] = 0;
+    for (i = 0; i < g_nvel; i++) if (g_vel[i].id == id) { k = i; break; }
+    if (k < 0) {                                        /* новая запись (при переполнении — вытесняем самую давнюю) */
+        if (g_nvel < MAXP + 1) k = g_nvel++;
+        else { long old = now; k = 0; for (i = 0; i < g_nvel; i++) if (g_vel[i].tSeen <= old) { old = g_vel[i].tSeen; k = i; } }
+        r = &g_vel[k]; r->id = id; r->x = pos[0]; r->y = pos[1]; r->z = pos[2]; r->vx = r->vy = r->vz = 0; r->tSeen = r->tMove = now;
+        return;
+    }
+    r = &g_vel[k];
+    if (now - r->tSeen > 3000) {                        /* игрока долго не видели — старая позиция не годится для разности */
+        r->x = pos[0]; r->y = pos[1]; r->z = pos[2]; r->vx = r->vy = r->vz = 0; r->tSeen = r->tMove = now;
+        return;
+    }
+    if (pos[0] != r->x || pos[1] != r->y || pos[2] != r->z) {
+        float dt = (float)(now - r->tMove) / 1000.0f, dx = pos[0] - r->x, dy = pos[1] - r->y, dz = pos[2] - r->z, sp;
+        if (dt < 0.05f) dt = 0.05f;
+        r->vx = dx / dt; r->vy = dy / dt; r->vz = dz / dt;
+        sp = __builtin_sqrtf(r->vx * r->vx + r->vy * r->vy + r->vz * r->vz);
+        if (sp > VEL_MAX) r->vx = r->vy = r->vz = 0;    /* скачок/телепорт */
+        r->x = pos[0]; r->y = pos[1]; r->z = pos[2]; r->tMove = now;
+    } else if (now - r->tMove > VEL_HOLD_MS) {
+        r->vx = r->vy = r->vz = 0;
+    }
+    r->tSeen = now;
+    v[0] = r->vx; v[1] = r->vy; v[2] = r->vz;
+}
+static long g_tickMs;                                   /* момент чтения текущего снимка */
+static double g_mePing;
+
+static int bool_field(void* obj, const char* name, int* has) {   /* bool-поле объекта (read_num bool не знает); has=0 — поля нет */
+    void* f; if (has) *has = 0;
+    if (!obj) return 0;
+    f = find_field(A.object_get_class(obj), name);
+    if (!f) return 0;
+    if (has) *has = 1;
+    return *((u8*)obj + A.field_get_offset(f)) ? 1 : 0;
+}
 
 static void* g_mGetText;
 static void read_label(void* player, PInfo* p) {
@@ -131,7 +187,13 @@ static void on_player(void* item, void* ctx) {
     p->id = int_field(item, "m_ID", NULL, NULL, -1);
     if (item == g_local) return;
     p->hasPos = read_pos_k(item, pos, &p->src);
+    if (p->hasPos) {                                    /* пакета позиции ещё не было — в структуре нули: это не координаты, а «неизвестно» */
+        int has = 0, got = bool_field(item, "m_IsPositionReceived", &has);
+        if (has && !got && pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) p->hasPos = 0;
+    }
     p->x = p->hasPos ? pos[0] : 0; p->y = p->hasPos ? pos[1] : 0; p->z = p->hasPos ? pos[2] : 0;
+    p->hasVel = 0; p->vx = p->vy = p->vz = 0;
+    if (p->hasPos && p->id >= 0) { float v[3]; vel_track(p->id, pos, g_tickMs, v); p->vx = v[0]; p->vy = v[1]; p->vz = v[2]; p->hasVel = 1; }
     p->hp = num_field(item, "m_Health", &ok);
     p->ar = num_field(item, "m_Armour", &ok);
     p->ping = num_field(item, "Ping", &ok);
@@ -145,6 +207,8 @@ static void on_player(void* item, void* ctx) {
 /* ───────────── итоговый JSON ───────────── */
 static char g_json[2][32768];
 static volatile int g_jsonCur;
+static volatile long g_snapMs[2];                      /* когда прочитан снимок g_json[i] — по нему при ответе считаем возраст «ago» */
+static float g_meV[3]; static int g_meHasV;
 static volatile unsigned g_ticks;
 static void publish(int ok, const char* why, int havePos, float mx, float my, float mz, int meId) {
     Buf b; int next = g_jsonCur ^ 1, i;
@@ -153,7 +217,9 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
     b_s(&b, ",\"stage\":"); b_jstr(&b, why);
     b_s(&b, ",\"tick\":"); b_int(&b, (long)g_ticks);
     b_s(&b, ",\"me\":{\"id\":"); b_int(&b, meId); b_s(&b, ",\"src\":"); b_int(&b, g_meKind);
+    if (g_mePing > 0) { b_s(&b, ",\"ping\":"); b_fix(&b, g_mePing, 0); }
     if (havePos) { b_s(&b, ",\"x\":"); b_fix(&b, mx, 1); b_s(&b, ",\"y\":"); b_fix(&b, my, 1); b_s(&b, ",\"z\":"); b_fix(&b, mz, 1); }
+    if (havePos && g_meHasV) { b_s(&b, ",\"vx\":"); b_fix(&b, g_meV[0], 2); b_s(&b, ",\"vy\":"); b_fix(&b, g_meV[1], 2); b_s(&b, ",\"vz\":"); b_fix(&b, g_meV[2], 2); }
     b_s(&b, "},\"n\":[");
     for (i = 0; i < g_np; i++) {
         PInfo* p = &g_pl[i];
@@ -163,6 +229,7 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
         b_s(&b, ",\"label\":"); b_jstr(&b, p->label);
         if (p->hasPos) {
             b_s(&b, ",\"x\":"); b_fix(&b, p->x, 1); b_s(&b, ",\"y\":"); b_fix(&b, p->y, 1); b_s(&b, ",\"z\":"); b_fix(&b, p->z, 1);
+            if (p->hasVel) { b_s(&b, ",\"vx\":"); b_fix(&b, p->vx, 2); b_s(&b, ",\"vy\":"); b_fix(&b, p->vy, 2); b_s(&b, ",\"vz\":"); b_fix(&b, p->vz, 2); }
             if (havePos) {
                 double dx = p->x - mx, dy = p->y - my, dz = p->z - mz;
                 b_s(&b, ",\"d\":"); b_fix(&b, __builtin_sqrt(dx * dx + dy * dy + dz * dz), 1);
@@ -177,6 +244,7 @@ static void publish(int ok, const char* why, int havePos, float mx, float my, fl
         b_ch(&b, '}');
     }
     b_s(&b, "]}");
+    g_snapMs[next] = g_tickMs ? g_tickMs : mono_ms();
     g_jsonCur = next;
 }
 
@@ -222,6 +290,7 @@ static void snap_write(float* me, int havePos, int meId) {
 static void collect_tick(void) {
     void* pool; void* stream; float me[3] = {0, 0, 0}; int havePos = 0, meId = -1;
     g_ticks++;
+    g_tickMs = mono_ms();
     if (!il2cpp_open()) { set_stage("ждём libil2cpp"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
     if (!g_domain) g_domain = A.domain_get();
     if (!g_domain) { set_stage("ждём домен IL2CPP"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
@@ -242,6 +311,9 @@ static void collect_tick(void) {
     if (g_local) {
         meId = int_field(g_local, "m_ID", NULL, NULL, -1);
         havePos = read_pos_k(g_local, me, &g_meKind);
+        { int pk = 0; double pg = num_field(g_local, "Ping", &pk); g_mePing = pk ? pg : 0; }
+        g_meHasV = 0;
+        if (havePos) { vel_track(-2, me, g_tickMs, g_meV); g_meHasV = 1; }
     }
     stream = ref_field(pool, "PlayersInStream");
     if (!stream) { set_stage("PlayersInStream = null"); g_np = 0; publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
@@ -376,7 +448,15 @@ static void* server_main(void* arg) {
                 rq[n] = 0;
                 { static int hl; if (hl < 15) { char q[48]; int k; hl++; for (k = 0; k < 47 && rq[k] && rq[k] != '\r' && rq[k] != '\n'; k++) q[k] = rq[k]; q[k] = 0; dlog2("HTTP: запрос ", q); } }
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
-                else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
+                else if (sprefix(rq, "GET /near")) {   /* к снимку дописываем "ago" — сколько мс ему было на момент ответа (Near.js двигает цель на это время) */
+                    static char out[32768 + 64]; int cur = g_jsonCur; const char* j = g_json[cur]; long ago = mono_ms() - g_snapMs[cur]; Buf ob;
+                    if (ago < 0) ago = 0;
+                    if (ago > 60000) ago = 60000;
+                    b_init(&ob, out, sizeof out);
+                    b_s(&ob, "{\"ago\":"); b_int(&ob, ago); b_ch(&ob, ',');
+                    b_s(&ob, j[0] == '{' ? j + 1 : j);
+                    respond(c, "200 OK", "application/json", ob.p, ob.n);
+                }
                 else if (sprefix(rq, "GET /id")) { char id[40]; int k; for (k = 0; k < 39 && g_near_id[k]; k++) id[k] = g_near_id[k]; id[k] = 0; respond(c, "200 OK", "text/plain", id, (unsigned)k); }   /* метка окна («» — ещё не привязано) */
                 else if (sprefix(rq, "GET /diag")) handle_diag(c);
                 else if (sprefix(rq, "GET /konstt")) { static const char kid[] = "KONSTT-CLIENT " HM_BUILD_ID; respond(c, "200 OK", "text/plain", kid, (unsigned)(sizeof kid - 1)); }   /* константа «это клиент konstt» — по ней Load.js решает, запускать ли скрипты */
