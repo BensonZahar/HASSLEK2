@@ -1,7 +1,8 @@
 {
   "Zahar": {
     "Memu - 1": "7b358e520b1b5711",
-    "Memu - 2": "86c15260a2eebb43"
+    "Memu - 2": "86c15260a2eebb43",
+    "Xiaomi Redmi Note 10 Pro": "88c9c5766b783fb9"
   },
   "Кирилл": {
     "телефон": "4586f29a8dd4b6e6"
