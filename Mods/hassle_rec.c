@@ -11,6 +11,9 @@
  *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr
  *     (всё это делает ядро: hm_cmd_install). Свой поток-ждун, как у /nocol и /route.
  *   • /rec diag — состояние в чат.
+ *   • Таймер под чатом: после успешного запуска мод один раз вызывает WebViewSystem.ExecuteJavaScript(string) (static, 1 аргумент —
+ *     из метаданных клиента) и внедряет в WebView маленький оверлей. Дальше считает JS сам: «Реконнект через N с» → «Подключение… N с»;
+ *     прячется, когда открылось окно Authorization, при новом /rec или через (N + 120) с. Ничего в фоне и ничего в главный поток не постится.
  */
 #pragma once
 #include "hassle_core.c"
@@ -112,6 +115,51 @@ static void rec_camera_stock(void) {
     dlog("реконнект: камера поднята в воздух (SetMode None + SetPosition/SetLookPosition)");
 }
 
+/* ── Таймер реконнекта под чатом ──
+   Оверлей — один div в WebView, ставится под блок чата (.radmir-chat, у старого чата .chat), при отсутствии чата — слева на 40vh.
+   Скрипт идемпотентный: новый /rec сносит старый оверлей и таймер. Внутри только одинарные кавычки, чтобы не экранировать их в C. */
+static void rec_js(const char* code) {
+    void *cw, *m, *exc = NULL, *args[1]; char et[200];
+    if (!A.string_new || !g_img) return;
+    cw = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
+    if (!cw) { dlog("реконнект: таймер: класс WebViewSystem не найден"); return; }
+    m = A.class_get_method_from_name(cw, "ExecuteJavaScript", 1);
+    if (!m) { dlog("реконнект: таймер: метод ExecuteJavaScript(1) не найден"); return; }
+    args[0] = A.string_new(code);
+    if (!args[0]) return;
+    A.runtime_invoke(m, NULL, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: таймер: ExecuteJavaScript бросил: ", et); }
+}
+static void rec_timer_show(int t) {
+    char js[2600]; Buf b;
+    b_init(&b, js, sizeof js);
+    b_s(&b,
+        "(function(t){try{var w=window,id='hm-rec-timer',old=document.getElementById(id);"
+        "if(w.__hmRecT){clearInterval(w.__hmRecT.iv);w.__hmRecT=null;}"
+        "if(old&&old.parentNode)old.parentNode.removeChild(old);"
+        "var e=document.createElement('div');e.id=id;"
+        "e.style.cssText='position:fixed;z-index:2147483000;pointer-events:none;padding:.5vh 1.1vh;border-radius:.7vh;"
+        "background:rgba(12,10,6,.62);color:#f4f1e1;font:600 1.7vh Open Sans,sans-serif;"
+        "text-shadow:0 .1vh .2vh rgba(0,0,0,.8);white-space:nowrap;left:1.66vw;top:40vh';"
+        "(document.body||document.documentElement).appendChild(e);"
+        "var t0=Date.now(),end=t0+t*1000,st={iv:0};w.__hmRecT=st;"
+        "function stop(){clearInterval(st.iv);if(e.parentNode)e.parentNode.removeChild(e);if(w.__hmRecT===st)w.__hmRecT=null;}"
+        "function auth(){try{return !!(w.getInterfaceStatus&&w.getInterfaceStatus('Authorization'));}catch(x){return false;}}"
+        "function place(){var c=document.querySelector('.radmir-chat')||document.querySelector('.chat-container .chat');"
+        "if(c){var r=c.getBoundingClientRect();if(r.width>0&&r.height>0){e.style.left=r.left+'px';e.style.top=(r.bottom+6)+'px';return;}}"
+        "e.style.left='1.66vw';e.style.top='40vh';}"
+        "function tick(){var now=Date.now(),left=Math.ceil((end-now)/1000);"
+        "if(now-t0>(t+120)*1000||(left<=0&&auth())){stop();return;}"
+        "if(left>0){e.textContent='Реконнект через '+left+' с';e.style.color='#f4f1e1';}"
+        "else{e.textContent='Подключение... '+Math.floor((now-end)/1000)+' с';e.style.color='#ffd166';}"
+        "place();}"
+        "st.iv=setInterval(tick,250);tick();}catch(x){}})(");
+    b_int(&b, t);
+    b_s(&b, ");");
+    rec_js(js);
+    dlog_i("реконнект: таймер под чатом запущен, секунд ", t);
+}
+
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
    тогда, когда игра уже идёт, поэтому ждать сборщика (бывшие 60 секунд) не нужно. */
 static void do_reconnect(int t, RecRes* r) {
@@ -184,6 +232,7 @@ static void do_reconnect(int t, RecRes* r) {
     }
     r->ok = 1; r->state = state; r->port = port;
     dlog("реконнект: DelayedConnect запущен");
+    rec_timer_show(t);                                  /* таймер под чатом (только при успехе — при ошибке в чате и так причина) */
 }
 
 static int g_recReg;                             /* 1 — /rec зарегистрирована, -1 — нет */
