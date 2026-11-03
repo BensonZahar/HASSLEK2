@@ -281,7 +281,7 @@ static void rec_ac_release(int gen) {
 #endif
     rec_ac_unlock();
 }
-/* NetworkState — enum (тип поля VALUETYPE), num_field() для него всегда даёт 0, поэтому читаем int по смещению поля. подтверждено только 2 = Connected (OnApplicationQuit делает cmp State,#2); -1 — не прочитать. */
+/* NetworkState — enum (тип поля VALUETYPE), num_field() для него всегда даёт 0, поэтому читаем int по смещению поля. по dump.cs: 0 None, 1 Connecting, 2 Connected, 3 Disconnected (поле State по смещению 0x18); -1 — не прочитать. */
 static int rec_state_of(void* nc) {
     void* f; int off;
     if (!nc || !hm_obj_ok(nc)) return -1;
