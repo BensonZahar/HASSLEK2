@@ -11,8 +11,6 @@
  *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr
  *     (всё это делает ядро: hm_cmd_install). Свой поток-ждун, как у /nocol и /route.
  *   • /rec diag — состояние в чат.
- *   • Встроенный автореконнект игры (PacketReceive → DelayedConnect(1 с) после «Потеряно соединение с сервером») на время ожидания
- *     подавляется заменой одной инструкции в PacketReceive (arm64); после подключения + 15 с возвращается. См. rec_ac_* ниже.
  *   • Таймер под чатом: после успешного запуска мод один раз вызывает WebViewSystem.ExecuteJavaScript(string) (static, 1 аргумент —
  *     из метаданных клиента) и внедряет в WebView маленький оверлей. Дальше считает JS сам: «Реконнект через N с» → «Подключение… N с»;
  *     прячется, когда открылось окно Authorization, при новом /rec или через (N + 120) с. Ничего в фоне и ничего в главный поток не постится.
@@ -162,171 +160,10 @@ static void rec_timer_show(int t) {
     dlog_i("реконнект: таймер под чатом запущен, секунд ", t);
 }
 
-/* ── Подавление встроенного автореконнекта игры на время ожидания /rec ──
-   ПРИЧИНА «подключается раньше таймера» (разбор libil2cpp, arm64). OnApplicationQuit() только шлёт серверу ID_DISCONNECTION_NOTIFICATION;
-   сервер рвёт связь, и через несколько секунд в NetworkClient.PacketReceive приходит ID_CONNECTION_LOST (22). Игра в этой ветке:
-   пишет в чат «Потеряно соединение с сервером», вызывает Game.Reset() и СРАЗУ (без задержки) NetworkClient.Connect(host, port,
-   password, nick) — отсюда «Подключение к …» через ~1 с. Тот же хвост с Connect у ID_CONNECTION_ATTEMPT_FAILED (17). Наш
-   DelayedConnect(N) при этом остаётся в очереди и через N с подключает ВТОРОЙ раз. (Ветка NO_FREE_INCOMING (20) — отдельная,
-   с DelayedConnect(1 с); её не трогаем.)
-   Лечение: пока /rec ждёт, в хвосте PacketReceive единственную инструкцию `B Connect` (перед ней стек уже восстановлен:
-   `ldr x22,[sp],#0x30`, PacketReceive возвращает void) заменяем на `RET`, потом возвращаем как было. Сообщение «Потеряно
-   соединение…» и Game.Reset() остаются как есть — не остаётся только немедленного подключения. Адрес берём из MethodInfo
-   (методы Connect и PacketReceive), не из RVA; если поиск не сошёлся (другая сборка игры, не arm64) — ничего не трогаем. */
-#if defined(__aarch64__)
-#define REC_AC_ARM64 1
-extern int mprotect(void*, unsigned long, int);
-extern long pwrite(int, const void*, unsigned long, long);
-#endif
-#define REC_HOLD_AFTER_S 15             /* сколько держать подавление после подключения: запоздалый «lost» от старой связи */
-#define REC_HOLD_MAX_S   30             /* предел удержания сверх N секунд, если подключения так и нет (дальше игра снова реконнектится сама) */
-#define REC_RET_INSN     0xD65F03C0u    /* ret */
-
-#ifdef REC_AC_ARM64
-static uptr g_rec_acSite;               /* адрес инструкции «B Connect» в хвосте PacketReceive (0 — не искали/не нашли) */
-static u32  g_rec_acOrig;               /* её исходное слово */
-#endif
-static int  g_rec_acTried;              /* 1 — нашли, -1 — искали и не нашли */
-static int  g_rec_acOn;                 /* 1 — сейчас на месте стоит RET */
-static int  g_rec_gen;                  /* номер последнего /rec (поток-наблюдатель снимает подавление только за свой) */
-static int  g_rec_acLock;
-static int  g_rec_wT;                   /* секунды последнего /rec — для потока-наблюдателя */
-
-#ifdef REC_AC_ARM64
-static void rec_ac_flush(void* p, unsigned n) {          /* синхронизация кэшей после записи кода */
-    uptr ctr, dl, il, a, e;
-    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
-    dl = 4u << ((ctr >> 16) & 15u); il = 4u << (ctr & 15u);
-    e = (uptr)p + n;
-    for (a = (uptr)p & ~(dl - 1); a < e; a += dl) __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
-    __asm__ volatile("dsb ish" ::: "memory");
-    for (a = (uptr)p & ~(il - 1); a < e; a += il) __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
-    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
-}
-static int rec_ac_write(uptr addr, u32 w) {              /* одно слово кода; права страницы возвращаются в r-x */
-    uptr p0 = addr & ~(uptr)4095;
-    if (mprotect((void*)p0, 4096, 7) == 0) {
-        *(volatile u32*)addr = w;
-        rec_ac_flush((void*)addr, 4);
-        mprotect((void*)p0, 4096, 5);
-        return 1;
-    }
-    {
-        int fd = open("/proc/self/mem", 2); long r = -1;
-        if (fd >= 0) { r = pwrite(fd, &w, 4, (long)addr); close(fd); }
-        if (r == 4) { rec_ac_flush((void*)addr, 4); return 1; }
-    }
-    return 0;
-}
-/* Ищем в теле PacketReceive единственный хвостовой «B <Connect>», перед которым стек уже восстановлен (ldr/ldp с пост-инкрементом от sp). */
-static int rec_ac_find(void* nk) {
-    void *pr, *cm; uptr f, cn, a, site = 0; int found = 0; u32 prev;
-    if (g_rec_acTried) return g_rec_acTried > 0;
-    pr = find_method(nk, "PacketReceive", 2);
-    cm = find_method(nk, "Connect", 4);
-    if (!pr || !cm || !hm_readable(pr, sizeof(void*)) || !hm_readable(cm, sizeof(void*))) { dlog("реконнект: автореконнект: PacketReceive/Connect не найдены"); return 0; }
-    f = *(uptr*)pr; cn = *(uptr*)cm;
-    if (!f || !cn || (f & 3) || (cn & 3) || !hm_range_ok((void*)f, 0x400)) { dlog("реконнект: автореконнект: адреса методов нечитаемы"); return 0; }
-    g_rec_acTried = -1;
-    for (a = f; a < f + 0x400; a += 4) {
-        u32 w = *(const u32*)a;
-        if ((w >> 26) == 5u) {                                           /* B imm26 */
-            long imm = (long)(w & 0x3FFFFFFu); uptr tgt;
-            if (imm & 0x2000000) imm -= 0x4000000;
-            tgt = a + (uptr)(imm * 4);
-            if (tgt == cn) { if (!found) site = a; found++; }
-        }
-    }
-    if (found != 1) { dlog_i("реконнект: автореконнект: переходов на Connect в PacketReceive: ", found); return 0; }
-    prev = *(const u32*)(site - 4);
-    /* ldr xN,[sp],#imm (пост-инкремент) или ldp xN,xM,[sp],#imm — стек уже снят, значит это настоящий хвостовой вызов */
-    if (!(((prev & 0xFFE00C00u) == 0xF8400400u || (prev & 0xFFC00000u) == 0xA8C00000u) && ((prev >> 5) & 31u) == 31u)) {
-        dlog("реконнект: автореконнект: перед переходом нет снятия стека — другая сборка, не трогаем"); return 0; }
-    g_rec_acSite = site; g_rec_acOrig = *(const u32*)site; g_rec_acTried = 1;
-    dlog_i("реконнект: автореконнект (B Connect) найден, смещение в PacketReceive ", (long)(site - f));
-    return 1;
-}
-#endif
-
-static void rec_ac_lock(void)   { while (__sync_lock_test_and_set(&g_rec_acLock, 1)) usleep(200); }
-static void rec_ac_unlock(void) { __sync_lock_release(&g_rec_acLock); }
-
-/* Включить подавление (и объявить новый /rec). 1 — подавление стоит; 0 — не получилось (тогда как раньше). */
-static int rec_ac_hold(void* nk, int t) {
-    int r = 0;
-    rec_ac_lock();
-    g_rec_gen++; g_rec_wT = t;
-#ifdef REC_AC_ARM64
-    if (rec_ac_find(nk)) {
-        if (g_rec_acOn) r = 1;
-        else if (rec_ac_write(g_rec_acSite, REC_RET_INSN)) { g_rec_acOn = 1; r = 1; dlog("реконнект: мгновенный автореконнект игры (B Connect) подавлен на время ожидания"); }
-        else dlog("реконнект: автореконнект: не удалось записать в код игры");
-    }
-#else
-    (void)nk; dlog("реконнект: подавление автореконнекта есть только в arm64-сборке");
-#endif
-    rec_ac_unlock();
-    return r;
-}
-/* Снять подавление. gen = 0 — безусловно (ошибка запуска), иначе только если за это время не начался новый /rec. */
-static void rec_ac_release(int gen) {
-    rec_ac_lock();
-#ifdef REC_AC_ARM64
-    if (g_rec_acOn && (gen == 0 || gen == g_rec_gen)) {
-        if (rec_ac_write(g_rec_acSite, g_rec_acOrig)) { g_rec_acOn = 0; dlog("реконнект: встроенный автореконнект игры возвращён"); }
-        else dlog("реконнект: автореконнект: не удалось вернуть код — останется подавленным до перезапуска игры");
-    }
-#else
-    (void)gen;
-#endif
-    rec_ac_unlock();
-}
-/* NetworkState — enum (тип поля VALUETYPE), num_field() для него всегда даёт 0, поэтому читаем int по смещению поля. по dump.cs: 0 None, 1 Connecting, 2 Connected, 3 Disconnected (поле State по смещению 0x18); -1 — не прочитать. */
-static int rec_state_of(void* nc) {
-    void* f; int off;
-    if (!nc || !hm_obj_ok(nc)) return -1;
-    f = find_field(A.object_get_class(nc), "State");
-    if (!f) return -1;
-    off = A.field_get_offset(f);
-    if (off < 0 || off > 0x200) return -1;
-    return *(volatile int*)((char*)nc + off);
-}
-static int rec_net_state(void) {
-    void *fn, *nc = NULL;
-    if (!g_cGame) return -1;
-    fn = A.class_get_field_from_name(g_cGame, "Network");
-    if (!fn) return -1;
-    A.field_static_get_value(fn, &nc);
-    return rec_state_of(nc);
-}
-/* Поток-наблюдатель: ждёт N с, потом подключения и ещё REC_HOLD_AFTER_S с, затем возвращает код игры.
-   Каждое изменение State пишет в журнал со временем от старта /rec — по нему видно, когда игра «потеряла» связь. */
-static void* rec_ac_watch(void* arg) {
-    int gen = (int)(long)arg, t = g_rec_wT, i, conn = -1, st, last = -99, steps = (t + REC_HOLD_MAX_S) * 4;
-    char m[96]; Buf b;
-    ensure_attached();
-    for (i = 0; i < steps; i++) {
-        usleep(250000);
-        if (g_rec_gen != gen) return NULL;               /* пошёл новый /rec — он сам снимет подавление */
-        if (i & 1) continue;                             /* State читаем раз в полсекунды */
-        st = rec_net_state();
-        if (st != last) {
-            b_init(&b, m, sizeof m); b_s(&b, "реконнект: State "); b_int(&b, st); b_s(&b, " через "); b_int(&b, i / 4); b_s(&b, " с");
-            dlog(m); last = st;
-        }
-        if (i >= t * 4 && st == 2) {
-            if (conn < 0) conn = i;
-            if (i - conn >= REC_HOLD_AFTER_S * 4) break;
-        }
-    }
-    rec_ac_release(gen);
-    return NULL;
-}
-
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
    тогда, когда игра уже идёт, поэтому ждать сборщика (бывшие 60 секунд) не нужно. */
 static void do_reconnect(int t, RecRes* r) {
-    int state = -1, port = 0, ok = 0, held = 0;
+    int state = -1, port = 0, ok = 0;
     void *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL, *host, *pw, *nick;
     unsigned short port16; float tf; char et[256];
 
@@ -346,7 +183,7 @@ static void do_reconnect(int t, RecRes* r) {
     if (!nc) { rec_set(r, "Game.Network = null (вы не на сервере?)"); return; }
     nk = A.object_get_class(nc);
 
-    state = rec_state_of(nc);
+    state = (int)num_field(nc, "State", &ok);
     host = ref_field(nc, "m_Host");
     pw = ref_field(nc, "m_Password");
     nick = ref_field(nc, "m_NickName");
@@ -359,10 +196,6 @@ static void do_reconnect(int t, RecRes* r) {
     dlog_i("реконнект: старт, секунд ", t);
     dlog_i("реконнект: State ", state);
     dlog_i("реконнект: порт ", port);
-
-    /* 0) глушим встроенный автореконнект игры (PacketReceive → DelayedConnect(1 с)), иначе она подключится сама через ~1 с после
-       «потеряно соединение», не дожидаясь N секунд. Если не вышло — работаем как раньше. */
-    held = rec_ac_hold(nk, t);
 
     /* 1) корректный выход с сервера (внутри сам проверяет State == Connected).
        Как в оригинальном libHassleExtended (HassleRec): OnApplicationQuit → DelayedConnect.
@@ -394,16 +227,11 @@ static void do_reconnect(int t, RecRes* r) {
         exc_text(exc, et, sizeof et);
         dlog2("реконнект: DelayedConnect бросил: ", et);
         rec_set(r, "DelayedConnect: исключение");
-        if (held) rec_ac_release(0);
         { unsigned i = 0; for (; et[i] && i < sizeof r->exc - 1; i++) r->exc[i] = et[i]; r->exc[i] = 0; }
         return;
     }
     r->ok = 1; r->state = state; r->port = port;
     dlog("реконнект: DelayedConnect запущен");
-    if (held) {
-        unsigned long th = 0;
-        if (pthread_create(&th, NULL, rec_ac_watch, (void*)(long)g_rec_gen) != 0) rec_ac_release(0);   /* без наблюдателя подавление не оставляем */
-    }
     rec_timer_show(t);                                  /* таймер под чатом (только при успехе — при ошибке в чате и так причина) */
 }
 
@@ -418,7 +246,6 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
     if (diag) {
         b_s(&b, "Rec: стадия «"); b_s(&b, g_stage); b_s(&b, "», игра готова: "); b_s(&b, g_ready ? "да" : "нет");
         b_s(&b, ", /rec нативно: "); b_s(&b, g_recReg == 1 ? "да" : "нет");
-        b_s(&b, ", автореконнект игры: "); b_s(&b, g_rec_acTried > 0 ? (g_rec_acOn ? "подавлен" : "найден") : (g_rec_acTried < 0 ? "не найден" : "ещё не искали"));
         chat_say(msg);
         return;
     }
