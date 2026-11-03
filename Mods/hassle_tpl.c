@@ -26,6 +26,10 @@
  *                        «back» — вернуться на точку включения и выключить. «/tpl ghost unhook» — вернуть код игры в исходный вид.
  *                        «/tpl ghost tap [сек]» — на несколько секунд (по умолчанию 4, до 60) ПУСТИТЬ пакеты: чтобы наступить на метку/маркер
  *                        (переодеться, взять работу и т.п.). Потом призрак включается сам. Пока окно открыто, сервер видит вас там, где вы стоите.
+ *   /tpl keep [on [сек]|log|off|unhook]   машина откатывается после /tpl: сервер (античит) шлёт клиенту RPC SetVehiclePos, и клиент переставляет машину обратно
+ *                        (пешком такого приказа нет — поэтому пеший /tpl «держится»). «log» — только считает такие приказы и после отката скажет, приходили ли они
+ *                        (диагностика, ничего не меняет); «on» — на окно после прыжка (по умолчанию 8 с после прибытия, «on 15» — 15 с) приказ игнорируется, машина остаётся
+ *                        на новой точке; «off» — выкл.; «unhook» — снять перехват совсем. По умолчанию выключено. Только arm64. Сервер может счесть рассинхрон — на ваш риск.
  *   /tpl int N           сменить интерьер на номер N (0..255, 0 — улица). Только номер, координаты не нужны и тело не двигается.
  *                        «/tpl int» без номера — показать текущий (он же в строке «/tpl pos»). ВАЖНО: номер — это ТОЛЬКО метка (освещение
  *                        «в помещении» + сообщение серверу), а не место: сам интерьер — обычный участок карты со своими координатами.
@@ -442,6 +446,34 @@ static int gh_hook(void* player, void* a1) {
     return 1;
 }
 
+/* ───────────── серверный откат машины: RPC SetVehiclePos (/tpl keep) ─────────────
+   Прыжок машины клиент делает тем же Entity.SetPosition, что и по приказу сервера. Если сервер после прыжка возвращает машину (античит), он шлёт
+   клиенту RPC SetVehiclePos (Hassle.Network.RPCs, id 159: id машины + 3 float) — клиент послушно переставляет машину обратно. Пешком такого приказа нет,
+   поэтому пеший /tpl «держится», а машинный — нет. Перехват в начале RPCs.SetVehiclePos(PacketData) (та же заглушка, что у призрака):
+     режим 1 (log) — только считает приказы и время последнего (для диагностики: откат пришёл этим RPC или нет);
+     режим 2 (on)  — пока идёт окно после прыжка (g_rv_win с после прибытия), приказ проглатывается и машина остаётся на новой точке.
+   Окно открывается только прыжком машины из /tpl (tplw_begin) — вне его хук ничего не глотает. Режим выключен, пока не включён командой. */
+static volatile int g_rv_mode;                           /* 0 — выкл. (хук ничего не делает); 1 — считать; 2 — считать и глотать в окне */
+static volatile long long g_rv_until;                    /* конец окна глотания, мс по CLOCK_MONOTONIC */
+static volatile long long g_rv_lastT;                    /* когда пришёл последний SetVehiclePos */
+static volatile unsigned g_rv_seen, g_rv_drop;           /* сколько приказов пришло / сколько проглочено — всего */
+static unsigned g_rv_seen0, g_rv_drop0;                  /* значения на начало последнего прыжка машины */
+static float g_rv_win = 8.0f;                            /* секунд окна после прибытия (2…60) */
+static int g_rv_state;                                   /* 1 — перехват стоит */
+static char g_rv_err[160];
+__attribute__((noinline, used))
+static int rv_hook(void* data, void* a1) {               /* главный поток, начало RPCs.SetVehiclePos; 1 — приказ пропустить. Только атомики */
+    int m = __atomic_load_n(&g_rv_mode, __ATOMIC_ACQUIRE);
+    long long now;
+    (void)data; (void)a1;
+    if (!m) return 0;
+    now = gh_now_ms();
+    __atomic_fetch_add(&g_rv_seen, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_rv_lastT, now, __ATOMIC_RELAXED);
+    if (m == 2 && now < __atomic_load_n(&g_rv_until, __ATOMIC_ACQUIRE)) { __atomic_fetch_add(&g_rv_drop, 1u, __ATOMIC_RELAXED); return 1; }
+    return 0;
+}
+
 /* ───────────── наблюдатель за прыжком машины ─────────────
    Зачем: Entity.SetPosition у машины возвращает управление сразу, а сам перенос делает позже (заморозка → подгрузка карты в точке → ожидание →
    Rigidbody/Transform.position → разморозка). Раньше мод в тот же миг писал «готово» и обнулял скорость — на дальнем прыжке и то и другое было
@@ -627,6 +659,8 @@ static int tplw_begin(const TplCtx* c, const float* from, const float* to) {
     for (i = 0; i < 3; i++) { g_tplw_from[i] = from[i]; g_tplw_to[i] = to[i]; }
     g_tplw_total = tplw_dxz(from, to);
     g_tplw_t0 = now; g_tplw_tArr = now;
+    g_rv_seen0 = __atomic_load_n(&g_rv_seen, __ATOMIC_RELAXED); g_rv_drop0 = __atomic_load_n(&g_rv_drop, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&g_rv_mode, __ATOMIC_ACQUIRE) == 2) __atomic_store_n(&g_rv_until, now + (long long)(g_rv_win * 1000.0f), __ATOMIC_RELEASE);
     if (tpl_cur_pos(c, cur) && tplw_dxz(cur, to) <= TPLW_ARRIVE) pending = 0;      /* близкий прыжок: коллизия была загружена, перенос уже случился */
     g_tplw_pending = 0;
     __atomic_store_n(&g_tplw_on, pending ? 1 : 2, __ATOMIC_RELEASE);
@@ -667,6 +701,7 @@ static void tplw_tick(void) {
     if (!tpl_cur_pos(&c, p)) { if (now - g_tplw_t0 > TPLW_TIMEOUT) tplw_end("позицию машины прочитать не удалось"); return; }
     if (st == 1) {
         float dTo = tplw_dxz(p, g_tplw_to);
+        if (__atomic_load_n(&g_rv_mode, __ATOMIC_ACQUIRE) == 2) __atomic_store_n(&g_rv_until, now + (long long)(g_rv_win * 1000.0f), __ATOMIC_RELEASE);   /* ещё ждём карту — окно не закрываем */
         if (dTo <= TPLW_ARRIVE) {
             long long dt = now - g_tplw_t0;
             tpl_stop_vehicle(c.veh);                                     /* машина уже разморожена и стоит на точке: теперь сброс скорости имеет смысл */
@@ -694,6 +729,14 @@ static void tplw_tick(void) {
             b_s(&b, " мс после прибытия. К этому моменту /tpl уже поставил её на точку, так что откат пришёл не из кода мода — похоже на серверную проверку телепорта у машин");
             chat_say(msg);
             { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "/tpl: ОТКАТ машины на старое место через мс: "); b_int(&x, (int)dt); dlog(lg); }
+            {   /* откуда откат: пришёл ли серверный SetVehiclePos */
+                int m = __atomic_load_n(&g_rv_mode, __ATOMIC_ACQUIRE); unsigned sn = g_rv_seen - g_rv_seen0, dr = g_rv_drop - g_rv_drop0; char m2[200]; Buf b2;
+                b_init(&b2, m2, sizeof m2);
+                if (!m) b_s(&b2, "Откуда откат — узнать можно: /tpl keep log (считает серверные приказы SetVehiclePos), затем повторить прыжок");
+                else if (!sn) b_s(&b2, "Серверный SetVehiclePos за это время НЕ приходил — откат не этим приказом (см. konstt.log)");
+                else { b_s(&b2, "Серверных SetVehiclePos с начала прыжка: "); b_int(&b2, (int)sn); b_s(&b2, ", проглочено: "); b_int(&b2, (int)dr); }
+                chat_say(m2);
+            }
             tplw_end("машину вернуло назад");
             return;
         }
@@ -858,10 +901,85 @@ static void gh_unhook(void) {
     if (ok) { g_gh_state = 0; dlog("/tpl ghost: перехваты сняты, код игры восстановлен"); }
     else dlog("/tpl ghost: не удалось вернуть исходные инструкции");
 }
+/* Перехват RPCs.SetVehiclePos(PacketData data) — статический, x0 = data. Те же проверки пролога, что у призрака. */
+static int rv_fail(const char* why) {
+    unsigned i = 0;
+    for (; why[i] && i < sizeof g_rv_err - 1; i++) g_rv_err[i] = why[i];
+    g_rv_err[i] = 0;
+    dlog2("/tpl keep: перехват не поставлен: ", why);
+    return 0;
+}
+static uptr g_rv_site; static u32 g_rv_orig[4]; static int g_rv_patched; static void* g_rv_veneer;
+static int rv_install(void) {
+    void *kls, *m; uptr fn; u32 code[4]; int i;
+    if (g_rv_state == 1) return 1;
+    if (!g_img) return rv_fail("игра ещё не готова");
+    kls = A.class_from_name(g_img, "Hassle.Network", "RPCs");
+    if (!kls) return rv_fail("нет класса Hassle.Network.RPCs");
+    m = A.class_get_method_from_name(kls, "SetVehiclePos", 1);
+    if (!m || !hm_readable(m, sizeof(void*))) return rv_fail("нет метода RPCs.SetVehiclePos");
+    fn = *(uptr*)m;
+    if (!fn || (fn & 3) || !hm_range_ok((void*)fn, 64)) return rv_fail("адрес метода нечитаем");
+    for (i = 0; i < 4; i++) code[i] = ((const u32*)fn)[i];
+    if (g_rv_veneer && g_rv_patched && g_rv_site == fn) for (i = 0; i < 4; i++) code[i] = g_rv_orig[i];   /* уже патчен нами — берём сохранённое */
+    if ((code[0] & 0xFF0003FFu) != 0xD10003FFu) return rv_fail("пролог не начинается с «sub sp, sp, #…» (другая сборка игры?)");
+    for (i = 0; i < 4; i++) if (gh_pc_rel(code[i])) return rv_fail("пролог зависит от адреса — перенести нельзя");
+    if (g_rv_veneer && g_rv_site && g_rv_site != fn) return rv_fail("адрес метода изменился после первой установки");
+    if (!g_rv_veneer) {
+        u32 v[GH_TRAMP_WORDS]; void* page = mmap(NULL, 4096, 3, 0x22, -1, 0);
+        if (page == (void*)-1 || !page) return rv_fail("не удалось выделить страницу под заглушку");
+        for (i = 0; i < GH_TRAMP_WORDS; i++) v[i] = 0xD503201Fu;
+        gh_make_tramp(v, code, (uptr)rv_hook, fn + 16);
+        for (i = 0; i < GH_TRAMP_WORDS; i++) ((u32*)page)[i] = v[i];
+        gh_flush(page, GH_TRAMP_WORDS * 4);
+        if (mprotect(page, 4096, 5) != 0) { munmap(page, 4096); return rv_fail("не удалось сделать страницу заглушки исполняемой"); }
+        g_rv_veneer = page; g_rv_site = fn; for (i = 0; i < 4; i++) g_rv_orig[i] = code[i];
+    }
+    if (!g_rv_patched) {
+        u32 e[4]; gh_make_entry(e, (uptr)g_rv_veneer);
+        if (!gh_write_code(fn, e, 4)) return rv_fail("запись в код игры запрещена системой");
+        g_rv_patched = 1;
+    }
+    g_rv_state = 1;
+    dlog("/tpl keep: перехват RPCs.SetVehiclePos установлен");
+    return 1;
+}
+static void rv_unhook(void) {
+    __atomic_store_n(&g_rv_mode, 0, __ATOMIC_RELEASE);
+    if (g_rv_patched) {
+        if (gh_write_code(g_rv_site, g_rv_orig, 4)) { g_rv_patched = 0; g_rv_state = 0; dlog("/tpl keep: перехват снят, код игры восстановлен"); }
+        else dlog("/tpl keep: не удалось вернуть исходные инструкции");
+    }
+}
 #else
 static int gh_install(void) { return gh_fail("поддерживается только arm64"); }
 static void gh_unhook(void) { __atomic_store_n(&g_gh_on, 0, __ATOMIC_RELEASE); }
+static int rv_install(void) { unsigned i = 0; const char* w = "поддерживается только arm64"; for (; w[i] && i < sizeof g_rv_err - 1; i++) g_rv_err[i] = w[i]; g_rv_err[i] = 0; return 0; }
+static void rv_unhook(void) { __atomic_store_n(&g_rv_mode, 0, __ATOMIC_RELEASE); }
 #endif
+
+/* /tpl keep [on [сек] | log | off | unhook]: sub 0 — показать состояние, 1 on, 2 off, 4 unhook, 6 log; secs — окно после прибытия, -1 — не указано */
+static void tpl_cmd_keep(int sub, float secs) {
+    char msg[260]; Buf b; int mode = __atomic_load_n(&g_rv_mode, __ATOMIC_ACQUIRE);
+    if (sub == 4) { rv_unhook(); chat_say(g_rv_state ? "Keep: выключен, но вернуть код игры не удалось (см. konstt.log)" : "Keep: выключен, перехват снят, код игры в исходном виде"); return; }
+    if (sub == 2) { __atomic_store_n(&g_rv_mode, 0, __ATOMIC_RELEASE); chat_say("Keep: выключен — серверные приказы SetVehiclePos снова выполняются (снять перехват совсем: /tpl keep unhook)"); return; }
+    if (sub == 1 || sub == 6) {
+        if (secs >= 0) { g_rv_win = secs < 2.0f ? 2.0f : (secs > 60.0f ? 60.0f : secs); }
+        if (!rv_install()) { b_init(&b, msg, sizeof msg); b_s(&b, "Keep: перехват не поставлен — "); b_s(&b, g_rv_err); chat_say(msg); return; }
+        __atomic_store_n(&g_rv_mode, sub == 1 ? 2 : 1, __ATOMIC_RELEASE);
+        b_init(&b, msg, sizeof msg);
+        if (sub == 1) { b_s(&b, "Keep: включён — после прыжка машины серверный возврат (SetVehiclePos) игнорируется "); b_fix(&b, g_rv_win, 0); b_s(&b, " с после прибытия. Сервер при этом может счесть это рассинхроном — на ваш риск. Выключить: /tpl keep off"); }
+        else b_s(&b, "Keep: режим «лог» — серверные SetVehiclePos только считаются (ничего не глотаем). Сделайте прыжок на машине: при откате мод скажет, приходил ли такой приказ");
+        chat_say(msg);
+        return;
+    }
+    b_init(&b, msg, sizeof msg);
+    b_s(&b, "Keep: "); b_s(&b, mode == 2 ? "включён" : mode == 1 ? "режим «лог»" : "выключен");
+    b_s(&b, g_rv_state ? ", перехват стоит" : ", перехват не стоит");
+    b_s(&b, ", окно "); b_fix(&b, g_rv_win, 0); b_s(&b, " с; SetVehiclePos от сервера: "); b_int(&b, (int)g_rv_seen); b_s(&b, ", проглочено: "); b_int(&b, (int)g_rv_drop);
+    chat_say(msg);
+    chat_usage("/tpl keep on [сек] — не давать серверу вернуть машину после /tpl;  /tpl keep log — только считать серверные возвраты (диагностика);  /tpl keep off | unhook");
+}
 
 static void tpl_cmd_ghost(int sub, float secs) {            /* secs — для «tap»: -1 — не указано */
     TplCtx c; Buf b; char msg[300]; int st = __atomic_load_n(&g_gh_on, __ATOMIC_ACQUIRE);
@@ -1008,6 +1126,7 @@ static int tpl_word(const char* t) {
     if (seq(t, "depth") || seq(t, "deep") || seq(t, "глубина") || seq(t, "глуб")) return 24;
     if (seq(t, "up") || seq(t, "surface") || seq(t, "вынырнуть") || seq(t, "наверх") || seq(t, "вверх")) return 25;
     if (seq(t, "use") || seq(t, "touch")) return 26;
+    if (seq(t, "keep") || seq(t, "hold") || seq(t, "держать") || seq(t, "удержать") || seq(t, "откат")) return 27;
     return -1;
 }
 /* подслово после «ghost»: 1 on, 2 off, 3 back, 4 unhook, 5 tap, 0 — не оно */
@@ -1017,6 +1136,7 @@ static int tpl_gword(const char* t) {
     if (seq(t, "back") || seq(t, "назад") || seq(t, "вернись") || seq(t, "возврат") || seq(t, "return")) return 3;
     if (seq(t, "unhook") || seq(t, "снять")) return 4;
     if (seq(t, "tap") || seq(t, "sync") || seq(t, "окно") || seq(t, "метка") || seq(t, "маркер")) return 5;
+    if (seq(t, "log") || seq(t, "лог") || seq(t, "count") || seq(t, "счёт")) return 6;
     return 0;
 }
 /* вся строка — число («2», «2.5», «2,5»)? */
@@ -1061,7 +1181,8 @@ static void tpl_apply_word(int w, TplArgs* a) {
     else if (w == 23) a->under = 1;
     else if (w == 24) a->mode = 11;
     else if (w == 25) a->mode = 12;
-    else if (w == 26) { a->use = 1; a->mode = 10; }                 /* «use»: «/tpl use N» == «/tpl pick N use» */
+    else if (w == 26) { a->use = 1; a->mode = 10; }
+    else if (w == 27) a->mode = 13;                                 /* keep */                 /* «use»: «/tpl use N» == «/tpl pick N use» */
 }
 static void tpl_token(const char* tok, TplArgs* a) {
     float v; int w, k;
@@ -1070,7 +1191,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
         tpl_copy_name(a->name, tok, TPL_NAME); a->nameSet = a->name[0] ? 1 : 0;
         return;
     }
-    if (a->mode == 7) { int g = tpl_gword(tok); if (g) { a->gsub = g; return; } }     /* после «ghost»: on / off / back / unhook / tap */
+    if (a->mode == 7 || a->mode == 13) { int g = tpl_gword(tok); if (g) { a->gsub = g; return; } }     /* после «ghost»: on / off / back / unhook / tap */
     if (a->mode == 8 && tpl_num(tok, &v)) { a->iid = (int)(v + 0.5f); a->iidSet = 1; return; }   /* после «int»: номер (0 — валидный, не подрезаем) */
     if (a->mode == 2 && tpl_snum(tok, &v)) {                       /* после «to» числа — это координаты (с минусом можно) */
         if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
@@ -1707,6 +1828,7 @@ static void tpl_usage(void) {
     chat_usage("/tpl pos — мои координаты;  /tpl to X Y Z — телепорт в точку (или /tpl to X Z — высота по земле);  /tpl alt — другой способ");
     chat_usage("/tpl ghost [on|off|back|tap [сек]] — призрак: сервер и NPC не видят, что вы двигаетесь (tap — окно, чтобы наступить на метку);  /tpl int N — метка интерьера/освещение (только номер, 0 — улица; место не меняет — точки запоминают интерьер сами). За рулём телепорт переносит машину");
     chat_usage("/tpl pick N use (или /tpl use N) — войти в пикап №N, не двигаясь с места (стойте рядом, до ~5 м): клиент сам шлёт серверу вход в пикап. Раздевалка: /dress use");
+    chat_usage("В машине сервер может вернуть вас назад после прыжка: /tpl keep log — проверить, приходит ли от него SetVehiclePos;  /tpl keep on [сек] — не давать вернуть машину;  /tpl keep off");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
     chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место;  /tpl depth [м] — глубина нырка (по умолчанию 1)");
 }
@@ -1731,6 +1853,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         }
     }
     if (a.bad || a.help) { tpl_usage(); return; }
+    if (a.mode == 13) { tpl_cmd_keep(a.gsub, a.numSet ? a.rawNum : -1.0f); return; }       /* число после «keep on» — секунды окна */
     if (a.alt) {
         g_tpl_alt = !g_tpl_alt;
         chat_say(g_tpl_alt ? "Телепорт: способ — через движение персонажа (запасной)" : "Телепорт: способ — Player.SetPosition (основной)");
@@ -1775,7 +1898,7 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | int N | gps | pick [N] [under [сек]] | depth [м]");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | keep [on|log|off] | int N | gps | pick [N] [under [сек]] | depth [м]");
     return NULL;
 }
 #ifndef KONSTT_TEST
