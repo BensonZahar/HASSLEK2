@@ -163,26 +163,27 @@ static void rec_timer_show(int t) {
 }
 
 /* ── Подавление встроенного автореконнекта игры на время ожидания /rec ──
-   ПРИЧИНА «подключается раньше таймера». NetworkClient.OnApplicationQuit() только шлёт серверу пакет об отключении, ничего не
-   закрывая. Сервер рвёт связь, и через несколько секунд в NetworkClient.PacketReceive приходит «потеряно соединение»: игра пишет
-   в чат «Потеряно соединение с сервером» и САМА зовёт DelayedConnect(host, port, password, nick, 1.0f) — реконнект через 1 с.
-   Наш DelayedConnect(N) при этом тоже живёт и через N с подключается ещё раз. Дизассемблирование libil2cpp (arm64): в конце
-   PacketReceive стоит `fmov s0, #1.0` и хвостовой вызов `B DelayedConnect` (адрес метода берём из MethodInfo, не из RVA).
-   Лечение: пока /rec ждёт, эту одну инструкцию `B DelayedConnect` заменяем на `RET` (стек к этому моменту уже восстановлен,
-   PacketReceive возвращает void — возврат корректен), потом возвращаем как было. Сообщение «Потеряно соединение…» остаётся.
-   Всё ради одного слова кода; если поиск не сошёлся (другая сборка игры, не arm64) — ничего не трогаем, работает как раньше. */
+   ПРИЧИНА «подключается раньше таймера» (разбор libil2cpp, arm64). OnApplicationQuit() только шлёт серверу ID_DISCONNECTION_NOTIFICATION;
+   сервер рвёт связь, и через несколько секунд в NetworkClient.PacketReceive приходит ID_CONNECTION_LOST (22). Игра в этой ветке:
+   пишет в чат «Потеряно соединение с сервером», вызывает Game.Reset() и СРАЗУ (без задержки) NetworkClient.Connect(host, port,
+   password, nick) — отсюда «Подключение к …» через ~1 с. Тот же хвост с Connect у ID_CONNECTION_ATTEMPT_FAILED (17). Наш
+   DelayedConnect(N) при этом остаётся в очереди и через N с подключает ВТОРОЙ раз. (Ветка NO_FREE_INCOMING (20) — отдельная,
+   с DelayedConnect(1 с); её не трогаем.)
+   Лечение: пока /rec ждёт, в хвосте PacketReceive единственную инструкцию `B Connect` (перед ней стек уже восстановлен:
+   `ldr x22,[sp],#0x30`, PacketReceive возвращает void) заменяем на `RET`, потом возвращаем как было. Сообщение «Потеряно
+   соединение…» и Game.Reset() остаются как есть — не остаётся только немедленного подключения. Адрес берём из MethodInfo
+   (методы Connect и PacketReceive), не из RVA; если поиск не сошёлся (другая сборка игры, не arm64) — ничего не трогаем. */
 #if defined(__aarch64__)
 #define REC_AC_ARM64 1
 extern int mprotect(void*, unsigned long, int);
 extern long pwrite(int, const void*, unsigned long, long);
 #endif
 #define REC_HOLD_AFTER_S 15             /* сколько держать подавление после подключения: запоздалый «lost» от старой связи */
-#define REC_HOLD_MAX_S   90             /* предел ожидания подключения сверх N секунд */
+#define REC_HOLD_MAX_S   30             /* предел удержания сверх N секунд, если подключения так и нет (дальше игра снова реконнектится сама) */
 #define REC_RET_INSN     0xD65F03C0u    /* ret */
-#define REC_FMOV_S0_1    0x1E2E1000u    /* fmov s0, #1.0 — за 1–2 инструкции до хвостового вызова (аргумент time = 1 с) */
 
 #ifdef REC_AC_ARM64
-static uptr g_rec_acSite;               /* адрес инструкции «B DelayedConnect» в PacketReceive (0 — не искали/не нашли) */
+static uptr g_rec_acSite;               /* адрес инструкции «B Connect» в хвосте PacketReceive (0 — не искали/не нашли) */
 static u32  g_rec_acOrig;               /* её исходное слово */
 #endif
 static int  g_rec_acTried;              /* 1 — нашли, -1 — искали и не нашли */
@@ -217,14 +218,15 @@ static int rec_ac_write(uptr addr, u32 w) {              /* одно слово 
     }
     return 0;
 }
-/* Ищем в теле PacketReceive единственный «B <DelayedConnect>» сразу после «fmov s0, #1.0». */
-static int rec_ac_find(void* nk, void* md) {
-    void* pr; uptr f, dc, a, site = 0; int found = 0;
+/* Ищем в теле PacketReceive единственный хвостовой «B <Connect>», перед которым стек уже восстановлен (ldr/ldp с пост-инкрементом от sp). */
+static int rec_ac_find(void* nk) {
+    void *pr, *cm; uptr f, cn, a, site = 0; int found = 0; u32 prev;
     if (g_rec_acTried) return g_rec_acTried > 0;
     pr = find_method(nk, "PacketReceive", 2);
-    if (!pr || !md || !hm_readable(pr, sizeof(void*)) || !hm_readable(md, sizeof(void*))) { dlog("реконнект: автореконнект: PacketReceive/DelayedConnect не найдены"); return 0; }
-    f = *(uptr*)pr; dc = *(uptr*)md;
-    if (!f || !dc || (f & 3) || (dc & 3) || !hm_range_ok((void*)f, 0x400)) { dlog("реконнект: автореконнект: адреса методов нечитаемы"); return 0; }
+    cm = find_method(nk, "Connect", 4);
+    if (!pr || !cm || !hm_readable(pr, sizeof(void*)) || !hm_readable(cm, sizeof(void*))) { dlog("реконнект: автореконнект: PacketReceive/Connect не найдены"); return 0; }
+    f = *(uptr*)pr; cn = *(uptr*)cm;
+    if (!f || !cn || (f & 3) || (cn & 3) || !hm_range_ok((void*)f, 0x400)) { dlog("реконнект: автореконнект: адреса методов нечитаемы"); return 0; }
     g_rec_acTried = -1;
     for (a = f; a < f + 0x400; a += 4) {
         u32 w = *(const u32*)a;
@@ -232,14 +234,16 @@ static int rec_ac_find(void* nk, void* md) {
             long imm = (long)(w & 0x3FFFFFFu); uptr tgt;
             if (imm & 0x2000000) imm -= 0x4000000;
             tgt = a + (uptr)(imm * 4);
-            if (tgt == dc) { if (!found) site = a; found++; }
+            if (tgt == cn) { if (!found) site = a; found++; }
         }
     }
-    if (found != 1) { dlog_i("реконнект: автореконнект: переходов на DelayedConnect в PacketReceive: ", found); return 0; }
-    if (*(const u32*)(site - 4) != REC_FMOV_S0_1 && *(const u32*)(site - 8) != REC_FMOV_S0_1) {   /* в этой сборке: fmov, ldr x22,[sp],#0x30, B */
-        dlog("реконнект: автореконнект: перед вызовом нет fmov s0,#1.0 — другая сборка, не трогаем"); return 0; }
+    if (found != 1) { dlog_i("реконнект: автореконнект: переходов на Connect в PacketReceive: ", found); return 0; }
+    prev = *(const u32*)(site - 4);
+    /* ldr xN,[sp],#imm (пост-инкремент) или ldp xN,xM,[sp],#imm — стек уже снят, значит это настоящий хвостовой вызов */
+    if (!(((prev & 0xFFE00C00u) == 0xF8400400u || (prev & 0xFFC00000u) == 0xA8C00000u) && ((prev >> 5) & 31u) == 31u)) {
+        dlog("реконнект: автореконнект: перед переходом нет снятия стека — другая сборка, не трогаем"); return 0; }
     g_rec_acSite = site; g_rec_acOrig = *(const u32*)site; g_rec_acTried = 1;
-    dlog_i("реконнект: автореконнект найден, смещение в PacketReceive ", (long)(site - f));
+    dlog_i("реконнект: автореконнект (B Connect) найден, смещение в PacketReceive ", (long)(site - f));
     return 1;
 }
 #endif
@@ -248,18 +252,18 @@ static void rec_ac_lock(void)   { while (__sync_lock_test_and_set(&g_rec_acLock,
 static void rec_ac_unlock(void) { __sync_lock_release(&g_rec_acLock); }
 
 /* Включить подавление (и объявить новый /rec). 1 — подавление стоит; 0 — не получилось (тогда как раньше). */
-static int rec_ac_hold(void* nk, void* md, int t) {
+static int rec_ac_hold(void* nk, int t) {
     int r = 0;
     rec_ac_lock();
     g_rec_gen++; g_rec_wT = t;
 #ifdef REC_AC_ARM64
-    if (rec_ac_find(nk, md)) {
+    if (rec_ac_find(nk)) {
         if (g_rec_acOn) r = 1;
-        else if (rec_ac_write(g_rec_acSite, REC_RET_INSN)) { g_rec_acOn = 1; r = 1; dlog("реконнект: встроенный автореконнект игры подавлен на время ожидания"); }
+        else if (rec_ac_write(g_rec_acSite, REC_RET_INSN)) { g_rec_acOn = 1; r = 1; dlog("реконнект: мгновенный автореконнект игры (B Connect) подавлен на время ожидания"); }
         else dlog("реконнект: автореконнект: не удалось записать в код игры");
     }
 #else
-    (void)nk; (void)md; dlog("реконнект: подавление автореконнекта есть только в arm64-сборке");
+    (void)nk; dlog("реконнект: подавление автореконнекта есть только в arm64-сборке");
 #endif
     rec_ac_unlock();
     return r;
@@ -277,15 +281,23 @@ static void rec_ac_release(int gen) {
 #endif
     rec_ac_unlock();
 }
-static int rec_net_state(void) {                         /* NetworkState: 2 = Connected; -1 — не прочитать */
-    void *fn, *nc = NULL; int ok = 0, st;
+/* NetworkState — enum (тип поля VALUETYPE), num_field() для него всегда даёт 0, поэтому читаем int по смещению поля. подтверждено только 2 = Connected (OnApplicationQuit делает cmp State,#2); -1 — не прочитать. */
+static int rec_state_of(void* nc) {
+    void* f; int off;
+    if (!nc || !hm_obj_ok(nc)) return -1;
+    f = find_field(A.object_get_class(nc), "State");
+    if (!f) return -1;
+    off = A.field_get_offset(f);
+    if (off < 0 || off > 0x200) return -1;
+    return *(volatile int*)((char*)nc + off);
+}
+static int rec_net_state(void) {
+    void *fn, *nc = NULL;
     if (!g_cGame) return -1;
     fn = A.class_get_field_from_name(g_cGame, "Network");
     if (!fn) return -1;
     A.field_static_get_value(fn, &nc);
-    if (!nc || !hm_obj_ok(nc)) return -1;
-    st = (int)num_field(nc, "State", &ok);
-    return ok ? st : -1;
+    return rec_state_of(nc);
 }
 /* Поток-наблюдатель: ждёт N с, потом подключения и ещё REC_HOLD_AFTER_S с, затем возвращает код игры.
    Каждое изменение State пишет в журнал со временем от старта /rec — по нему видно, когда игра «потеряла» связь. */
@@ -334,7 +346,7 @@ static void do_reconnect(int t, RecRes* r) {
     if (!nc) { rec_set(r, "Game.Network = null (вы не на сервере?)"); return; }
     nk = A.object_get_class(nc);
 
-    state = (int)num_field(nc, "State", &ok);
+    state = rec_state_of(nc);
     host = ref_field(nc, "m_Host");
     pw = ref_field(nc, "m_Password");
     nick = ref_field(nc, "m_NickName");
@@ -350,7 +362,7 @@ static void do_reconnect(int t, RecRes* r) {
 
     /* 0) глушим встроенный автореконнект игры (PacketReceive → DelayedConnect(1 с)), иначе она подключится сама через ~1 с после
        «потеряно соединение», не дожидаясь N секунд. Если не вышло — работаем как раньше. */
-    held = rec_ac_hold(nk, md, t);
+    held = rec_ac_hold(nk, t);
 
     /* 1) корректный выход с сервера (внутри сам проверяет State == Connected).
        Как в оригинальном libHassleExtended (HassleRec): OnApplicationQuit → DelayedConnect.
