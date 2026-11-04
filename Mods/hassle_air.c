@@ -50,10 +50,13 @@
  *     у Rigidbody машины на время полёта: isKinematic = true, detectCollisions = false, useGravity = false, interpolation = None (иначе картинка дёргается).
  *     Скорости обнуляются ДО kinematic. При выключении всё возвращается как было, скорости снова обнуляются. Entity.SetPosition (асинхронный, с заморозкой
  *     и подгрузкой карты — см. /tpl) каждый кадр не годится, его зовём только для посадки машины на землю (findHeight=true).
- *   • Куда лететь: руль/газ/тормоз берём у самой физики машины — WheeledVehiclePhysics.SteerInput / ThrottleInput / BrakeInput (их пишет VehicleInput.Update
- *     из экранных кнопок, поэтому от устройства HUD не зависит). Вперёд = газ − тормоз, вправо = руль; «вперёд» — туда, куда смотрит камера (3d) или горизонтально (flat),
- *     «вправо» — вправо от камеры. Машина при этом не поворачивается: её ориентация остаётся прежней. Вверх/вниз: камерой в 3d (смотрите вверх и жмите газ),
- *     кнопки ПРЫЖОК/ПРИСЕД, если они есть в HUD машины, и /air up|down N. У вертолёта/самолёта/лодки нет WheeledVehiclePhysics — джойстик не читается, двигайте /air up|down, /air to ID.
+ *   • HUD машины (Hud.js, блок isSpeedometerShown): кнопки W (PedalGas), S (PedalStop), ПРОБЕЛ (HandBrake, всегда) и либо A/D (TurnLeft/TurnRight), либо — при useJoystick —
+ *     стик «<Gamepad>/leftStick» (его двойной тап включает «<Keyboard>/c»). Кнопки прыжка (leftShift) в машине нет: она показывается только пешком.
+ *   • Куда лететь: сперва читаем те самые экранные кнопки W/S/A/D (OnScreenControls.m_Controls, isPressed); если ни одна не нажата — физику машины
+ *     WheeledVehiclePhysics.SteerInput / ThrottleInput / BrakeInput (их пишет VehicleInput.Update; именно так читается руль-стик). Вперёд = газ − тормоз, вправо = руль;
+ *     «вперёд» — туда, куда смотрит камера (3d) или горизонтально (flat), «вправо» — вправо от камеры. Машина не поворачивается: ориентация остаётся прежней.
+ *   • Вверх/вниз в машине: ЗАЖМИТЕ РУЧНИК (пробел) — пока он зажат, газ двигает вверх, тормоз вниз (по высоте; в кнопочном и в стиковом HUD). Ещё: присед (двойной тап по стику) — вниз,
+ *     взгляд камерой вверх/вниз в 3d, /air up|down N. У вертолёта/самолёта/лодки нет WheeledVehiclePhysics, но кнопки W/S в их HUD те же, так что работает и там, если кнопки найдутся.
  *   • Сели в машину, пока летели пешком, — полёт перейдёт на машину; вышли из машины в полёте — машина сама встанет на землю, а вы продолжите лететь пешком.
  *   • Выключение: если машина выше 3 м над точкой включения (или ниже неё), мод ставит её на землю (Entity.SetPosition(pos, findHeight=true)); /air land делает это всегда.
  *   • Серверный античит может отреагировать на скорость/высоту машины; /tpl ghost перед /air не пускает позицию на сервер. Если сервер вернёт машину RPC SetVehiclePos —
@@ -456,20 +459,7 @@ static int air_read_f(void* obj, const char* name, float* out, int n) {
     for (i = 0; i < n; i++) { if (!(p[i] == p[i]) || p[i] > 1e4f || p[i] < -1e4f) return 0; out[i] = p[i]; }
     return 1;
 }
-/* ввод в машине: руль (вправо +) и газ − тормоз (вперёд +) из WheeledVehiclePhysics. 1 — прочиталось */
-static int air_veh_input(const AirCtx* c, float* x, float* y) {
-    void* ph; float st = 0.0f, th = 0.0f, br = 0.0f;
-    g_air_vinOk = 0;
-    ph = c->veh ? ref_field_s(c->veh, "m_Physics") : NULL;          /* WheeledVehicle.m_Physics; у вертолёта/самолёта/лодки такого поля нет */
-    if (!ph || !hm_obj_ok(ph)) return 0;
-    if (!air_read_f(ph, "SteerInput", &st, 1) || !air_read_f(ph, "ThrottleInput", &th, 1)) return 0;
-    air_read_f(ph, "BrakeInput", &br, 1);
-    g_air_vin[0] = st; g_air_vin[1] = th; g_air_vin[2] = br; g_air_vinOk = 1;
-    if (st > 1.0f) { st = 1.0f; } else if (st < -1.0f) { st = -1.0f; }
-    *x = st; *y = th - br;
-    if (*y > 1.0f) { *y = 1.0f; } else if (*y < -1.0f) { *y = -1.0f; }
-    return 1;
-}
+static int air_veh_input(const AirCtx* c, float* x, float* y);     /* ниже, после чтения экранных контролов */
 static void air_norm2(float* x, float* z) {
     float l = (float)__builtin_sqrt((double)(*x) * (*x) + (double)(*z) * (*z));
     if (l > 1e-4f) { *x /= l; *z /= l; }
@@ -568,7 +558,7 @@ static int air_keys(void* ctrl, int* jump, int* crouch) {
  * m_Controls (путь → OnWebViewScreenControl). Каждый такой объект пишет нажатие в свой InputControl (OnScreenControl.m_Control, у клавиши это
  * ButtonControl) — читаем у него isPressed. Это настоящее состояние кнопки на экране: оно не зависит от способностей персонажа (Jump и Crouch
  * в воздухе, скорее всего, не стартуют — «земли» под ногами нет), в отличие от Character.Keys. */
-typedef struct { void *jump, *crouch; int n; } AirBtnCtx;
+typedef struct { void *jump, *crouch, *w, *s, *a, *d, *sp[2]; int nsp, n; } AirBtnCtx;   /* w/s/a/d/пробел — кнопки HUD машины (Hud.js: PedalGas, PedalStop, TurnLeft, TurnRight, HandBrake) */
 static void *g_air_oscFld; static int g_air_oscBad, g_air_oscDumped;
 static u16 air_lc(u16 c) { return (c >= 'A' && c <= 'Z') ? (u16)(c + 32) : c; }
 static int air_str_is(void* s, const char* a) {                    /* строка .NET == ASCII-строке a, без учёта регистра */
@@ -587,6 +577,11 @@ static void air_btn_cb(void* it, void* ctx) {
     c->n++;
     if (air_str_is(p, "<Keyboard>/leftShift")) c->jump = it;
     else if (air_str_is(p, "<Keyboard>/c")) c->crouch = it;
+    else if (air_str_is(p, "<Keyboard>/w")) c->w = it;
+    else if (air_str_is(p, "<Keyboard>/s")) c->s = it;
+    else if (air_str_is(p, "<Keyboard>/a")) c->a = it;
+    else if (air_str_is(p, "<Keyboard>/d")) c->d = it;
+    else if (air_str_is(p, "<Keyboard>/space") && c->nsp < 2) c->sp[c->nsp++] = it;   /* «/space» (ручник) и «/Space» (спринт джойстика) — разные записи словаря, но одна клавиша */
 }
 static void air_btn_dump_cb(void* it, void* ctx) {                  /* один раз пишем в журнал, какие экранные контролы вообще есть */
     void* p = hm_obj_ok(it) ? ref_field_s(it, "m_ControlPath") : NULL; char tmp[96]; int cnt; const u16* ch;
@@ -600,7 +595,7 @@ static void air_btn_dump_cb(void* it, void* ctx) {                  /* один 
 /* находит в словаре контролы прыжка и приседа. 1 — словарь прочитался */
 static int air_osc_find(AirBtnCtx* out) {
     void *dict = NULL, *arr; int total;
-    out->jump = out->crouch = NULL; out->n = 0;
+    out->jump = out->crouch = out->w = out->s = out->a = out->d = out->sp[0] = out->sp[1] = NULL; out->nsp = 0; out->n = 0;
     if (g_air_oscBad || !g_img) return 0;
     if (!g_air_oscFld) {
         void* cls = A.class_from_name(g_img, "Hassle.WebView.Controls", "OnScreenControls");
@@ -615,7 +610,7 @@ static int air_osc_find(AirBtnCtx* out) {
     walk_struct_array(arr, total, "value", air_btn_cb, out);
     if (!out->jump && !out->crouch && out->n > 0 && !g_air_oscDumped) {
         g_air_oscDumped = 1;
-        dlog("air: в OnScreenControls нет <Keyboard>/leftShift и <Keyboard>/c; есть:");
+        dlog("air: в OnScreenControls нет <Keyboard>/leftShift и <Keyboard>/c (в машине так и должно быть); есть:");
         walk_struct_array(arr, total, "value", air_btn_dump_cb, NULL);
     }
     return 1;
@@ -625,6 +620,49 @@ static int air_ctl_pressed(void* oc) {                              /* OnScreenC
     if (!ctl) ctl = air_obj(oc, "get_control");
     if (!ctl || !hm_obj_ok(ctl)) return 0;
     return air_get_bool(ctl, "get_isPressed", 0);
+}
+/* кнопки HUD машины (Hud.js, блок isSpeedometerShown): W — газ, S — тормоз/назад, A/D — руль (только при кнопочном управлении; при джойстике руль — стик),
+   ПРОБЕЛ — ручник (всегда). Прыжка в машине нет; присед (<Keyboard>/c) есть только при джойстике (двойной тап). 1 — словарь контролов прочитался */
+typedef struct { int w, s, a, d, sp; } AirCarKeys;
+static AirCarKeys g_air_vkeys; static int g_air_vkFound = -1;
+static int air_car_keys(AirCarKeys* k) {
+    AirBtnCtx b; int i;
+    k->w = k->s = k->a = k->d = k->sp = 0;
+    if (!air_osc_find(&b)) return 0;
+    if (b.w) k->w = air_ctl_pressed(b.w);
+    if (b.s) k->s = air_ctl_pressed(b.s);
+    if (b.a) k->a = air_ctl_pressed(b.a);
+    if (b.d) k->d = air_ctl_pressed(b.d);
+    for (i = 0; i < b.nsp; i++) if (air_ctl_pressed(b.sp[i])) k->sp = 1;
+    return (b.w || b.s || b.a || b.d || b.nsp) ? 1 : 0;
+}
+/* ввод в машине. Источники: (1) кнопки HUD (W/S/A/D) — самое прямое, не зависит от физики; если ни одна не нажата — (2) физика машины WheeledVehiclePhysics
+   (SteerInput/ThrottleInput/BrakeInput; их пишет VehicleInput.Update — это даёт стик-руль при управлении джойстиком). Руль: вправо +, газ − тормоз: вперёд +.
+   Заодно g_air_vsp — зажат ли ПРОБЕЛ (ручник): тогда газ/тормоз двигают вверх/вниз (режим высоты). 1 — хоть что-то прочиталось */
+static int g_air_vsp;
+static int air_veh_input(const AirCtx* c, float* x, float* y) {
+    void* ph; float st = 0.0f, th = 0.0f, br = 0.0f; int physOk = 0, kOk;
+    kOk = air_car_keys(&g_air_vkeys); g_air_vkFound = kOk;
+    g_air_vsp = kOk ? g_air_vkeys.sp : 0;
+    ph = c->veh ? ref_field_s(c->veh, "m_Physics") : NULL;          /* WheeledVehicle.m_Physics; у вертолёта/самолёта/лодки такого поля нет */
+    if (ph && hm_obj_ok(ph) && air_read_f(ph, "SteerInput", &st, 1) && air_read_f(ph, "ThrottleInput", &th, 1)) {
+        air_read_f(ph, "BrakeInput", &br, 1);
+        g_air_vin[0] = st; g_air_vin[1] = th; g_air_vin[2] = br; physOk = 1;
+    }
+    g_air_vinOk = physOk;
+    if (kOk && (g_air_vkeys.w || g_air_vkeys.s || g_air_vkeys.a || g_air_vkeys.d)) {   /* кнопки нажаты — они главные */
+        *x = (float)(g_air_vkeys.d - g_air_vkeys.a); *y = (float)(g_air_vkeys.w - g_air_vkeys.s);
+        if (physOk && (st > 0.05f || st < -0.05f) && g_air_vkeys.a == g_air_vkeys.d) *x = st;   /* кнопки газа/тормоза + руль стиком */
+        return 1;
+    }
+    if (physOk) {
+        if (st > 1.0f) { st = 1.0f; } else if (st < -1.0f) { st = -1.0f; }
+        *x = st; *y = th - br;
+        if (*y > 1.0f) { *y = 1.0f; } else if (*y < -1.0f) { *y = -1.0f; }
+        return 1;
+    }
+    if (kOk) { *x = 0.0f; *y = 0.0f; return 1; }                     /* кнопки найдены, не нажаты, физика не читается — стоим на месте */
+    return 0;
 }
 /* состояние ПРЫЖКА и ПРИСЕДА. Возврат — источник: 2 экранные контролы (основной), 1 Character.Keys (запасной), 0 — ничего не прочиталось.
    Если экранные контролы нашлись, Character.Keys НЕ смешиваем: он в воздухе устроен иначе, и «залипший» присед тянул бы вас вниз после отпускания. */
@@ -870,9 +908,13 @@ static void air_tick(void) {
         }
     }
     if (air_move_vec(&c, mv3)) {
-        g_air_hold[0] += mv3[0] * g_air_speed * dt;
-        g_air_hold[1] += mv3[1] * g_air_speed * dt;
-        g_air_hold[2] += mv3[2] * g_air_speed * dt;
+        if (g_air_mode == 1 && g_air_vsp) {                          /* ручник зажат: газ — вверх, тормоз — вниз (только по высоте) */
+            g_air_hold[1] += g_air_rawIn[1] * g_air_speed * dt;
+        } else {
+            g_air_hold[0] += mv3[0] * g_air_speed * dt;
+            g_air_hold[1] += mv3[1] * g_air_speed * dt;
+            g_air_hold[2] += mv3[2] * g_air_speed * dt;
+        }
     }
     if (g_air_mode == 1) air_vset(c.veh, g_air_hold);
     else if (air_call_setpos(c.mv, g_air_hold, "движению")) air_zero_vel(c.mv);
@@ -928,7 +970,8 @@ static int air_tokens(void* arr, char tok[][32], int maxn) {
 }
 static void air_usage(void) {
     chat_usage("/air — полёт вкл/выкл (и пешком, и за рулём — тогда летит машина). Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику, второй тап держать) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
-    chat_usage("В машине: газ/тормоз — вперёд/назад, руль — вбок (относительно камеры); вверх/вниз — взглядом камеры в 3d, или /air up|down N. Вышли из машины — она встанет на землю, вы продолжите лететь пешком");
+    chat_usage("В машине: W/газ — вперёд, S/тормоз — назад, руль (A/D или стик) — вбок, всё относительно камеры. Вверх/вниз: зажмите РУЧНИК (пробел) — тогда газ летит вверх, тормоз вниз; или взгляд камерой в 3d, или /air up|down N");
+    chat_usage("Вышли из машины в полёте — она встанет на землю, вы продолжите лететь пешком");
     chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
@@ -945,9 +988,13 @@ static void air_status(void) {
         b_init(&b, m, sizeof m); b_s(&b, "  машина: Rigidbody "); b_s(&b, rb ? "найден" : "НЕ НАЙДЕН"); b_s(&b, ", kinematic "); b_int(&b, rb ? air_get_bool(rb, "get_isKinematic", -1) : -1);
         b_s(&b, ", коллизии "); b_int(&b, rb ? air_get_bool(rb, "get_detectCollisions", -1) : -1); b_s(&b, ", возвратов физики игрой: "); b_int(&b, g_air_vfix);
         chat_say(m);
-        b_init(&b, m, sizeof m); b_s(&b, "  ввод машины (руль/газ/тормоз): ");
-        if (g_air_vinOk == 1) { b_fix(&b, g_air_vin[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[2], 2); b_s(&b, " — понажимайте газ/руль: числа должны меняться"); }
-        else b_s(&b, "НЕ ЧИТАЕТСЯ (нет WheeledVehiclePhysics — вертолёт/самолёт/лодка? тогда /air up|down|to)");
+        b_init(&b, m, sizeof m); b_s(&b, "  кнопки HUD машины W S A D пробел: ");
+        if (g_air_vkFound == 1) { b_int(&b, g_air_vkeys.w); b_ch(&b, ' '); b_int(&b, g_air_vkeys.s); b_ch(&b, ' '); b_int(&b, g_air_vkeys.a); b_ch(&b, ' '); b_int(&b, g_air_vkeys.d); b_ch(&b, ' '); b_int(&b, g_air_vkeys.sp); b_s(&b, " — зажмите газ: W станет 1"); }
+        else b_s(&b, "НЕ НАЙДЕНЫ (список экранных контролов — в konstt.log, строки «экранный контрол»)");
+        chat_say(m);
+        b_init(&b, m, sizeof m); b_s(&b, "  физика машины, руль/газ/тормоз: ");
+        if (g_air_vinOk == 1) { b_fix(&b, g_air_vin[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[2], 2); }
+        else b_s(&b, "не читается (нет WheeledVehiclePhysics — вертолёт/самолёт/лодка? тогда кнопки или /air up|down|to)");
         chat_say(m);
     }
     if (g_air_on && air_ctx(&c, 1) && (g_air_mode == 1 ? air_vpos(c.veh, p) : air_mypos(&c, p, NULL))) {
