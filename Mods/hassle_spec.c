@@ -17,8 +17,7 @@
  *     выходит (RVA 0x12F9B68..0x12F9B70: ldr w8,[x0,#0x28]; cmp w8,#2; b.ne ret). Статус 2 игра ставит сама только тогда, когда сервер
  *     реально включил наблюдение за целью (RPC ToggleSpectating + SetTarget). Если менять только m_IsSpectating, onfoot уже не уходит,
  *     а spectate ещё не уходит — на сервер не приходит НИЧЕГО, позиция NPC замерзает. Поэтому /spec on теперь пишет и m_LoadingStatus = 2.
- *     Компонента Spectate на камере может не быть вовсе: игра создаёт его лениво (F.GetOrAddComponent<Spectate>) при первом серверном наблюдении.
- *     Тогда /spec on добавляет его сам (GameObject.AddComponent). Spectate.Update при этом ничего не ломает: пока m_TargetID == 0xFFFF (значение из конструктора) он сразу выходит.
+ *     Spectate.Update при этом ничего не ломает: пока m_TargetID == 0xFFFF (значение из конструктора) он сразу выходит.
  *   • ПОЗИЦИЯ В ПАКЕТЕ — не позиция игрока, а MainCamera.TargetPosition + (0, 1, 0) (RVA 0x12F9C10..0x12F9C28: x, y+1.0, z).
  *     TargetPosition = transform.position цели камеры (MainCamera.m_Target/m_TargetTransform). Пока камера следит за своим игроком — это
  *     позиция игрока, но сервер увидит её на 1 м выше, чем в onfoot (учтите на сервере или вычтите 1.0 по Y). Если камера на чужой цели
@@ -94,14 +93,14 @@ static void* spec_camera(void) {
     return (cam && hm_obj_ok(cam)) ? cam : NULL;
 }
 
-/* Метод name(System.Type) с одним параметром: у GetComponent/AddComponent есть и другие перегрузки с тем же числом аргументов
-   (string и т.п.), поэтому перебираем методы класса и его предков и сверяем тип параметра */
-static void* spec_find_type_method(void* k, const char* name) {
-    for (; k; k = A.class_get_parent(k)) {
+/* Component.GetComponent(System.Type) — у GetComponent есть перегрузка (string) с тем же числом аргументов, поэтому перебираем методы */
+static void* spec_get_component_method(void* obj) {
+    void* k;
+    for (k = A.object_get_class(obj); k; k = A.class_get_parent(k)) {
         void* it = NULL; void* m;
         while ((m = SP.cls_methods(k, &it)) != NULL) {
             const char* nm = SP.m_name(m); const char* tn;
-            if (!nm || !seq(nm, name) || SP.m_pcount(m) != 1) continue;
+            if (!nm || !seq(nm, "GetComponent") || SP.m_pcount(m) != 1) continue;
             tn = A.type_get_name(SP.m_param(m, 0));
             if (tn && seq(tn, "System.Type")) return m;
         }
@@ -109,47 +108,22 @@ static void* spec_find_type_method(void* k, const char* name) {
     return NULL;
 }
 
-/* Вызов с проверкой исключения; при исключении пишет в журнал класс исключения */
-static void* spec_invoke(const char* what, void* m, void* obj, void** args) {
-    void* exc = NULL; void* r = A.runtime_invoke(m, obj, args, &exc);
-    if (exc) {
-        dlog2("spec: исключение в ", what);
-        if (hm_obj_ok(exc)) dlog2("spec:   класс исключения ", A.class_get_name(A.object_get_class(exc)));
-        return NULL;
-    }
-    return r;
-}
-
-/* Компонент Hassle.Graphics.Spectate на объекте MainCamera или NULL. Сама игра создаёт его лениво (F.GetOrAddComponent<Spectate>) при
-   первом серверном «наблюдении», поэтому у игрока, за которым ещё не наблюдали, компонента нет. create=1 — добавить, если его нет.
-   Только главный поток (вызывается из обработчика команды). */
-static void* spec_component(void** outKlass, int create) {
-    void *cam, *kc, *m, *typ, *args[1], *r, *go;
+/* Компонент Hassle.Graphics.Spectate на MainCamera или NULL. Только главный поток (вызывается из обработчика команды). */
+static void* spec_component(void** outKlass) {
+    void *cam, *kc, *m, *typ, *args[1], *exc = NULL, *r;
     if (!spec_api()) return NULL;
     cam = spec_camera();
     if (!cam) { dlog("spec: Game.MainCamera = null"); return NULL; }
     kc = A.class_from_name(g_img, "Hassle.Graphics", "Spectate");
     if (!kc) { dlog("spec: класс Hassle.Graphics.Spectate не найден"); return NULL; }
-    typ = SP.type_object(SP.cls_type(kc));
-    if (!typ) { dlog("spec: не получился System.Type для Spectate"); return NULL; }
-    args[0] = typ;
-    if (outKlass) *outKlass = kc;
-    m = spec_find_type_method(A.object_get_class(cam), "GetComponent");
+    m = spec_get_component_method(cam);
     if (!m) { dlog("spec: Component.GetComponent(Type) не найден"); return NULL; }
-    r = spec_invoke("GetComponent(Spectate)", m, cam, args);
-    if (r && hm_obj_ok(r)) return r;
-    if (!create) { dlog("spec: на MainCamera пока нет компонента Spectate (игра создаёт его при первом наблюдении)"); return NULL; }
-    /* компонента нет — добавляем сами: MainCamera.gameObject.AddComponent(typeof(Spectate)); конструктор ставит m_TargetID = 0xFFFF,
-       так что Spectate.Update ничего не делает */
-    m = find_method(A.object_get_class(cam), "get_gameObject", 0);
-    if (!m) { dlog("spec: Component.get_gameObject не найден"); return NULL; }
-    go = spec_invoke("get_gameObject", m, cam, NULL);
-    if (!go || !hm_obj_ok(go)) { dlog("spec: get_gameObject вернул null"); return NULL; }
-    m = spec_find_type_method(A.object_get_class(go), "AddComponent");
-    if (!m) { dlog("spec: GameObject.AddComponent(Type) не найден"); return NULL; }
-    r = spec_invoke("AddComponent(Spectate)", m, go, args);
-    if (!r || !hm_obj_ok(r)) { dlog("spec: AddComponent(Spectate) вернул null"); return NULL; }
-    dlog("spec: компонент Spectate добавлен на MainCamera");
+    typ = SP.type_object(SP.cls_type(kc));
+    if (!typ) return NULL;
+    args[0] = typ;
+    r = A.runtime_invoke(m, cam, args, &exc);
+    if (exc || !r || !hm_obj_ok(r)) { dlog("spec: на MainCamera нет компонента Spectate"); return NULL; }
+    if (outKlass) *outKlass = kc;
     return r;
 }
 
@@ -224,10 +198,10 @@ static void spec_status(void* lp) {
     u8* fl = spec_flag(lp);
     unsigned lr = 0, ud = 0, keys = 0; float sp[3] = {0, 0, 0}, op[3] = {0, 0, 0};
     chat_say(!fl ? "spec: поле m_IsSpectating не найдено" : *fl ? "spec: ВКЛ (шлётся spectate, ID 212)" : "spec: выкл (обычные пакеты)");
-    {   void* sc = spec_component(NULL, 0); int* st = sc ? spec_status_ptr(sc) : NULL;
+    {   void* sc = spec_component(NULL); int* st = sc ? spec_status_ptr(sc) : NULL;
         char mem[96]; Buf b; b_init(&b, mem, sizeof mem);
         b_s(&b, "Spectate.m_LoadingStatus = ");
-        if (!st) b_s(&b, "? (компонента Spectate ещё нет — появится после /spec on)"); else { b_int(&b, (long)*st); b_s(&b, *st == 2 ? " (Loaded — пакеты идут)" : " (НЕ 2 — spectate-пакет не уходит!)"); }
+        if (!st) b_s(&b, "? (компонент не найден)"); else { b_int(&b, (long)*st); b_s(&b, *st == 2 ? " (Loaded — пакеты идут)" : " (НЕ 2 — spectate-пакет не уходит!)"); }
         chat_say(b.p);
         if (spec_cam_target(sp)) spec_say_xyz("cam target:   ", sp);
     }
@@ -251,14 +225,14 @@ static void native_spec_cmd(void* self, void* args, void* mi) {
     fl = spec_flag(lp);
     if (!fl) { chat_say("spec: поле m_IsSpectating не найдено (смотрите konstt.log)"); dlog("spec: нет поля LocalPlayer.m_IsSpectating или оно не bool"); return; }
     if (cmd == 1) {
-        void* sc = spec_component(NULL, 1); int* st = sc ? spec_status_ptr(sc) : NULL;
+        void* sc = spec_component(NULL); int* st = sc ? spec_status_ptr(sc) : NULL;
         if (!st) { chat_say("spec: не нашёл Spectate.m_LoadingStatus — без него пакет не уйдёт, режим НЕ включён (см. konstt.log)"); return; }
         *st = 2;                                            /* Loaded: иначе SendSpectateSyncData молча выходит и на сервер не уходит ничего */
         *fl = 1;                                            /* НЕ ToggleSpectating: тот при выключении делает RequestSpawn */
         chat_say("spec: ВКЛ — вместо onfoot/aim/drive уходит spectate (ID 212)");
         dlog("spec: Spectate.m_LoadingStatus = 2, m_IsSpectating = 1");
     } else {
-        void* sc = spec_component(NULL, 0); int* st = sc ? spec_status_ptr(sc) : NULL;
+        void* sc = spec_component(NULL); int* st = sc ? spec_status_ptr(sc) : NULL;
         *fl = 0;
         if (st && *st == 2) *st = 0;                        /* вернуть как было (None) */
         chat_say("spec: выкл — снова обычные пакеты");
