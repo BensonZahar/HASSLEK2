@@ -43,7 +43,21 @@
  *     учтите: в призраке сервер и его NPC считают, что вы стоите на старом месте.
  *   • Выключение: настоящая гравитация вернётся, и вы упадёте. Если вы выше 5 м над точкой включения, мод сам ставит вас на землю
  *     (Player.SetPosition(pos, findHeight=true) — тот же вызов, что у «/tpl to X Z»), чтобы не разбиться; /air land делает это всегда.
- *   • В машине режим не работает (при посадке выключается сам). Если игра переставила вас далеко (сервер вернул/телепортировал) — держим новую точку.
+ *   • Если игра переставила вас далеко (сервер вернул/телепортировал) — держим новую точку.
+ *
+ * В МАШИНЕ (за рулём) /air летит вместе с машиной — для сломавшихся/застрявших машин и NPC в них. Пассажиру отказ (машиной управляет водитель).
+ *   • Машину держим так же, как пешего: каждый кадр ставим Transform.position машины (и Rigidbody.position) в нашу точку. Чтобы физика не мешала,
+ *     у Rigidbody машины на время полёта: isKinematic = true, detectCollisions = false, useGravity = false, interpolation = None (иначе картинка дёргается).
+ *     Скорости обнуляются ДО kinematic. При выключении всё возвращается как было, скорости снова обнуляются. Entity.SetPosition (асинхронный, с заморозкой
+ *     и подгрузкой карты — см. /tpl) каждый кадр не годится, его зовём только для посадки машины на землю (findHeight=true).
+ *   • Куда лететь: руль/газ/тормоз берём у самой физики машины — WheeledVehiclePhysics.SteerInput / ThrottleInput / BrakeInput (их пишет VehicleInput.Update
+ *     из экранных кнопок, поэтому от устройства HUD не зависит). Вперёд = газ − тормоз, вправо = руль; «вперёд» — туда, куда смотрит камера (3d) или горизонтально (flat),
+ *     «вправо» — вправо от камеры. Машина при этом не поворачивается: её ориентация остаётся прежней. Вверх/вниз: камерой в 3d (смотрите вверх и жмите газ),
+ *     кнопки ПРЫЖОК/ПРИСЕД, если они есть в HUD машины, и /air up|down N. У вертолёта/самолёта/лодки нет WheeledVehiclePhysics — джойстик не читается, двигайте /air up|down, /air to ID.
+ *   • Сели в машину, пока летели пешком, — полёт перейдёт на машину; вышли из машины в полёте — машина сама встанет на землю, а вы продолжите лететь пешком.
+ *   • Выключение: если машина выше 3 м над точкой включения (или ниже неё), мод ставит её на землю (Entity.SetPosition(pos, findHeight=true)); /air land делает это всегда.
+ *   • Серверный античит может отреагировать на скорость/высоту машины; /tpl ghost перед /air не пускает позицию на сервер. Если сервер вернёт машину RPC SetVehiclePos —
+ *     мод увидит прыжок и возьмёт новую точку (чтобы сервер не возвращал вообще — /tpl keep on).
  *
  * «Как на ровном» (/air stand) — по дампу IL2CPP и дизассемблированию libil2cpp.so (RVA из dump.cs)
  *   • Левитация в кадре — это способность Fall (клип m_FallDownClip, руки в стороны). Fall.CanStartAbility = «не isOnGround И FindGround(...) ничего не нашёл».
@@ -69,6 +83,7 @@ extern int clock_gettime(int, void*);       /* как в mem/route/tpl: struct t
 #define AIR_TICK_US 8000                          /* период рабочего потока; реально тик идёт раз в кадр (пока прошлый не отработал, новый не шлём) */
 #define AIR_NEAR 8
 #define AIR_JUMP 6.0f                             /* если игра сама сдвинула вас дальше, чем на столько метров за кадр — считаем это перестановкой и берём новую точку */
+#define AIR_VEH_AUTOLAND 3.0f                     /* то же для машины: выше этого над точкой включения (или ниже неё) при выключении ставим машину на землю */
 #define AIR_AUTOLAND 5.0f                         /* выше этого над точкой включения при выключении ставим на землю */
 #define AIR_TAP_STEP 0.5f                         /* короткий тап по ПРЫЖКУ/ПРИСЕДУ сразу сдвигает на столько метров (иначе тап длиной в 2-3 кадра почти не виден) */
 
@@ -95,6 +110,13 @@ static int g_air_stand = 1;                       /* 1 — не пускаем F
 static void* g_air_fall;                          /* способность Fall текущего персонажа */
 static int g_air_fallSaved;
 static float g_air_rawIn[3];                      /* последние сырые значения ввода — для /air status */
+static int g_air_mode;                            /* 0 — летим пешком (персонаж), 1 — летим вместе с машиной, в которой вы за рулём */
+static void* g_air_veh;                           /* машина, которую держим в воздухе (режим 1) */
+static int g_air_vsaved, g_air_vK = -1, g_air_vDc = -1, g_air_vGr = -1, g_air_vIp = -1;   /* исходные флаги Rigidbody машины (-1 — не прочиталось) */
+static int g_air_vrbSame;                         /* 1 — Rigidbody на том же Transform, что и Entity машины: Rigidbody.position тоже ставим */
+static float g_air_vin[3];                        /* последний ввод в машине: руль, газ, тормоз — для /air status */
+static int g_air_vinOk = -1;                      /* 1 — WheeledVehiclePhysics.*Input прочитались, 0 — нет, -1 — не пробовали */
+static int g_air_vfix;                            /* сколько раз игра возвращала машине обычную физику, а мы снова выключали */
 
 /* ───────────── мелкие помощники ───────────── */
 static long long air_now_ns(void) { long ts[2]; ts[0] = 0; ts[1] = 0; clock_gettime(1, ts); return (long long)ts[0] * 1000000000LL + ts[1]; }
@@ -200,6 +222,47 @@ static void air_zero_vel(void* mv) {
     A.runtime_invoke(m, mv, args, &exc);
 }
 
+/* int-геттер/сеттер (enum тоже): dflt — если метода нет или он бросил */
+static int air_get_i32(void* obj, const char* getter, int dflt) {
+    void *m, *exc = NULL, *r;
+    if (!obj) return dflt;
+    m = find_method(A.object_get_class(obj), getter, 0);
+    if (!m) return dflt;
+    r = A.runtime_invoke(m, obj, NULL, &exc);
+    if (exc || !r) return dflt;
+    return *(int*)((char*)r + HDR);
+}
+static int air_set_i32(void* obj, const char* setter, int v) {
+    void *m, *exc = NULL, *args[1]; int x = v;
+    if (!obj) return 0;
+    m = find_method(A.object_get_class(obj), setter, 1);
+    if (!m) return 0;
+    args[0] = &x;
+    A.runtime_invoke(m, obj, args, &exc);
+    return exc ? 0 : 1;
+}
+/* сеттер с одним Vector3 (position, velocity…) */
+static int air_set_v3(void* obj, const char* setter, const float* p) {
+    void *m, *exc = NULL, *args[1]; float v[3];
+    if (!obj) return 0;
+    v[0] = p[0]; v[1] = p[1]; v[2] = p[2];
+    m = find_method(A.object_get_class(obj), setter, 1);
+    if (!m) return 0;
+    args[0] = v;
+    A.runtime_invoke(m, obj, args, &exc);
+    return exc ? 0 : 1;
+}
+/* SetPosition(Vector3, bool findHeight) у Player или у машины (Entity.SetPosition) */
+static int air_call_set_h(void* obj, const float* pos, u8 findH, const char* what) {
+    void *m, *exc = NULL, *args[2]; float v[3]; char et[240]; u8 f = findH;
+    v[0] = pos[0]; v[1] = pos[1]; v[2] = pos[2];
+    m = find_method(A.object_get_class(obj), "SetPosition", 2);
+    if (!m) { dlog2("air: SetPosition не найден у ", what); return 0; }
+    args[0] = v; args[1] = &f;
+    A.runtime_invoke(m, obj, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("air: SetPosition бросил исключение: ", et); return 0; }
+    return 1;
+}
 
 /* способность персонажа по имени класса (Character.m_Abilities — List<Ability>) */
 static void* air_find_ability(void* ctrl, const char* cls) {
@@ -229,15 +292,16 @@ static void air_stop_ability(void* ab) {                           /* Ability.St
 }
 
 /* ───────────── контекст: игрок и его компоненты (главный поток) ───────────── */
-typedef struct { void *me, *ctrl, *mv, *rb, *etr, *mtr, *veh; } AirCtx;
+typedef struct { void *me, *ctrl, *mv, *rb, *etr, *mtr, *veh; int drv; } AirCtx;   /* drv: 0 — вы пассажир (машиной правит другой) */
 static int air_ctx(AirCtx* c, int quiet) {
-    c->me = c->ctrl = c->mv = c->rb = c->etr = c->mtr = c->veh = NULL;
+    c->me = c->ctrl = c->mv = c->rb = c->etr = c->mtr = c->veh = NULL; c->drv = 1;
     if (!g_safe || !il2cpp_light()) { if (!quiet) chat_say("/air: игра ещё грузится, подождите"); return 0; }
     ensure_attached();
     c->me = local_player();
     if (!c->me || !hm_obj_ok(c->me)) { if (!quiet) chat_say("/air: вы не в игре (персонаж не создан)"); return 0; }
     c->veh = ref_field_s(c->me, "Vehicle");                           /* Player.Vehicle */
     if (c->veh && !hm_obj_ok(c->veh)) c->veh = NULL;
+    if (c->veh) { void* d = ref_field_s(c->veh, "m_Driver"); if (d && hm_obj_ok(d) && d != c->me) c->drv = 0; }   /* BaseVehicle.m_Driver; не прочиталось — считаем водителем */
     c->ctrl = ref_field_s(c->me, "m_Controller");                     /* Actor.m_Controller (ThirdPersonCharacter) */
     if (c->ctrl && !hm_obj_ok(c->ctrl)) c->ctrl = NULL;
     if (c->ctrl) {
@@ -260,6 +324,74 @@ static int air_mypos(const AirCtx* c, float* mP, float* eP) {
     return ok;
 }
 
+
+/* ───────────── машина: Rigidbody, позиция, флаги ───────────── */
+static void* air_veh_rb(void* veh) {                               /* BaseVehicle.m_Rigidbody (как в /tpl) */
+    void* rb = ref_field_s(veh, "m_Rigidbody");
+    if (!rb || !hm_obj_ok(rb)) rb = ref_field_s(veh, "vehicleRigidbody");
+    if (!rb || !hm_obj_ok(rb)) rb = air_obj(veh, "get_Rigidbody");
+    return (rb && hm_obj_ok(rb)) ? rb : NULL;
+}
+static void* air_veh_tr(void* veh) {
+    void* tr = air_obj(veh, "get_Transform");
+    if (!tr) tr = air_obj(veh, "get_transform");
+    return tr;
+}
+static int air_vpos(void* veh, float* p) { void* tr = veh ? air_veh_tr(veh) : NULL; return tr && air_vec(tr, "get_position", p); }
+static void air_rb_zero(void* rb) {                                /* только у не-kinematic тела: у kinematic Unity ругается в лог */
+    static const float z[3] = { 0.0f, 0.0f, 0.0f };
+    air_set_v3(rb, "set_velocity", z);
+    air_set_v3(rb, "set_angularVelocity", z);
+}
+/* прямая постановка машины: Transform.position (+ Rigidbody.position). Работает мгновенно, в отличие от Entity.SetPosition */
+static int air_vset(void* veh, const float* pos) {
+    void *tr = air_veh_tr(veh), *rb;
+    if (!tr || !air_set_v3(tr, "set_position", pos)) return 0;
+    if (g_air_vrbSame) { rb = air_veh_rb(veh); if (rb) air_set_v3(rb, "set_position", pos); }
+    return 1;
+}
+/* on=1: kinematic, без коллизий и гравитации, без интерполяции; on=0: вернуть исходные значения */
+static void air_vflags(void* veh, int on) {
+    void* rb = veh ? air_veh_rb(veh) : NULL; int okK, okD, okG;
+    if (!rb) { dlog("air: у машины не найден Rigidbody — флаги не менял"); return; }
+    if (on) {
+        if (!g_air_vsaved) {                                       /* исходные значения — один раз за включение (повторные вызовы их не затирают) */
+            char lg[200]; Buf x;
+            g_air_vK = air_get_bool(rb, "get_isKinematic", -1);
+            g_air_vDc = air_get_bool(rb, "get_detectCollisions", -1);
+            g_air_vGr = air_get_bool(rb, "get_useGravity", -1);
+            g_air_vIp = air_get_i32(rb, "get_interpolation", -1);
+            g_air_vsaved = 1;
+            b_init(&x, lg, sizeof lg); b_s(&x, "air: машина, исходные флаги: isKinematic "); b_int(&x, g_air_vK); b_s(&x, ", detectCollisions "); b_int(&x, g_air_vDc);
+            b_s(&x, ", useGravity "); b_int(&x, g_air_vGr); b_s(&x, ", interpolation "); b_int(&x, g_air_vIp); b_s(&x, ", Rigidbody на том же Transform: "); b_s(&x, g_air_vrbSame ? "да" : "нет");
+            dlog(lg);
+        }
+        air_rb_zero(rb);                                           /* пока тело ещё не kinematic */
+        if (g_air_vIp >= 0) air_set_i32(rb, "set_interpolation", 0);
+        okG = air_set_bool(rb, "set_useGravity", 0);
+        okD = air_set_bool(rb, "set_detectCollisions", 0);
+        okK = air_set_bool(rb, "set_isKinematic", 1);
+        { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "air: машина, флаги применены: isKinematic "); b_s(&x, okK ? "ок" : "НЕТ");
+          b_s(&x, ", detectCollisions "); b_s(&x, okD ? "ок" : "НЕТ"); b_s(&x, ", useGravity "); b_s(&x, okG ? "ок" : "НЕТ"); dlog(lg); }
+    } else {
+        int k = g_air_vK < 0 ? 0 : g_air_vK, dc = g_air_vDc < 0 ? 1 : g_air_vDc, gr = g_air_vGr < 0 ? 1 : g_air_vGr;
+        air_set_bool(rb, "set_isKinematic", k);
+        air_set_bool(rb, "set_detectCollisions", dc);
+        air_set_bool(rb, "set_useGravity", gr);
+        if (g_air_vIp >= 0) air_set_i32(rb, "set_interpolation", g_air_vIp);
+        if (!k) air_rb_zero(rb);                                   /* без этого машина продолжила бы с прежней скоростью */
+        g_air_vsaved = 0;
+        dlog("air: машина, флаги возвращены");
+    }
+}
+/* отпустить машину: вернуть физику и (land) поставить на землю тем же вызовом, что /tpl to — Entity.SetPosition(pos, findHeight=true) */
+static void air_vrelease(int land) {
+    void* veh = g_air_veh; float p[3];
+    g_air_veh = NULL;
+    if (!veh || !hm_obj_ok(veh)) { g_air_vsaved = 0; dlog("air: машина пропала — флаги вернуть не на чем"); return; }
+    air_vflags(veh, 0);
+    if (land && air_vpos(veh, p)) { if (air_call_set_h(veh, p, 1, "машине (посадка)")) dlog("air: машина поставлена на землю"); }
+}
 
 /* ───────────── «как на ровном»: отключаем способность Fall ───────────── */
 static int g_air_oFallEn = 1;
@@ -324,6 +456,20 @@ static int air_read_f(void* obj, const char* name, float* out, int n) {
     for (i = 0; i < n; i++) { if (!(p[i] == p[i]) || p[i] > 1e4f || p[i] < -1e4f) return 0; out[i] = p[i]; }
     return 1;
 }
+/* ввод в машине: руль (вправо +) и газ − тормоз (вперёд +) из WheeledVehiclePhysics. 1 — прочиталось */
+static int air_veh_input(const AirCtx* c, float* x, float* y) {
+    void* ph; float st = 0.0f, th = 0.0f, br = 0.0f;
+    g_air_vinOk = 0;
+    ph = c->veh ? ref_field_s(c->veh, "m_Physics") : NULL;          /* WheeledVehicle.m_Physics; у вертолёта/самолёта/лодки такого поля нет */
+    if (!ph || !hm_obj_ok(ph)) return 0;
+    if (!air_read_f(ph, "SteerInput", &st, 1) || !air_read_f(ph, "ThrottleInput", &th, 1)) return 0;
+    air_read_f(ph, "BrakeInput", &br, 1);
+    g_air_vin[0] = st; g_air_vin[1] = th; g_air_vin[2] = br; g_air_vinOk = 1;
+    if (st > 1.0f) { st = 1.0f; } else if (st < -1.0f) { st = -1.0f; }
+    *x = st; *y = th - br;
+    if (*y > 1.0f) { *y = 1.0f; } else if (*y < -1.0f) { *y = -1.0f; }
+    return 1;
+}
 static void air_norm2(float* x, float* z) {
     float l = (float)__builtin_sqrt((double)(*x) * (*x) + (double)(*z) * (*z));
     if (l > 1e-4f) { *x /= l; *z /= l; }
@@ -333,6 +479,10 @@ static int air_move_vec(const AirCtx* c, float* out) {
     float in[3]; float R[3], F[3]; void* ct; int fromCam = 1; float mag;
     out[0] = out[1] = out[2] = 0.0f;
     g_air_rawIn[0] = g_air_rawIn[1] = g_air_rawIn[2] = 0.0f;
+    if (g_air_mode == 1) {                                           /* в машине: руль и газ/тормоз физики машины */
+        if (!air_veh_input(c, &in[0], &in[1])) return 0;
+        goto have_input;
+    }
     if (!c->ctrl) return 0;
     if (g_air_inSrc == 1) {                                          /* Character.MovementDirection — мировой вектор, только горизонталь */
         if (!air_read_f(c->ctrl, "MovementDirection", in, 3)) return 0;
@@ -344,6 +494,7 @@ static int air_move_vec(const AirCtx* c, float* out) {
         return 1;
     }
     if (!air_read_f(c->ctrl, "m_MovementInput", in, 2)) return 0;    /* Vector2: x — вправо, y — вперёд */
+have_input:
     g_air_rawIn[0] = in[0]; g_air_rawIn[1] = in[1];
     mag = (float)__builtin_sqrt((double)in[0] * in[0] + (double)in[1] * in[1]);
     if (mag < 0.05f) return 1;
@@ -572,53 +723,87 @@ static void* air_worker(void* arg) {
     }
     return NULL;
 }
-static int air_enter(float lift, const float* target /* NULL — подняться на lift над собой; иначе лететь в точку (система Entity.Transform) */) {
-    AirCtx c; float mP[3], eP[3], hold[3];
-    if (!air_ctx(&c, 0)) return 0;
-    if (c.veh) { chat_say("/air: в машине не работает — сначала выйдите"); return 0; }
-    if (!c.mv) { chat_say("/air: у вашего персонажа не найден компонент движения (подробности в konstt.log)"); dlog("air: нет Actor.m_Controller.Movement"); return 0; }
-    if (!air_mypos(&c, mP, eP)) { chat_say("/air: ваша позиция не прочиталась — подробности в konstt.log"); return 0; }
-    mt_capture_ctx();                                                /* нужен главный поток — мы как раз в нём (обработчик команды) */
-    if (!g_mt_ctx || !g_mt_postM || !g_mt_kCb) { chat_say("/air: нет канала в главный поток — полёт не удержать (подробности в konstt.log)"); dlog("air: нет g_mt_ctx"); return 0; }
-    if (target) { hold[0] = target[0] + (mP[0] - eP[0]); hold[1] = target[1] + (mP[1] - eP[1]); hold[2] = target[2] + (mP[2] - eP[2]); }
-    else { hold[0] = mP[0]; hold[1] = mP[1] + lift; hold[2] = mP[2]; }
-    air_flags(&c, 1);
-    if (!air_call_setpos(c.mv, hold, "движению")) {
-        air_flags(&c, 0);
-        chat_say("/air: не получилось поставить персонажа в воздух — подробности в konstt.log");
-        return 0;
-    }
-    air_zero_vel(c.mv);
+static void air_state_init(const float* hold) {
     g_air_hold[0] = g_air_last[0] = hold[0]; g_air_hold[1] = g_air_last[1] = hold[1]; g_air_hold[2] = g_air_last[2] = hold[2];
-    g_air_y0 = mP[1];
     g_air_tPrev = air_now_ns(); g_air_jumps = 0; g_air_watchId = -1; g_air_watchT = 0; g_air_pending = 0;
     g_air_pj = g_air_pc = 1; g_air_kSrc = -1;                        /* если кнопка уже зажата в момент включения — это не «новое нажатие» */
+}
+/* пешком: флаги + постановка в точку hold (система transform движения). 0 — не вышло, флаги возвращены */
+static int air_begin_foot(const AirCtx* c, const float* hold) {
+    air_flags(c, 1);
+    if (!air_call_setpos(c->mv, hold, "движению")) { air_flags(c, 0); return 0; }
+    air_zero_vel(c->mv);
+    air_state_init(hold);
+    g_air_mode = 0; g_air_veh = NULL;
+    return 1;
+}
+/* за рулём: флаги Rigidbody машины + постановка в точку hold (система Entity.Transform машины). 0 — не вышло, флаги возвращены */
+static int air_begin_car(const AirCtx* c, const float* hold) {
+    void *rb = air_veh_rb(c->veh), *tr = air_veh_tr(c->veh);
+    if (!rb || !tr) { dlog(!rb ? "air: у машины нет Rigidbody (m_Rigidbody)" : "air: у машины нет Transform"); return 0; }
+    g_air_vrbSame = (air_obj(rb, "get_transform") == tr);
+    g_air_veh = c->veh;
+    air_vflags(c->veh, 1);
+    if (!air_vset(c->veh, hold)) { air_vflags(c->veh, 0); g_air_veh = NULL; dlog("air: машину в точку поставить не вышло (Transform.set_position)"); return 0; }
+    air_state_init(hold);
+    g_air_mode = 1;
+    return 1;
+}
+static int air_enter(float lift, const float* target /* NULL — подняться на lift над собой; иначе лететь в точку (система Entity.Transform) */) {
+    AirCtx c; float mP[3], eP[3], hold[3]; int car;
+    if (!air_ctx(&c, 0)) return 0;
+    car = c.veh ? 1 : 0;
+    if (car) {
+        if (!c.drv) { chat_say("/air: вы пассажир — машиной правит водитель. Сядьте за руль или выйдите"); return 0; }
+        if (!air_vpos(c.veh, eP)) { chat_say("/air: позиция машины не прочиталась — подробности в konstt.log"); dlog("air: нет Transform.position у машины"); return 0; }
+    } else {
+        if (!c.mv) { chat_say("/air: у вашего персонажа не найден компонент движения (подробности в konstt.log)"); dlog("air: нет Actor.m_Controller.Movement"); return 0; }
+        if (!air_mypos(&c, mP, eP)) { chat_say("/air: ваша позиция не прочиталась — подробности в konstt.log"); return 0; }
+    }
+    mt_capture_ctx();                                                /* нужен главный поток — мы как раз в нём (обработчик команды) */
+    if (!g_mt_ctx || !g_mt_postM || !g_mt_kCb) { chat_say("/air: нет канала в главный поток — полёт не удержать (подробности в konstt.log)"); dlog("air: нет g_mt_ctx"); return 0; }
+    if (car) {
+        if (target) { hold[0] = target[0]; hold[1] = target[1]; hold[2] = target[2]; }
+        else { hold[0] = eP[0]; hold[1] = eP[1] + lift; hold[2] = eP[2]; }
+        if (!air_begin_car(&c, hold)) { chat_say("/air: не получилось поднять машину — подробности в konstt.log"); return 0; }
+        g_air_y0 = eP[1];
+    } else {
+        if (target) { hold[0] = target[0] + (mP[0] - eP[0]); hold[1] = target[1] + (mP[1] - eP[1]); hold[2] = target[2] + (mP[2] - eP[2]); }
+        else { hold[0] = mP[0]; hold[1] = mP[1] + lift; hold[2] = mP[2]; }
+        if (!air_begin_foot(&c, hold)) { chat_say("/air: не получилось поставить персонажа в воздух — подробности в konstt.log"); return 0; }
+        g_air_y0 = mP[1];
+    }
     if (!g_air_thread) {
         unsigned long t = 0;
-        if (pthread_create(&t, NULL, air_worker, NULL) != 0) { air_flags(&c, 0); chat_say("/air: не создался рабочий поток"); dlog("air: pthread_create не вышел"); return 0; }
+        if (pthread_create(&t, NULL, air_worker, NULL) != 0) {
+            if (car) air_vrelease(0); else air_flags(&c, 0);
+            chat_say("/air: не создался рабочий поток"); dlog("air: pthread_create не вышел"); return 0;
+        }
         g_air_thread = 1;
     }
     __atomic_store_n(&g_air_on, 1, __ATOMIC_RELEASE);
-    dlog("air: включён");
+    dlog(car ? "air: включён (в машине)" : "air: включён");
     return 1;
 }
 static void air_exit(const char* why, int land) {
-    AirCtx c; float eP[3]; int doLand = land;
-    if (!__atomic_load_n(&g_air_on, __ATOMIC_ACQUIRE) && !g_air_saved) return;
-    if (g_air_hold[1] - g_air_y0 > AIR_AUTOLAND || g_air_y0 - g_air_hold[1] > 1.0f) doLand = 1;    /* высоко над точкой включения или ниже неё (спустились под землю) — ставим на поверхность */
+    AirCtx c; float eP[3]; int doLand = land, car = (g_air_mode == 1);
+    if (!__atomic_load_n(&g_air_on, __ATOMIC_ACQUIRE) && !g_air_saved && !g_air_vsaved) return;
+    {
+        float lim = car ? AIR_VEH_AUTOLAND : AIR_AUTOLAND;
+        if (g_air_hold[1] - g_air_y0 > lim || g_air_y0 - g_air_hold[1] > 1.0f) doLand = 1;    /* высоко над точкой включения или ниже неё (спустились под землю) — ставим на поверхность */
+    }
     __atomic_store_n(&g_air_on, 0, __ATOMIC_RELEASE);
+    if (car) {                                                       /* машина: вернуть физику и (если надо) поставить на землю */
+        air_vrelease(doLand);
+        g_air_mode = 0;
+        dlog2("air: выключен (машина): ", why);
+        return;
+    }
     if (air_ctx(&c, 1)) {
         air_flags(&c, 0);
         if (c.mv) air_zero_vel(c.mv);
         if (doLand && !c.veh && c.me && air_mypos(&c, NULL, eP)) {
-            void *m, *exc = NULL, *args[2]; u8 findH = 1; float v[3]; char et[240];
-            v[0] = eP[0]; v[1] = eP[1]; v[2] = eP[2];
-            m = find_method(A.object_get_class(c.me), "SetPosition", 2);   /* Player.SetPosition(Vector3, findHeight) — тот же вызов, что «/tpl to X Z» */
-            if (m) {
-                args[0] = v; args[1] = &findH;
-                A.runtime_invoke(m, c.me, args, &exc);
-                if (exc) { exc_text(exc, et, sizeof et); dlog2("air: посадка: SetPosition бросил исключение: ", et); }
-            }
+            if (air_call_set_h(c.me, eP, 1, "Player (посадка)")) {}   /* Player.SetPosition(Vector3, findHeight) — тот же вызов, что «/tpl to X Z» */
         }
     } else { g_air_saved = 0; g_air_ctrl = NULL; g_air_fall = NULL; g_air_fallSaved = 0; }
     dlog2("air: выключен: ", why);
@@ -629,11 +814,38 @@ static void air_tick(void) {
     AirCtx c; float cur[3], mv3[3], dt; long long now;
     g_air_pending = 0;
     if (!__atomic_load_n(&g_air_on, __ATOMIC_ACQUIRE)) return;
-    if (!air_ctx(&c, 1) || !c.mv) { air_exit("персонаж недоступен", 0); chat_say("/air: персонаж пропал (смерть/смена мира) — полёт выключен"); return; }
-    if (c.veh) { air_exit("вы сели в машину", 0); chat_say("/air: вы в машине — полёт выключен"); return; }
-    if (c.ctrl != g_air_ctrl) air_flags(&c, 1);                      /* персонаж пересоздан: флаги — на новые объекты */
-    if (g_air_stand && g_air_fall && hm_obj_ok(g_air_fall) && air_get_bool(g_air_fall, "get_IsActive", 0)) air_stop_ability(g_air_fall);   /* Fall всё же стартовал (под вами пусто) — гасим */
-    if (!air_mypos(&c, cur, NULL)) return;
+    if (!air_ctx(&c, 1) || (!c.veh && !c.mv)) { air_exit("персонаж недоступен", 0); chat_say("/air: персонаж пропал (смерть/смена мира) — полёт выключен"); return; }
+    if (g_air_mode == 0 && c.veh) {                                  /* сели в машину, пока летели пешком */
+        float vp[3];
+        if (!c.drv) { air_exit("вы сели пассажиром", 0); chat_say("/air: вы пассажир — полёт выключен (за рулём он работает)"); return; }
+        air_flags(&c, 0);                                            /* пешие флаги снимаем, дальше держим машину */
+        if (!air_vpos(c.veh, vp) || !air_begin_car(&c, vp)) { air_exit("не удалось перейти на машину", 0); chat_say("/air: не получилось перейти на машину — полёт выключен (подробности в konstt.log)"); return; }
+        chat_say("/air: вы за рулём — теперь летит машина");
+        return;
+    }
+    if (g_air_mode == 1 && (!c.veh || c.veh != g_air_veh)) {         /* вышли из машины (или пересели) в полёте */
+        float hp[3];
+        air_vrelease(1);                                             /* брошенная машина иначе осталась бы висеть/упала бы с высоты — на землю */
+        g_air_mode = 0;
+        if (c.veh) {
+            if (!c.drv || !air_vpos(c.veh, hp) || !air_begin_car(&c, hp)) { air_exit("пересели в машину, не удалось продолжить", 0); chat_say("/air: полёт выключен"); return; }
+            chat_say("/air: вы пересели — теперь летит другая машина");
+        } else {
+            if (!c.mv || !air_mypos(&c, hp, NULL) || !air_begin_foot(&c, hp)) { air_exit("вышли из машины, персонаж недоступен", 0); chat_say("/air: вы вышли из машины — полёт выключен"); return; }
+            chat_say("/air: вы вышли из машины — она поставлена на землю, вы продолжаете лететь пешком");
+        }
+        return;
+    }
+    if (g_air_mode == 0) {
+        if (c.ctrl != g_air_ctrl) air_flags(&c, 1);                  /* персонаж пересоздан: флаги — на новые объекты */
+        if (g_air_stand && g_air_fall && hm_obj_ok(g_air_fall) && air_get_bool(g_air_fall, "get_IsActive", 0)) air_stop_ability(g_air_fall);   /* Fall всё же стартовал (под вами пусто) — гасим */
+        if (!air_mypos(&c, cur, NULL)) return;
+    } else {
+        void* rb;
+        if (!air_vpos(c.veh, cur)) return;
+        rb = air_veh_rb(c.veh);                                      /* игра (Entity.SetPosition по приказу сервера) могла вернуть машине обычную физику — снова выключаем */
+        if (rb && air_get_bool(rb, "get_isKinematic", 1) == 0) { air_vflags(c.veh, 1); g_air_vfix++; dlog("air: игра вернула машине физику — выключил снова"); }
+    }
     now = air_now_ns();
     dt = (float)((double)(now - g_air_tPrev) / 1e9);
     g_air_tPrev = now;
@@ -645,7 +857,7 @@ static void air_tick(void) {
         dlog("air: вас переставили далеко — держу новую точку");
     }
     if (g_air_keys) {                                                /* прыжок — вверх, присед — вниз (как клавиши высоты в airbrake) */
-        int kj = 0, kc = 0, src = air_buttons(c.ctrl, &kj, &kc);
+        int kj = 0, kc = 0, src = air_buttons(g_air_mode == 1 ? NULL : c.ctrl, &kj, &kc);   /* в машине Character.Keys не читаем: там другие клавиши */
         if (src != g_air_kSrc) {
             g_air_kSrc = src;
             dlog(src == 2 ? "air: кнопки ПРЫЖОК/ПРИСЕД читаю из экранных контролов (OnScreenControls)" : src == 1 ? "air: экранные контролы не найдены — кнопки из Character.Keys (в воздухе могут не работать)" : "air: кнопки ПРЫЖОК/ПРИСЕД не читаются ни из контролов, ни из Character.Keys");
@@ -662,7 +874,8 @@ static void air_tick(void) {
         g_air_hold[1] += mv3[1] * g_air_speed * dt;
         g_air_hold[2] += mv3[2] * g_air_speed * dt;
     }
-    if (air_call_setpos(c.mv, g_air_hold, "движению")) air_zero_vel(c.mv);
+    if (g_air_mode == 1) air_vset(c.veh, g_air_hold);
+    else if (air_call_setpos(c.mv, g_air_hold, "движению")) air_zero_vel(c.mv);
     g_air_last[0] = g_air_hold[0]; g_air_last[1] = g_air_hold[1]; g_air_last[2] = g_air_hold[2];
     if (g_air_watch && now / 1000000 - g_air_watchT >= 700) {        /* кто ближайший NPC — пишем, когда меняется */
         float eP[3]; g_air_watchT = now / 1000000;
@@ -714,7 +927,8 @@ static int air_tokens(void* arr, char tok[][32], int maxn) {
     return n;
 }
 static void air_usage(void) {
-    chat_usage("/air — полёт вкл/выкл. Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику, второй тап держать) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
+    chat_usage("/air — полёт вкл/выкл (и пешком, и за рулём — тогда летит машина). Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику, второй тап держать) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
+    chat_usage("В машине: газ/тормоз — вперёд/назад, руль — вбок (относительно камеры); вверх/вниз — взглядом камеры в 3d, или /air up|down N. Вышли из машины — она встанет на землю, вы продолжите лететь пешком");
     chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
@@ -722,10 +936,21 @@ static void air_status(void) {
     b_init(&b, m, sizeof m);
     b_s(&b, "/air: "); b_s(&b, g_air_on ? "ВКЛ" : "выкл");
     b_s(&b, ", скорость "); b_fix(&b, g_air_speed, 1); b_s(&b, " м/с, режим "); b_s(&b, g_air_look3d ? "3d (куда смотрит камера)" : "flat (горизонтально)");
+    b_s(&b, ", летим: "); b_s(&b, g_air_on ? (g_air_mode == 1 ? "МАШИНОЙ" : "пешком") : "—");
     b_s(&b, ", слежка за NPC: "); b_s(&b, g_air_watch ? "да" : "нет");
     b_s(&b, ", как на ровном: "); b_s(&b, g_air_stand ? (g_air_fall ? "да (Fall найден)" : "да") : "нет");
     chat_say(m);
-    if (g_air_on && air_ctx(&c, 1) && air_mypos(&c, p, NULL)) {
+    if (g_air_on && g_air_mode == 1) {
+        void* rb = g_air_veh ? air_veh_rb(g_air_veh) : NULL;
+        b_init(&b, m, sizeof m); b_s(&b, "  машина: Rigidbody "); b_s(&b, rb ? "найден" : "НЕ НАЙДЕН"); b_s(&b, ", kinematic "); b_int(&b, rb ? air_get_bool(rb, "get_isKinematic", -1) : -1);
+        b_s(&b, ", коллизии "); b_int(&b, rb ? air_get_bool(rb, "get_detectCollisions", -1) : -1); b_s(&b, ", возвратов физики игрой: "); b_int(&b, g_air_vfix);
+        chat_say(m);
+        b_init(&b, m, sizeof m); b_s(&b, "  ввод машины (руль/газ/тормоз): ");
+        if (g_air_vinOk == 1) { b_fix(&b, g_air_vin[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[2], 2); b_s(&b, " — понажимайте газ/руль: числа должны меняться"); }
+        else b_s(&b, "НЕ ЧИТАЕТСЯ (нет WheeledVehiclePhysics — вертолёт/самолёт/лодка? тогда /air up|down|to)");
+        chat_say(m);
+    }
+    if (g_air_on && air_ctx(&c, 1) && (g_air_mode == 1 ? air_vpos(c.veh, p) : air_mypos(&c, p, NULL))) {
         b_init(&b, m, sizeof m); b_s(&b, "  держу "); air_b_xyz(&b, g_air_hold); b_s(&b, ", сейчас "); air_b_xyz(&b, p);
         b_s(&b, ", высота над точкой включения "); b_fix(&b, g_air_hold[1] - g_air_y0, 1); b_s(&b, " м, перестановок игрой: "); b_int(&b, g_air_jumps);
         chat_say(m);
@@ -801,7 +1026,7 @@ static void native_air_cmd(void* self, void* args, void* mi) {
     if (seq(tok[0], "stand") || seq(tok[0], "ровно2") || seq(tok[0], "анимация")) {
         AirCtx c;
         g_air_stand = !g_air_stand;
-        if (g_air_on && air_ctx(&c, 1)) air_stand(&c, g_air_stand);
+        if (g_air_on && g_air_mode == 0 && air_ctx(&c, 1)) air_stand(&c, g_air_stand);
         chat_say(g_air_stand ? "/air: анимация «как на ровном» включена (в полёте идёте/стоите, а не падаете с раскинутыми руками)" : "/air: анимация «как на ровном» выключена — в полёте обычная анимация падения");
         return;
     }
@@ -831,7 +1056,14 @@ static void native_air_cmd(void* self, void* args, void* mi) {
             }
             if (!air_ent_pos(ent, tp)) { chat_say("/air: нашёл NPC, но позиция не прочиталась — подробности в konstt.log"); return; }
             tp[1] += 3.0f;
-            if (g_air_on) {
+            if (g_air_on && g_air_mode == 1) {                           /* машиной: точка в системе Entity.Transform — та же, что у NPC */
+                AirCtx c;
+                if (air_ctx(&c, 0) && c.veh && c.veh == g_air_veh) {
+                    g_air_hold[0] = tp[0]; g_air_hold[1] = tp[1]; g_air_hold[2] = tp[2];
+                    air_vset(c.veh, g_air_hold);
+                    g_air_last[0] = g_air_hold[0]; g_air_last[1] = g_air_hold[1]; g_air_last[2] = g_air_hold[2];
+                } else return;
+            } else if (g_air_on) {
                 AirCtx c; float mP[3], eP[3];
                 if (air_ctx(&c, 0) && air_mypos(&c, mP, eP)) {
                     g_air_hold[0] = tp[0] + (mP[0] - eP[0]); g_air_hold[1] = tp[1] + (mP[1] - eP[1]); g_air_hold[2] = tp[2] + (mP[2] - eP[2]);
@@ -839,7 +1071,7 @@ static void native_air_cmd(void* self, void* args, void* mi) {
                     g_air_last[0] = g_air_hold[0]; g_air_last[1] = g_air_hold[1]; g_air_last[2] = g_air_hold[2];
                 } else return;
             } else if (!air_enter(0.0f, tp)) return;
-            b_init(&b, m, sizeof m); b_s(&b, "/air: над NPC "); b_int(&b, id); b_s(&b, " (3 м выше него): "); air_b_xyz(&b, tp);
+            b_init(&b, m, sizeof m); b_s(&b, g_air_mode == 1 ? "/air: машина над NPC " : "/air: над NPC "); b_int(&b, id); b_s(&b, " (3 м выше него): "); air_b_xyz(&b, tp);
             chat_say(m);
         }
         return;
