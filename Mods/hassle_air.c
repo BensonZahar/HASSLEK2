@@ -19,7 +19,15 @@
  *   /air npc ID  |  /air to ID    перелететь на 3 м над NPC с этим ID (включит полёт сам)
  *   /air watch            вкл/выкл: пока летите, мод пишет в чат ID ближайшего NPC, когда он меняется (подлетели к другому — увидите, кто это)
  *   /air input            переключить источник джойстика (если «не летит» — смотрите /air status и пробуйте этот вариант)
+ *   /air mark [gps|cp|off]  автолёт к красной метке: к маркеру сервера (чекпоинт) или, если его нет, к метке GPS с карты (/gps). Метка сменилась или появилась
+ *                         новая — сам летит к ней, на месте ждёт следующую. gps — только метка карты, cp — только маркер сервера, off — выключить. Если полёт был
+ *                         выключен — включится сам. Пока вы жмёте джойстик/кнопки — автолёт на паузе (перехват), отпустили — продолжит. Скорость — /air speed
  *   /air status           состояние и сырые значения ввода;  /air help — подсказка
+ *
+ * Метки (/air mark): маркер сервера — статические Hassle.Entities.Checkpoint.Race / .Simple (их ставят SetPlayerRaceCheckpoint / SetPlayerCheckpoint; активный — тот, чей
+ *   GameObject включён и позиция не нулевая), метка карты — MiniMap.m_NavigationPoint (+ m_IsNavigationActive), как в /tpl gps. Цель перечитывается раз в 150 мс; её позиция —
+ *   в системе Entity.Transform (как у NPC), поэтому пешему добавляем сдвиг «transform движения − Entity.Transform». Маркер сервера — точная точка (летим ровно в неё), у метки
+ *   карты высота известна не всегда: нет — летим на своей высоте и останавливаемся над точкой (дальше /air down или /air land).
  *
  * Как это работает (поля — из дампа IL2CPP, читаются по ИМЕНАМ, не по смещениям)
  *   • Позиция держится нашим кодом: каждый кадр главному потоку приходит «тик» (тот же приём, что у /tpl и /route: рабочий поток кладёт
@@ -119,6 +127,12 @@ static int g_air_vsaved, g_air_vK = -1, g_air_vDc = -1, g_air_vGr = -1, g_air_vI
 static int g_air_vrbSame;                         /* 1 — Rigidbody на том же Transform, что и Entity машины: Rigidbody.position тоже ставим */
 static float g_air_vin[3];                        /* последний ввод в машине: руль, газ, тормоз — для /air status */
 static int g_air_vinOk = -1;                      /* 1 — WheeledVehiclePhysics.*Input прочитались, 0 — нет, -1 — не пробовали */
+#define AIR_MARK_STOP 1.2f                        /* ближе этого к метке (м) считаем, что прилетели */
+#define AIR_MARK_POLL_MS 150
+static int g_air_mark;                            /* 0 — выкл; 1 — следим за любой меткой; 2 — только метка карты (gps); 3 — только маркер сервера (cp) */
+static int g_air_mkHave, g_air_mkArrived, g_air_mkKind, g_air_mkExact;   /* есть ли цель; прилетели ли; откуда: 1 — маркер сервера, 2 — метка карты; высота точная ли */
+static float g_air_mkPos[3];                      /* последняя прочитанная цель (система Entity.Transform) */
+static long long g_air_mkT;
 static int g_air_vfix;                            /* сколько раз игра возвращала машине обычную физику, а мы снова выключали */
 
 /* ───────────── мелкие помощники ───────────── */
@@ -747,6 +761,105 @@ static void air_cmd_npc_list(void) {
     }
 }
 
+/* ───────────── красные метки: маркер сервера и метка карты ───────────── */
+static int air_obj_active(void* comp) {                             /* GameObject.activeInHierarchy; не прочиталось — считаем активным */
+    void *go = air_obj(comp, "get_gameObject"), *m, *exc = NULL, *r;
+    if (!go) return 0;
+    m = find_method(A.object_get_class(go), "get_activeInHierarchy", 0);
+    if (!m) return 1;
+    r = A.runtime_invoke(m, go, NULL, &exc);
+    return (!exc && r && hm_readable((char*)r + HDR, 1)) ? (*((u8*)r + HDR) != 0) : 1;
+}
+static int air_chk_pos(const char* fld, float* out) {              /* Checkpoint.Simple / Checkpoint.Race */
+    void *cls, *f, *obj = NULL, *tr;
+    if (!g_safe || !il2cpp_light() || !g_img) return 0;
+    cls = A.class_from_name(g_img, "Hassle.Entities", "Checkpoint");
+    f = cls ? A.class_get_field_from_name(cls, fld) : NULL;
+    if (!f) return 0;
+    A.field_static_get_value(f, &obj);
+    if (!obj || !hm_obj_ok(obj) || !air_obj_active(obj)) return 0;
+    tr = air_obj(obj, "get_transform");
+    if (!tr || !air_vec(tr, "get_position", out)) return 0;
+    return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);   /* спрятанный маркер уезжает в ноль */
+}
+static void* air_minimap(void) {                                    /* UI.MiniMap (статический геттер, запасной путь — UI.m_Instance.m_MiniMap) */
+    void *cls, *m, *exc = NULL, *r, *f, *inst = NULL;
+    if (!g_safe || !il2cpp_light() || !g_img) return NULL;
+    cls = A.class_from_name(g_img, "Hassle.Graphics.UserInterfaces", "UI");
+    if (!cls) return NULL;
+    m = find_method(cls, "get_MiniMap", 0);
+    if (m) { r = A.runtime_invoke(m, NULL, NULL, &exc); if (!exc && r && hm_obj_ok(r)) return r; }
+    f = A.class_get_field_from_name(cls, "m_Instance");
+    if (f) {
+        A.field_static_get_value(f, &inst);
+        if (inst && hm_obj_ok(inst)) { r = ref_field(inst, "m_MiniMap"); if (r && hm_obj_ok(r)) return r; }
+    }
+    return NULL;
+}
+/* MiniMap.m_NavigationPoint — мировые координаты Unity; active: m_IsNavigationActive (-1 — поля нет) */
+static int air_nav_point(void* mm, float* p, int* active) {
+    void* k = A.object_get_class(mm); void* f = find_field(k, "m_NavigationPoint"); void* fa; const float* v;
+    if (active) *active = -1;
+    if (!f) return 0;
+    v = (const float*)((char*)mm + A.field_get_offset(f));
+    if (!hm_readable(v, 12) || !air_finite(v)) return 0;
+    p[0] = v[0]; p[1] = v[1]; p[2] = v[2];
+    fa = find_field(k, "m_IsNavigationActive");
+    if (fa && active) { const u8* bp = (const u8*)mm + A.field_get_offset(fa); if (hm_readable(bp, 1)) *active = *bp ? 1 : 0; }
+    return 1;
+}
+/* текущая цель: 1 — маркер сервера, 2 — метка карты, 0 — нет. mode: 1 любая (маркер важнее), 2 только карта, 3 только маркер. exact: высота точная */
+static int air_mark_target(int mode, float* out, int* exact) {
+    float cp[3], np[3]; int act = -1;
+    *exact = 1;
+    if (mode != 2 && (air_chk_pos("Race", cp) || air_chk_pos("Simple", cp))) { out[0] = cp[0]; out[1] = cp[1]; out[2] = cp[2]; return 1; }
+    if (mode != 3) {
+        void* mm = air_minimap();
+        if (mm && air_nav_point(mm, np, &act) && act != 0 && (np[0] != 0.0f || np[1] != 0.0f || np[2] != 0.0f)) {
+            out[0] = np[0]; out[2] = np[2];
+            if (np[1] > -50.0f && np[1] < 3000.0f && np[1] != 0.0f) out[1] = np[1] + 1.5f; else { out[1] = np[1]; *exact = 0; }
+            return 2;
+        }
+    }
+    return 0;
+}
+/* один шаг автолёта (главный поток, из тика). manual — игрок сам жмёт джойстик/кнопки: автолёт на паузе */
+static void air_mark_step(const AirCtx* c, float dt, int manual) {
+    long long nowMs = air_now_ns() / 1000000; float off[3], tg[3], d[3], dist, step; char m[200]; Buf b;
+    if (nowMs - g_air_mkT >= AIR_MARK_POLL_MS) {                    /* цель перечитываем раз в 150 мс */
+        float np[3]; int ex = 1, kind;
+        g_air_mkT = nowMs;
+        kind = air_mark_target(g_air_mark == 2 ? 2 : g_air_mark == 3 ? 3 : 1, np, &ex);
+        if (!kind) {
+            if (g_air_mkHave) { g_air_mkHave = 0; g_air_mkArrived = 0; chat_say("/air mark: метка пропала — жду следующую"); }
+        } else if (!g_air_mkHave || air_dist(np, g_air_mkPos) > 1.0f || kind != g_air_mkKind) {
+            g_air_mkHave = 1; g_air_mkArrived = 0; g_air_mkKind = kind; g_air_mkExact = ex;
+            g_air_mkPos[0] = np[0]; g_air_mkPos[1] = np[1]; g_air_mkPos[2] = np[2];
+            b_init(&b, m, sizeof m); b_s(&b, kind == 1 ? "/air mark: лечу к маркеру сервера, " : "/air mark: лечу к метке карты, ");
+            { float cur[3]; if (air_mypos(c, NULL, cur)) { b_fix(&b, air_dist(cur, np), 0); b_s(&b, " м"); } else b_s(&b, "расстояние неизвестно"); }
+            chat_say(m);
+            { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "air: mark: цель "); b_int(&x, kind); b_s(&x, " в "); air_b_xyz(&x, np); dlog(lg); }
+        } else { g_air_mkPos[0] = np[0]; g_air_mkPos[1] = np[1]; g_air_mkPos[2] = np[2]; g_air_mkExact = ex; }
+    }
+    if (!g_air_mkHave || manual) return;
+    off[0] = off[1] = off[2] = 0.0f;
+    if (g_air_mode == 0) {                                          /* пешком hold — в системе transform движения, цель — в Entity.Transform */
+        float mP[3], eP[3];
+        if (!air_mypos(c, mP, eP)) return;
+        off[0] = mP[0] - eP[0]; off[1] = mP[1] - eP[1]; off[2] = mP[2] - eP[2];
+    }
+    tg[0] = g_air_mkPos[0] + off[0]; tg[1] = g_air_mkExact ? g_air_mkPos[1] + off[1] : g_air_hold[1]; tg[2] = g_air_mkPos[2] + off[2];
+    d[0] = tg[0] - g_air_hold[0]; d[1] = tg[1] - g_air_hold[1]; d[2] = tg[2] - g_air_hold[2];
+    dist = (float)__builtin_sqrt((double)d[0] * d[0] + (double)d[1] * d[1] + (double)d[2] * d[2]);
+    if (dist <= AIR_MARK_STOP) {
+        if (!g_air_mkArrived) { g_air_mkArrived = 1; chat_say("/air mark: на месте — жду следующую метку (/air mark off — выключить, /air land — на землю)"); }
+        return;
+    }
+    g_air_mkArrived = 0;
+    step = g_air_speed * dt; if (step > dist) step = dist;
+    g_air_hold[0] += d[0] / dist * step; g_air_hold[1] += d[1] / dist * step; g_air_hold[2] += d[2] / dist * step;
+}
+
 /* ───────────── включить / выключить ───────────── */
 static void air_post(void);
 static void* air_worker(void* arg) {
@@ -831,6 +944,7 @@ static void air_exit(const char* why, int land) {
         if (g_air_hold[1] - g_air_y0 > lim || g_air_y0 - g_air_hold[1] > 1.0f) doLand = 1;    /* высоко над точкой включения или ниже неё (спустились под землю) — ставим на поверхность */
     }
     __atomic_store_n(&g_air_on, 0, __ATOMIC_RELEASE);
+    g_air_mark = 0; g_air_mkHave = 0; g_air_mkArrived = 0;
     if (car) {                                                       /* машина: вернуть физику и (если надо) поставить на землю */
         air_vrelease(doLand);
         g_air_mode = 0;
@@ -849,7 +963,7 @@ static void air_exit(const char* why, int land) {
 
 /* ───────────── тик (главный поток) ───────────── */
 static void air_tick(void) {
-    AirCtx c; float cur[3], mv3[3], dt; long long now;
+    AirCtx c; float cur[3], mv3[3], dt; long long now; int manual = 0;
     g_air_pending = 0;
     if (!__atomic_load_n(&g_air_on, __ATOMIC_ACQUIRE)) return;
     if (!air_ctx(&c, 1) || (!c.veh && !c.mv)) { air_exit("персонаж недоступен", 0); chat_say("/air: персонаж пропал (смерть/смена мира) — полёт выключен"); return; }
@@ -902,12 +1016,14 @@ static void air_tick(void) {
         }
         if (src) {
             g_air_kj = kj; g_air_kc = kc;
+            if (kj || kc) manual = 1;
             if (kj && !kc) { g_air_hold[1] += g_air_speed * dt; if (!g_air_pj) g_air_hold[1] += AIR_TAP_STEP; }
             else if (kc && !kj) { g_air_hold[1] -= g_air_speed * dt; if (!g_air_pc) g_air_hold[1] -= AIR_TAP_STEP; }
             g_air_pj = kj; g_air_pc = kc;
         }
     }
     if (air_move_vec(&c, mv3)) {
+        if (g_air_rawIn[0] * g_air_rawIn[0] + g_air_rawIn[1] * g_air_rawIn[1] > 0.04f) manual = 1;    /* игрок сам держит джойстик/газ — автолёт к метке на паузе */
         if (g_air_mode == 1 && g_air_vsp) {                          /* ручник зажат: газ — вверх, тормоз — вниз (только по высоте) */
             g_air_hold[1] += g_air_rawIn[1] * g_air_speed * dt;
         } else {
@@ -916,6 +1032,7 @@ static void air_tick(void) {
             g_air_hold[2] += mv3[2] * g_air_speed * dt;
         }
     }
+    if (g_air_mark) air_mark_step(&c, dt, manual);
     if (g_air_mode == 1) air_vset(c.veh, g_air_hold);
     else if (air_call_setpos(c.mv, g_air_hold, "движению")) air_zero_vel(c.mv);
     g_air_last[0] = g_air_hold[0]; g_air_last[1] = g_air_hold[1]; g_air_last[2] = g_air_hold[2];
@@ -972,6 +1089,7 @@ static void air_usage(void) {
     chat_usage("/air — полёт вкл/выкл (и пешком, и за рулём — тогда летит машина). Джойстик — лететь, ПРЫЖОК (держать) — вверх, ПРИСЕД (двойной тап по джойстику, второй тап держать) — вниз;  /air speed N;  /air flat|3d;  /air land — на землю");
     chat_usage("В машине: W/газ — вперёд, S/тормоз — назад, руль (A/D или стик) — вбок, всё относительно камеры. Вверх/вниз: зажмите РУЧНИК (пробел) — тогда газ летит вверх, тормоз вниз; или взгляд камерой в 3d, или /air up|down N");
     chat_usage("Вышли из машины в полёте — она встанет на землю, вы продолжите лететь пешком");
+    chat_usage("/air mark — автолёт к красной метке (маркер сервера или метка карты); появилась/сменилась — летит к новой. /air mark gps|cp — только карта|только маркер, /air mark off — выключить");
     chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
@@ -1002,6 +1120,9 @@ static void air_status(void) {
         b_s(&b, ", высота над точкой включения "); b_fix(&b, g_air_hold[1] - g_air_y0, 1); b_s(&b, " м, перестановок игрой: "); b_int(&b, g_air_jumps);
         chat_say(m);
     }
+    b_init(&b, m, sizeof m); b_s(&b, "  автолёт к метке: "); b_s(&b, g_air_mark == 0 ? "выкл" : g_air_mark == 2 ? "вкл (только метка карты)" : g_air_mark == 3 ? "вкл (только маркер сервера)" : "вкл (любая метка)");
+    if (g_air_mark) { b_s(&b, g_air_mkHave ? (g_air_mkKind == 1 ? ", цель: маркер сервера " : ", цель: метка карты ") : ", цели нет"); if (g_air_mkHave) { air_b_xyz(&b, g_air_mkPos); b_s(&b, g_air_mkArrived ? " (на месте)" : ""); } }
+    chat_say(m);
     b_init(&b, m, sizeof m); b_s(&b, "  ввод ("); b_s(&b, g_air_inSrc ? "MovementDirection" : "m_MovementInput"); b_s(&b, "): ");
     b_fix(&b, g_air_rawIn[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_rawIn[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_rawIn[2], 2);
     b_s(&b, " — подвигайте джойстик: числа должны меняться (/air input — сменить источник)");
@@ -1061,6 +1182,23 @@ static void native_air_cmd(void* self, void* args, void* mi) {
         if (v > AIR_MAXSPEED) v = AIR_MAXSPEED;
         g_air_speed = v;
         b_init(&b, m, sizeof m); b_s(&b, "/air: скорость "); b_fix(&b, v, 1); b_s(&b, " м/с"); chat_say(m);
+        return;
+    }
+    if (seq(tok[0], "mark") || seq(tok[0], "метка") || seq(tok[0], "марк") || seq(tok[0], "gps") || seq(tok[0], "гпс")) {
+        int mode = 1;
+        if (nt >= 2 && (seq(tok[1], "off") || seq(tok[1], "выкл") || seq(tok[1], "0"))) {
+            g_air_mark = 0; g_air_mkHave = 0; g_air_mkArrived = 0; chat_say("/air mark: автолёт к метке выключен (полёт остался)"); return;
+        }
+        if (seq(tok[0], "gps") || seq(tok[0], "гпс") || (nt >= 2 && (seq(tok[1], "gps") || seq(tok[1], "гпс") || seq(tok[1], "map") || seq(tok[1], "карта")))) mode = 2;
+        else if (nt >= 2 && (seq(tok[1], "cp") || seq(tok[1], "маркер") || seq(tok[1], "чекпоинт") || seq(tok[1], "server"))) mode = 3;
+        if (g_air_mark && nt == 1 && !seq(tok[0], "gps") && !seq(tok[0], "гпс")) {   /* голое «/air mark» при включённом — выключает */
+            g_air_mark = 0; g_air_mkHave = 0; g_air_mkArrived = 0; chat_say("/air mark: автолёт к метке выключен (полёт остался)"); return;
+        }
+        if (!g_air_on && !air_enter(AIR_LIFT, NULL)) return;         /* полёт выключен — включаем */
+        g_air_mark = mode; g_air_mkHave = 0; g_air_mkArrived = 0; g_air_mkT = 0;
+        chat_say(mode == 2 ? "/air mark: слежу за меткой карты (/gps). Поставите/смените — полечу к ней. Джойстик — перехват; /air mark off — выключить"
+               : mode == 3 ? "/air mark: слежу за маркером сервера. Появится/сменится — полечу к нему. Джойстик — перехват; /air mark off — выключить"
+               : "/air mark: слежу за красной меткой (маркер сервера, иначе метка карты). Появится/сменится — полечу к ней. Джойстик — перехват; /air mark off — выключить");
         return;
     }
     if (seq(tok[0], "flat") || seq(tok[0], "ровно")) { g_air_look3d = 0; chat_say("/air: режим flat — по джойстику летите горизонтально, высота — /air up|down"); return; }
