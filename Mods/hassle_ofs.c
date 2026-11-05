@@ -211,6 +211,40 @@ static uptr ofs_cbz_target(uptr at, u32 w) {                   /* абсолют
     return at + (uptr)(imm * 4);
 }
 
+/* ───────────── логирование установки/хука: при вылете последняя строка HLOG/konstt.log должна указать на точный шаг ───────────── */
+static void b_hex32(Buf* b, u32 v) {
+    static const char* hx = "0123456789abcdef";
+    int i;
+    b_s(b, "0x");
+    for (i = 28; i >= 0; i -= 4) b_ch(b, hx[(v >> i) & 0xF]);
+}
+static void ofs_dlog_words(const char* tag, const u32* w, int n) {
+    char m[300]; Buf b; int i;
+    b_init(&b, m, sizeof m);
+    b_s(&b, tag);
+    for (i = 0; i < n; i++) { b_ch(&b, ' '); b_hex32(&b, w[i]); }
+    dlog(m);
+}
+static void ofs_dlog_u2(const char* a, long v, const char* b2, long v2) {
+    char m[200]; Buf b; b_init(&b, m, sizeof m);
+    b_s(&b, a); b_int(&b, v); b_s(&b, b2); b_int(&b, v2); dlog(m);
+}
+/* первые 0x48 байт структуры как hex — печатается не на каждый пакет (журнал на диск пишется синхронно, дорого), а только первые несколько раз */
+static void ofs_dlog_struct(const char* tag, const u8* d) {
+    char m[300]; Buf b; int i;
+    b_init(&b, m, sizeof m);
+    b_s(&b, tag);
+    for (i = 0; i < OFS_STRUCT; i++) {
+        static const char* hx = "0123456789abcdef";
+        if (i && (i % 4) == 0) b_ch(&b, ' ');
+        b_ch(&b, hx[(d[i] >> 4) & 0xF]); b_ch(&b, hx[d[i] & 0xF]);
+    }
+    dlog(m);
+}
+/* ожидаемые слова пролога WriteOnFootPacket по дампу/дизассемблированию от 20.10.2026:
+   STR x20,[sp,#-32]! ; STP x19,x30,[sp,#16] ; CBZ x0,… ; MOV x20,x1 — если сборка игры другая, эти 4 слова не совпадут */
+static const u32 OFS_EXPECT_PROLOGUE[4] = { 0xf81e0ff4u, 0xa9017bf3u, 0xb4000b80u, 0xaa0103f4u };
+
 static int g_ofs_state;                                        /* 1 — перехват стоит */
 static char g_ofs_err[160];
 static int ofs_fail(const char* why) {
@@ -255,40 +289,70 @@ static int ofs_write_code(uptr addr, const u32* w, int n) {     /* слова п
 }
 static int ofs_install(void) {
     void *kls, *m; uptr fn; u32 code[8]; int i;
-    if (g_ofs_state == 1) return 1;
+    dlog("ofs: install: начало");
+    if (g_ofs_state == 1) { dlog("ofs: install: уже стоит"); return 1; }
     if (!ofs_layout()) return ofs_fail("раскладка OnFootSyncData не прочиталась");
+    dlog("ofs: install: раскладка ок, ищу Hassle.Network.SyncData");
     kls = A.class_from_name(g_img, "Hassle.Network", "SyncData");
     if (!kls) return ofs_fail("нет класса Hassle.Network.SyncData");
+    dlog("ofs: install: класс найден, ищу метод WriteOnFootPacket(2)");
     m = A.class_get_method_from_name(kls, "WriteOnFootPacket", 2);
     if (!m || !hm_readable(m, sizeof(void*))) return ofs_fail("нет метода SyncData.WriteOnFootPacket");
     fn = *(uptr*)m;
+    ofs_dlog_u2("ofs: install: MethodInfo=", (long)(uptr)m, " адрес функции=", (long)fn);
     if (!fn || (fn & 3) || !hm_range_ok((void*)fn, 64)) return ofs_fail("адрес WriteOnFootPacket нечитаем");
     for (i = 0; i < 8; i++) code[i] = ((const u32*)fn)[i];
-    if (g_ofs_veneer && g_ofs_site == fn) for (i = 0; i < 4; i++) code[i] = g_ofs_orig[i];   /* уже пропатчено нами — исходные из сохранённых */
+    ofs_dlog_words("ofs: install: сырые слова функции (из памяти сейчас):", code, 8);
+    if (g_ofs_veneer && g_ofs_site == fn) {
+        for (i = 0; i < 4; i++) code[i] = g_ofs_orig[i];   /* уже пропатчено нами — исходные из сохранённых */
+        dlog("ofs: install: функция уже была пропатчена нами ранее, беру исходные 4 слова из сохранённых");
+    }
+    ofs_dlog_words("ofs: install: 4 слова, которые будут перенесены в заглушку:", code, 4);
+    if (code[0] != OFS_EXPECT_PROLOGUE[0] || code[1] != OFS_EXPECT_PROLOGUE[1] ||
+        code[2] != OFS_EXPECT_PROLOGUE[2] || code[3] != OFS_EXPECT_PROLOGUE[3]) {
+        ofs_dlog_words("ofs: install: ВНИМАНИЕ, не совпадает с ожидаемым по дампу 20.10.2026:", OFS_EXPECT_PROLOGUE, 4);
+        dlog("ofs: install: это не обязательно ошибка (другая сборка игры может иметь другой пролог), но тогда проверки ниже решают, ставить перехват или нет");
+    }
     if (!ofs_is_cbz(code[2])) return ofs_fail("третья инструкция пролога не CBZ — другая сборка игры?");
     if (ofs_pc_rel(code[0]) || ofs_pc_rel(code[1]) || ofs_pc_rel(code[3])) return ofs_fail("пролог зависит от адреса — перенести нельзя");
+    dlog("ofs: install: проверки пролога пройдены (CBZ на месте, 0/1/3 не зависят от адреса)");
     if (!(g_ofs_veneer && g_ofs_site == fn)) {
         u32 v[OFS_TRAMP_WORDS];
-        void* page = mmap(NULL, 4096, 3, 0x22, -1, 0);
+        uptr cbzTarget = ofs_cbz_target(fn + 8, code[2]);
+        void* page;
+        ofs_dlog_u2("ofs: install: цель CBZ=", (long)cbzTarget, ", resume(fn+16)=", (long)(fn + 16));
+        page = mmap(NULL, 4096, 3, 0x22, -1, 0);
         if (page == (void*)-1 || !page) return ofs_fail("не удалось выделить страницу под заглушку");
-        ofs_make_tramp(v, code, (uptr)ofs_hook, ofs_cbz_target(fn + 8, code[2]), fn + 16);
+        ofs_dlog_u2("ofs: install: страница заглушки выделена по адресу ", (long)(uptr)page, ", размер=", 4096);
+        ofs_make_tramp(v, code, (uptr)ofs_hook, cbzTarget, fn + 16);
+        ofs_dlog_words("ofs: install: заглушка, слова 0-7:", v, 8);
+        ofs_dlog_words("ofs: install: заглушка, слова 8-19:", v + 8, OFS_TRAMP_WORDS - 8);
         for (i = 0; i < OFS_TRAMP_WORDS; i++) ((u32*)page)[i] = v[i];
         ofs_flush(page, sizeof v);
+        dlog("ofs: install: заглушка записана и промыта из кэшей, делаю страницу R-X");
         if (mprotect(page, 4096, 5) != 0) { munmap(page, 4096); return ofs_fail("не удалось сделать страницу заглушки исполняемой"); }
         g_ofs_veneer = page; g_ofs_site = fn;
         for (i = 0; i < 4; i++) g_ofs_orig[i] = code[i];
+        dlog("ofs: install: заглушка готова и исполняема");
+    } else {
+        dlog("ofs: install: заглушка уже стояла, переиспользую");
     }
     {
         u32 e[4];
         ofs_make_entry(e, (uptr)g_ofs_veneer);
+        ofs_dlog_words("ofs: install: вход (4 слова, пишутся в начало функции):", e, 4);
+        dlog("ofs: install: пишу вход в код игры...");
         if (!ofs_write_code(fn, e, 4)) return ofs_fail("запись в код игры запрещена системой");
+        dlog("ofs: install: вход записан успешно");
     }
     g_ofs_state = 1;
+    __atomic_store_n(&g_ofs_hookCalls, 0, __ATOMIC_RELEASE);
     dlog("ofs: перехват SyncData.WriteOnFootPacket установлен");
     return 1;
 }
 static void ofs_unhook(void) {
-    if (g_ofs_state != 1) return;
+    if (g_ofs_state != 1) { dlog("ofs: unhook: перехват и так не стоит"); return; }
+    dlog("ofs: unhook: возвращаю исходные 4 слова...");
     if (ofs_write_code(g_ofs_site, g_ofs_orig, 4)) { g_ofs_state = 0; dlog("ofs: перехват снят, код игры восстановлен"); }
     else dlog("ofs: не удалось вернуть исходные инструкции");
 }
