@@ -28,6 +28,10 @@
  *   (по порядку ID, в пределах зоны стрима ~300 м); на кнопке видно «ТП 2/5». Встаёте у руды на SHX_TP_BACK м в вашу сторону, Transform на SHX_TP_DY ниже точки
  *   объекта (так сервер видит игрока ровно в точке руды). Если оказались в стене — поправьте SHX_TP_BACK или вернитесь «/tpl pos».
  *
+ * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): раз в 0.9 с шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
+ *   для кружков с подписью «Нажимайте Y …» — это этап кирки. Бурение и лопата сервер заполняет сам по таймеру, их нажимать не нужно. Быстрее 0.9 с нельзя:
+ *   сервер (progress_bar.pwn, OnKeyPress) считает нажатие чаще 700 мс ошибкой — шкала откатывается, а после 5 ошибок этап срывается.
+ *
  * Меню (как оно устроено): мод сам внедряет JS в веб-интерфейс игры через WebViewSystem.ExecuteJavaScript (APK пересобирать не нужно).
  *   Нажатия меню уходят как «/shaxta q …» через window.sendChatInput (q — «тихо», без сообщений в чат), актуальное состояние мод
  *   присылает обратно тем же ExecuteJavaScript. Текст меню — между метками SHX_MENU_BEGIN/END; править shaxta_menu.js и запускать
@@ -195,6 +199,8 @@ static const char g_shx_menu_js[] =
 "var rr=el('div',null,'shx-row');rr.appendChild(el('div',null,'shx-n','Радиус'));\n"
 "var rc=el('div',null,'shx-st');var bm=el('div',null,'shx-b','\\u2212');var rv=el('div',null,'shx-v','300 м');var bp=el('div',null,'shx-b','+');\n"
 "rc.appendChild(bm);rc.appendChild(rv);rc.appendChild(bp);rr.appendChild(rc);panel.appendChild(rr);\n"
+"var ar=el('div',null,'shx-row');var al=el('div',null,'shx-l');al.appendChild(el('div',null,'shx-n','Автонажатие кружка'));\n"
+"var asub=el('div',null,'shx-s','выкл');al.appendChild(asub);ar.appendChild(al);var asw=mkSw();ar.appendChild(asw);panel.appendChild(ar);\n"
 "var ft=el('div',null,'shx-f');var hint=el('div',null,'shx-hint','');var rs=el('div',null,'shx-b shx-rs','Сбросить счётчик');\n"
 "ft.appendChild(hint);ft.appendChild(rs);panel.appendChild(ft);\n"
 "document.body.appendChild(fab);document.body.appendChild(panel);\n"
@@ -219,6 +225,11 @@ static const char g_shx_menu_js[] =
 "bm.addEventListener('click',function(){cmd('r '+Math.max(50,S.r-50));});\n"
 "bp.addEventListener('click',function(){cmd('r '+Math.min(1000,S.r+50));});\n"
 "rs.addEventListener('click',function(){cmd('reset');});\n"
+"var auto=false,autoT=null,autoN=0;\n"
+"function autoTick(){try{var L=document.querySelectorAll('.preloader-list');for(var i=0;i<L.length;i++){var t=L[i].querySelector('.preloader-title');\n"
+"if(t&&/Нажимайте/.test(t.textContent||'')){sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,'OnProgressBarClick',i);autoN++;asub.textContent='вкл · нажатий '+autoN;}}}catch(e){}}\n"
+"ar.addEventListener('click',function(){auto=!auto;asw.className='shx-sw'+(auto?' on':'');\n"
+"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';autoT=setInterval(autoTick,900);}else asub.textContent='выкл';});\n"
 "var dx=0,dy=0,sx=0,sy=0,tch=false;\n"
 "fab.addEventListener('touchstart',function(e){var t=e.touches[0];sx=t.clientX;sy=t.clientY;var b=fab.getBoundingClientRect();dx=t.clientX-b.left;dy=t.clientY-b.top;tch=true;dragged=false;});\n"
 "fab.addEventListener('touchmove',function(e){if(!tch)return;var t=e.touches[0];if(Math.abs(t.clientX-sx)+Math.abs(t.clientY-sy)<12&&!dragged)return;dragged=true;\n"
