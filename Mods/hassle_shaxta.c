@@ -23,6 +23,11 @@
  *   /shaxta menu         МЕНЮ на экране (кнопка-ромб + панель): переключатели видов руды, радиус, счётчики. Работает на мобилке
  *   /shaxta status       состояние;  /shaxta help — подсказка
  *
+ * Кнопка «ТП» в меню (золото / серебро / железо / уголь): телепорт к руде через обычный «/tpl to X Y Z» (hassle_tpl.c должен быть в бандле; сам мод от него
+ *   не зависит — меню просто шлёт чат-команду, как если бы вы набрали её руками). Каждое нажатие — следующая руда этого вида из тех, что клиент сейчас видит
+ *   (по порядку ID, в пределах зоны стрима ~300 м); на кнопке видно «ТП 2/5». Встаёте у руды на SHX_TP_BACK м в вашу сторону, Transform на SHX_TP_DY ниже точки
+ *   объекта (так сервер видит игрока ровно в точке руды). Если оказались в стене — поправьте SHX_TP_BACK или вернитесь «/tpl pos».
+ *
  * Меню (как оно устроено): мод сам внедряет JS в веб-интерфейс игры через WebViewSystem.ExecuteJavaScript (APK пересобирать не нужно).
  *   Нажатия меню уходят как «/shaxta q …» через window.sendChatInput (q — «тихо», без сообщений в чат), актуальное состояние мод
  *   присылает обратно тем же ExecuteJavaScript. Текст меню — между метками SHX_MENU_BEGIN/END; править shaxta_menu.js и запускать
@@ -71,6 +76,14 @@ typedef struct { float p[3]; int tid, seen; } ShxPos;
 
 static ShxC g_shx_c[SHX_MAXL]; static int g_shx_nc; static float g_shx_ref[3];
 static ShxSlot g_shx_slot[SHX_MAXL];
+/* точки для кнопки «ТП»: все видимые клиенту руды видов 0…3 (золото, серебро, железо, уголь), порядок по ID объекта — стабильный (по расстоянию он
+   менялся бы после каждого прыжка, и кнопка ходила бы туда-сюда). Радиус и скрытые в меню виды не учитываются. */
+#define SHX_TPK 12                       /* точек на вид */
+#define SHX_TP_DY 1.0f                   /* Transform игрока на столько НИЖЕ точки объекта (сервер видит игрока на Transform.y + 1, как у /tpl pick) */
+#define SHX_TP_BACK 0.8f                 /* встать на столько метров от руды в сторону, где вы стоите (руда может быть в стене); 0 — прямо в точку */
+#define SHX_TP_NEAR 8.0f                 /* сдвиг в вашу сторону — только если вы ближе (по горизонтали); дальше направление «к вам» может вести сквозь скалу */
+typedef struct { int id; float p[3]; } ShxTp;
+static ShxTp g_shx_tp[4][SHX_TPK]; static int g_shx_ntp[4];
 static int g_shx_present[SHX_RANGE];
 static int g_shx_total[SHX_NT];          /* сколько объектов каждого вида в пуле при последнем скане (весь стрим, не только радиус) */
 static int g_shx_inrad[SHX_NT];          /* то же в радиусе */
@@ -83,7 +96,7 @@ static float g_shx_radius = 300.0f;
 static int g_shx_show = 31;              /* маска видов, которые рисуем: бит i = g_shx_types[i] (счётчик считает все виды всегда) */
 static int g_shx_q;                      /* 1 — команда пришла из меню («/shaxta q …»): в чат не пишем */
 static int g_shx_uiOk, g_shx_uiTick;     /* JS меню внедрён / счётчик тиков для периодического повторного внедрения */
-static char g_shx_lastJs[400];           /* последнее отправленное в меню состояние — одинаковое повторно не шлём */
+static char g_shx_lastJs[2000];           /* последнее отправленное в меню состояние — одинаковое повторно не шлём */
 static int g_shx_layoutOk, g_shx_oID, g_shx_oCol, g_shx_oPos, g_shx_oDist, g_shx_oLos, g_shx_oPl, g_shx_oVeh, g_shx_oTxt, g_shx_ssize;
 
 static long long shx_now_ms(void) { long ts[2]; ts[0] = 0; ts[1] = 0; clock_gettime(1, ts); return (long long)ts[0] * 1000LL + ts[1] / 1000000LL; }
@@ -129,9 +142,10 @@ static const char g_shx_menu_js[] =
 "{k:'iron',n:'Железо',c:'#FF8030'},\n"
 "{k:'coal',n:'Уголь',c:'#9A9A9A'},\n"
 "{k:'ground',n:'Руда на земле',c:'#66FF66'}];\n"
-"var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0};\n"
+"var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0,t:[[],[],[],[]]},ix=[0,0,0,0];\n"
 "var open=false,dragged=false,syncT=null;\n"
 "function cmd(x){try{window.sendChatInput('/shaxta q '+x);}catch(e){}}\n"
+"function go(i){var a=S.t[i];if(!a||!a.length)return;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}}\n"
 "function el(tag,id,cls,txt){var e=document.createElement(tag);if(id)e.id=id;if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e;}\n"
 "var css='#shx-fab{position:fixed;right:1.4vh;top:34vh;width:6.6vh;height:6.6vh;border-radius:50%;background:rgba(12,10,6,.82);border:0.35vh solid #ffb110;z-index:999990;pointer-events:auto;display:flex;align-items:center;justify-content:center}'\n"
 "+'#shx-fab.on{background:rgba(255,177,16,.9)}'\n"
@@ -156,6 +170,9 @@ static const char g_shx_menu_js[] =
 "+'.shx-v{min-width:11vh;text-align:center;font-size:2.7vh;font-weight:700}'\n"
 "+'.shx-f{display:flex;align-items:center;justify-content:space-between;border-top:0.2vh solid rgba(255,255,255,.1);padding-top:1vh;height:7vh;box-sizing:border-box}'\n"
 "+'.shx-hint{font-size:1.7vh;color:rgba(238,238,230,.55);flex:1;margin-right:1.2vh}'\n"
+"+'.shx-ctl{display:flex;align-items:center}'\n"
+"+'.shx-tp{min-width:6.4vh;height:4.6vh;margin-right:1.2vh;border-radius:1.2vh;background:rgba(255,177,16,.22);border:0.2vh solid #ffb110;color:#ffb110;display:flex;align-items:center;justify-content:center;font-size:2.1vh;font-weight:700;padding:0 1vh;box-sizing:border-box}'\n"
+"+'.shx-tp.dis{opacity:.3}'\n"
 "+'.shx-rs{background:rgba(226,85,68,.22);color:#ffb3a8;font-size:2.1vh;font-weight:700}';\n"
 "var st=el('style');st.textContent=css;document.head.appendChild(st);\n"
 "var fab=el('div','shx-fab','');\n"
@@ -163,16 +180,18 @@ static const char g_shx_menu_js[] =
 "var panel=el('div','shx-panel','');\n"
 "var hd=el('div',null,'shx-h');hd.appendChild(el('div',null,'shx-t','Шахта: руды (тест)'));\n"
 "var xb=el('div',null,'shx-x','\\u00d7');hd.appendChild(xb);panel.appendChild(hd);\n"
-"panel.appendChild(el('div',null,'shx-sub','Тестовый инструмент: только для настройки шахты на тестовых NPC'));\n"
+"panel.appendChild(el('div',null,'shx-sub','Тест шахты. «ТП» — телепорт к руде (через /tpl to), каждое нажатие — следующая'));\n"
 "function mkSw(){var s=el('div',null,'shx-sw');s.appendChild(el('i'));return s;}\n"
 "var mrow=el('div',null,'shx-row');var ml=el('div',null,'shx-l');ml.appendChild(el('div',null,'shx-n','Подписи в мире'));\n"
 "var msub=el('div',null,'shx-s','');ml.appendChild(msub);mrow.appendChild(ml);var msw=mkSw();mrow.appendChild(msw);panel.appendChild(mrow);\n"
 "var rows=[];\n"
 "for(var i=0;i<T.length;i++){(function(i){\n"
 "var r=el('div',null,'shx-row');var l=el('div',null,'shx-l');var n=el('div',null,'shx-n',T[i].n);n.style.color=T[i].c;\n"
-"var s=el('div',null,'shx-s','');l.appendChild(n);l.appendChild(s);r.appendChild(l);var sw=mkSw();r.appendChild(sw);\n"
+"var s=el('div',null,'shx-s','');l.appendChild(n);l.appendChild(s);r.appendChild(l);var sw=mkSw();var ctl=el('div',null,'shx-ctl');var tp=null;\n"
+"if(i<4){tp=el('div',null,'shx-tp','ТП');tp.addEventListener('click',function(e){e.stopPropagation();go(i);});ctl.appendChild(tp);}\n"
+"ctl.appendChild(sw);r.appendChild(ctl);\n"
 "r.addEventListener('click',function(){cmd(T[i].k);});\n"
-"panel.appendChild(r);rows.push({r:r,s:s,sw:sw});})(i);}\n"
+"panel.appendChild(r);rows.push({r:r,s:s,sw:sw,tp:tp});})(i);}\n"
 "var rr=el('div',null,'shx-row');rr.appendChild(el('div',null,'shx-n','Радиус'));\n"
 "var rc=el('div',null,'shx-st');var bm=el('div',null,'shx-b','\\u2212');var rv=el('div',null,'shx-v','300 м');var bp=el('div',null,'shx-b','+');\n"
 "rc.appendChild(bm);rc.appendChild(rv);rc.appendChild(bp);rr.appendChild(rc);panel.appendChild(rr);\n"
@@ -186,6 +205,7 @@ static const char g_shx_menu_js[] =
 "msw.className='shx-sw'+(S.o?' on':'');\n"
 "msub.textContent=S.o?'включены':'выключены';\n"
 "for(i=0;i<5;i++){var on=((S.m>>i)&1)===1;rows[i].r.className='shx-row'+(on?'':' off');rows[i].sw.className='shx-sw'+(on?' on':'');\n"
+"if(rows[i].tp){var nt=S.t[i]?S.t[i].length:0;rows[i].tp.className='shx-tp'+(nt?'':' dis');rows[i].tp.textContent=nt?'ТП '+(ix[i]%nt+1)+'/'+nt:'ТП';}\n"
 "rows[i].s.textContent='сейчас '+S.c[i]+' \\u00b7 появлений '+S.s[i]+(sp>0?' ('+pct(S.s[i],sp)+'%)':'');}\n"
 "rv.textContent=S.r+' м';\n"
 "hint.textContent=S.p?(tot>0?'дальше ~300 м сервер руду не отдаёт':'руды рядом нет: зайдите в шахту'):'данные не прочитались (вы не в игре?)';\n"
@@ -226,7 +246,7 @@ static void shx_ui_inject(void) {                                   /* идем�
     if (shx_js_run(g_shx_menu_js)) { g_shx_uiOk = 1; g_shx_lastJs[0] = 0; }
 }
 static void shx_ui_push(int force) {                                /* состояние -> меню: window.__shx.u({...}) */
-    char js[400]; Buf b; int i, k;
+    char js[2000]; Buf b; int i, k, n;
     if (!g_shx_uiOk) return;
     b_init(&b, js, sizeof js);
     b_s(&b, "window.__shx&&window.__shx.u({o:"); b_int(&b, g_shx_on ? 1 : 0);
@@ -237,6 +257,20 @@ static void shx_ui_push(int force) {                                /* сост�
     for (i = 0; i < SHX_NT; i++) { if (i) b_ch(&b, ','); b_int(&b, g_shx_total[i]); }
     b_s(&b, "],s:[");
     for (i = 0; i < SHX_NT; i++) { if (i) b_ch(&b, ','); b_int(&b, g_shx_spawn[i]); }
+    b_s(&b, "],t:[");
+    for (i = 0; i < 4; i++) {                                       /* куда ставить игрока: точка руды, Transform на SHX_TP_DY ниже, чуть в вашу сторону */
+        if (i) b_ch(&b, ',');
+        b_ch(&b, '[');
+        for (n = 0; n < g_shx_ntp[i]; n++) {
+            float q[3], dx, dz, hd; const float* p = g_shx_tp[i][n].p;
+            q[0] = p[0]; q[1] = p[1] - SHX_TP_DY; q[2] = p[2];
+            dx = g_shx_ref[0] - p[0]; dz = g_shx_ref[2] - p[2]; hd = (float)__builtin_sqrt((double)(dx * dx + dz * dz));
+            if (hd > 0.05f && hd < SHX_TP_NEAR) { q[0] += dx / hd * SHX_TP_BACK; q[2] += dz / hd * SHX_TP_BACK; }
+            if (n) b_ch(&b, ',');
+            b_ch(&b, '['); b_fix(&b, q[0], 1); b_ch(&b, ','); b_fix(&b, q[1], 1); b_ch(&b, ','); b_fix(&b, q[2], 1); b_ch(&b, ']');
+        }
+        b_ch(&b, ']');
+    }
     b_s(&b, "]})");
     if (!force && seq(js, g_shx_lastJs)) return;
     for (k = 0; js[k] && k < (int)sizeof g_shx_lastJs - 1; k++) g_shx_lastJs[k] = js[k];
@@ -328,6 +362,14 @@ static void shx_add(int tid, int id, const float* p, int model) {
     g_shx_c[i].p[0] = p[0]; g_shx_c[i].p[1] = p[1]; g_shx_c[i].p[2] = p[2];
     if (g_shx_nc < SHX_MAXL) g_shx_nc++;
 }
+static void shx_tp_add(int tid, int id, const float* p) {         /* вставка с сортировкой по ID, не больше SHX_TPK */
+    int i, j, n = g_shx_ntp[tid];
+    for (i = 0; i < n && g_shx_tp[tid][i].id <= id; i++) {}
+    if (i >= SHX_TPK) return;
+    for (j = (n < SHX_TPK ? n : SHX_TPK - 1); j > i; j--) g_shx_tp[tid][j] = g_shx_tp[tid][j - 1];
+    g_shx_tp[tid][i].id = id; g_shx_tp[tid][i].p[0] = p[0]; g_shx_tp[tid][i].p[1] = p[1]; g_shx_tp[tid][i].p[2] = p[2];
+    if (n < SHX_TPK) g_shx_ntp[tid] = n + 1;
+}
 static void shx_obj_cb(void* it, void* ctx) {
     float p[3]; int model, tid; (void)ctx;
     if (!hm_obj_ok(it)) return;
@@ -337,12 +379,14 @@ static void shx_obj_cb(void* it, void* ctx) {
     if (!shx_vec(it, "get_Position", p)) return;
     g_shx_total[tid]++;
     shx_track(tid, p);
+    if (tid < 4) shx_tp_add(tid, (int)num_field(it, "ID", NULL), p);
     if (shx_dist(p, g_shx_ref) <= g_shx_radius) shx_add(tid, (int)num_field(it, "ID", NULL), p, model);
 }
 static void shx_collect(void) {                                     /* заполняет g_shx_c ближайшими рудами к g_shx_ref */
     int i;
     g_shx_nc = 0;
     for (i = 0; i < SHX_NT; i++) { g_shx_total[i] = 0; g_shx_inrad[i] = 0; }
+    for (i = 0; i < 4; i++) g_shx_ntp[i] = 0;
     for (i = 0; i < g_shx_np; i++) g_shx_pos[i].seen = 0;
     g_shx_poolN = shx_scan_pool("Objects", shx_obj_cb);
     if (g_shx_poolN < 0) return;
