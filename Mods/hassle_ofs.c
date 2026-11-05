@@ -390,6 +390,14 @@ static int ofs_find_car(float* dist) {
 /* ───────────── разбор ввода ───────────── */
 #define OFS_MAXTOK 12
 typedef struct { char t[OFS_MAXTOK][24]; int n; } OfsTok;
+/* Игра может положить в массив и само имя команды («ofs», «/ofs», «/ofs:»…) — выкидываем все ведущие слова, которые начинаются с «/» или равны «ofs»/«invis» */
+static void ofs_strip_cmd(OfsTok* tk) {
+    while (tk->n > 0 && (tk->t[0][0] == '/' || seq(tk->t[0], "ofs") || seq(tk->t[0], "invis"))) {
+        int k, j;
+        for (k = 1; k < tk->n; k++) for (j = 0; j < 24; j++) tk->t[k - 1][j] = tk->t[k][j];
+        tk->n--;
+    }
+}
 static void ofs_tokens(void* arr, OfsTok* tk) {                    /* все слова всех элементов string[], нижний регистр */
     long len; int i; char* data;
     tk->n = 0;
@@ -408,12 +416,12 @@ static void ofs_tokens(void* arr, OfsTok* tk) {                    /* все с�
             int q = 0;
             while (tmp[p] == ' ') p++;
             if (!tmp[p]) break;
-            if (tk->n >= OFS_MAXTOK) return;
+            if (tk->n >= OFS_MAXTOK) { ofs_strip_cmd(tk); return; }
             while (tmp[p] && tmp[p] != ' ') { if (q < 23) { char c = tmp[p]; tk->t[tk->n][q++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; } p++; }
             tk->t[tk->n][q] = 0; tk->n++;
         }
     }
-    if (tk->n > 0 && seq(tk->t[0], "ofs")) { int k; for (k = 1; k < tk->n; k++) { int j; for (j = 0; j < 24; j++) tk->t[k - 1][j] = tk->t[k][j]; } tk->n--; }   /* имя команды в массиве — отбрасываем */
+    ofs_strip_cmd(tk);
 }
 static int ofs_num(const char* s, float* out) {                    /* «-12», «0.45», «0,45» */
     float v = 0.0f, f = 0.1f; int neg = 0, dot = 0, digits = 0, k = 0;
@@ -584,7 +592,8 @@ static void native_ofs_cmd(void* self, void* args, void* mi) {
         chat_usage("Используйте: /ofs inv [on|off] | radius <м> | hp rand|<0-255>|off | anim <id>|off");
         return;
     }
-    chat_usage("Используйте: /ofs on|off|status|anim|inv|set|unset|fields|unhook   и   /invis");
+    { Buf b; char m[200]; b_init(&b, m, sizeof m); b_s(&b, "Используйте: /ofs on|off|status|anim|inv|set|unset|fields|unhook   и   /invis (получено слов: ");
+      b_int(&b, tk.n); b_s(&b, ", первое: «"); b_s(&b, tk.t[0]); b_s(&b, "»)"); chat_usage(m); }
 }
 static void native_inv_cmd(void* self, void* args, void* mi) {
     (void)self; (void)mi;
