@@ -22,6 +22,7 @@
  *   /air mark [gps|cp|off]  автолёт к красной метке: к маркеру сервера (чекпоинт) или, если его нет, к метке GPS с карты (/gps). Метка сменилась или появилась
  *                         новая — сам летит к ней, на месте ждёт следующую. gps — только метка карты, cp — только маркер сервера, off — выключить. Если полёт был
  *                         выключен — включится сам. Пока вы жмёте джойстик/кнопки — автолёт на паузе (перехват), отпустили — продолжит. Скорость — /air speed
+ *   /air exam chat [on|off]  перехват чата: стоять по словам инструктора «Здесь аккуратней» (мгновенно), ехать после «Отлично…» (см. блок про автошколу ниже)
  *   /air exam [on|off|auto]  автошкола: на экзамене по вождению /air mark cp ведёт машину как по правилам — курс по дороге, остановка у знаков STOP (подробно — в блоке
  *                         «автошкола: экзамен по вождению» ниже). auto (по умолчанию) — включается само на старте экзамена; /air exam speed N — скорость экзамена, м/с
  *   /air status           состояние и сырые значения ввода;  /air help — подсказка
@@ -777,6 +778,9 @@ static void air_cmd_npc_list(void) {
  *   – скорость своя: /air exam speed N (по умолчанию 14 м/с ≈ 50 км/ч, потолок 30);
  *   – знак впереди и курс подходит (±60°): с 30 м плавно тормозим, в 5 м от центра знака (внутри сферы 7 м) останавливаемся и стоим 2.2 с (4 проверки сервера), едем дальше;
  *   – машина пропала (экзамен закончился) — режим сам выключается.
+ * Остановки по чату (/air exam chat on): сервер сам сообщает, что знак засчитан в работу («[Инструктор]: Здесь аккуратней…» — машина вошла в сферу с подходящим курсом),
+ *   мод по этой строке ставит машину на месте мгновенно (скорость 0) и стоит до «[Инструктор]: Отлично, вы не пропустили дорожный знак…» (но не дольше 5 с). Таблица знаков
+ *   при этом остаётся запасным путём: она плавно сбавляет скорость к знаку. Приветствие инструктора включает режим экзамена само (если летите на машине).
  * Чего режим НЕ делает: не пристёгивает ремень (пристегните сами ДО второй точки — иначе предупреждение) и не смотрит на светофоры (красный/жёлтый на выезде из зоны —
  *   предупреждение; на маршруте №1 один такой перекрёсток есть, на №2 и №3 — несколько). Данные знаков и точка старта — из серверного autoschool.inc.
  * Координаты: SAMP (x, y, z) → Unity (x, z, y); курс — единичный вектор (x, z) в Unity, (sin ψ, cos ψ), ψ = −(угол SAMP).
@@ -814,6 +818,184 @@ static unsigned g_air_exDone;                     /* биты знаков, у �
 static int g_air_exSign = -1;                     /* у какого знака стоим сейчас (-1 — ни у какого) */
 static long long g_air_exUntil, g_air_exLost;
 static int g_air_exStops;                         /* сколько остановок у знаков сделано (для /air status) */
+
+/* ───────────── чат инструктора: перехват WebViewSystem.AddChatMessage (только arm64) ─────────────
+ * Зачем: сервер сам говорит, когда знак STOP «взят»: при входе в сферу с подходящим курсом он пишет «[Инструктор]: Здесь аккуратней, сосредоточьтесь.»,
+ * а когда увидел остановку — «[Инструктор]: Отлично, вы не пропустили дорожный знак, можете ехать дальше.». Мод ловит эти строки и ставит машину на месте
+ * мгновенно (машина kinematic — тормозного пути нет), а по «Отлично» едет дальше. Координаты, углы и маршруты знать не нужно: поменяли знаки на сервере —
+ * мод ничего не заметит. Приветствие «Приветствую на практической части…» включает режим экзамена само.
+ * Откуда строки: серверный SendClientMessage → Hassle.Network.RPCs.OnClientMessage читает цвет и строку и сразу зовёт WebViewSystem.AddChatMessage(message, color)
+ * (проверено по libil2cpp.so: в функции нет ничего, кроме ReadInt32, ReadString, int.ToString и этого вызова), поэтому строка приходит целиком, с «{FFFFFF}» внутри.
+ * Как перехвачено: у AddChatMessage первые 16 байт заменяются прыжком в заглушку (как AudioStream.PutData в hassle_voice.c): заглушка
+ * сохраняет x0–x7, зовёт airc_hook(message, color), восстанавливает и выполняет затёртые инструкции. Отличие от voice: 4-я инструкция AddChatMessage — ADRP x22
+ * (зависит от адреса), поэтому заглушка кладёт в x22 готовую константу — адрес страницы, посчитанный здесь же (проверено на байтах настоящего libil2cpp.so).
+ * По умолчанию ВЫКЛЮЧЕНО (код правит игру в памяти и на устройстве не проверялся): /air exam chat on — поставить, /air exam chat off — снять. Без хука режим экзамена
+ * работает по таблице знаков (см. выше). Перехват ставится из команды (главный поток, игра уже загружена).
+ */
+#define AIRC_TRAMP_WORDS 24
+#define AIRC_HOLD_MAX_MS 5000                     /* «Здесь аккуратней» без «Отлично» дольше этого — едем дальше сами (на случай, если сервер знак не засчитал) */
+#if defined(__aarch64__) || defined(AIRC_TEST_HOOK)
+#define AIRC_HOOK 1
+extern void* mmap(void*, unsigned long, int, int, int, long);
+extern int munmap(void*, unsigned long);
+extern int mprotect(void*, unsigned long, int);
+extern long pwrite(int, const void*, unsigned long, long);
+#endif
+static volatile int g_airc_state;                 /* 0 — не ставили, 1 — стоит, -1 — не вышло */
+static volatile int g_airc_seen;                  /* сколько строк инструктора увидели */
+static volatile long long g_airc_stopT, g_airc_okT, g_airc_startT;   /* когда пришли «Здесь аккуратней» / «Отлично…» / приветствие (монотонные мс; 0 — ещё не было) */
+static long long g_airc_startSeen;                /* приветствие, на которое мод уже ответил */
+static char g_airc_why[120];
+static int airc_fail(const char* why) {
+    unsigned i = 0;
+    for (; why[i] && i < sizeof g_airc_why - 1; i++) g_airc_why[i] = why[i];
+    g_airc_why[i] = 0;
+    g_airc_state = -1;
+    dlog2("air: exam: перехват чата не установлен: ", why);
+    return 0;
+}
+static int airc_has(const char* h, const char* n) {                 /* n входит в h? */
+    int i, k;
+    for (i = 0; h[i]; i++) { for (k = 0; n[k] && h[i + k] == n[k]; k++) {} if (!n[k]) return 1; }
+    return 0;
+}
+/* Разбор строки чата (UTF-8). Отдельно от хука — чтобы проверять без игры. Реагирует только на строки с «[Инструктор]» (чужая реплика игрока не остановит машину).
+   В хуке — только запись меток времени: ни журнала, ни выделения памяти, ни вызовов игры. */
+static void airc_handle_text(const char* t, long long nowMs) {
+    if (!airc_has(t, "[Инструктор]")) return;
+    __atomic_fetch_add(&g_airc_seen, 1, __ATOMIC_RELAXED);
+    if (airc_has(t, "Здесь аккуратней")) __atomic_store_n(&g_airc_stopT, nowMs, __ATOMIC_RELEASE);
+    else if (airc_has(t, "не пропустили дорожный знак") || airc_has(t, "проехали мимо дорожного знака")) __atomic_store_n(&g_airc_okT, nowMs, __ATOMIC_RELEASE);
+    else if (airc_has(t, "Приветствую на практической части")) __atomic_store_n(&g_airc_startT, nowMs, __ATOMIC_RELEASE);
+}
+/* Зовётся из заглушки в начале AddChatMessage — до того как игра обработает строку. Без выделения памяти и вызовов IL2CPP, кроме чтения строки */
+__attribute__((noinline, used))
+static void airc_hook(void* msg, void* color) {
+    char t[220]; int n;
+    (void)color;
+    if (!msg || !A.string_length || !A.string_chars) return;
+    n = A.string_length(msg);
+    if (n < 10 || n > 800) return;
+    if (n > 200) n = 200;
+    utf16_to_utf8(A.string_chars(msg), n, t, sizeof t);
+    airc_handle_text(t, air_now_ns() / 1000000);
+}
+/* Инструкция зависит от своего адреса? (то же, что vc_pc_rel в hassle_voice.c) */
+static int airc_pc_rel(u32 w) {
+    if ((w & 0x1F000000u) == 0x10000000u) return 1;              /* ADR, ADRP */
+    if ((w & 0x3B000000u) == 0x18000000u) return 1;              /* LDR / LDRSW / PRFM (literal) */
+    if ((w & 0x7C000000u) == 0x14000000u) return 1;              /* B, BL */
+    if ((w & 0xFF000010u) == 0x54000000u) return 1;              /* B.cond */
+    if ((w & 0x7E000000u) == 0x34000000u) return 1;              /* CBZ, CBNZ */
+    if ((w & 0x7E000000u) == 0x36000000u) return 1;              /* TBZ, TBNZ */
+    return 0;
+}
+static int airc_is_adrp(u32 w) { return (w & 0x9F000000u) == 0x90000000u; }
+/* Что кладёт ADRP по адресу pc: адрес страницы (pc без 12 младших бит + imm21 × 4096) */
+static uptr airc_adrp_page(u32 w, uptr pc) {
+    long imm = (long)((((w >> 5) & 0x7FFFFu) << 2) | ((w >> 29) & 3u));
+    if (imm & 0x100000L) imm -= 0x200000L;
+    return (pc & ~(uptr)4095) + (uptr)(imm * 4096L);
+}
+/* Заглушка (arm64), 24 слова. 0–11: сохранить x0–x7, x30, позвать hook, восстановить (как в hassle_voice.c); 12–14: три затёртые инструкции как есть;
+   15: четвёртая — как есть, а если это ADRP Xd — «ldr Xd, =страница» (слова 22–23); 16–17: «ldr x16, =fn+16; br x16» (слова 20–21); 18–19: адрес hook.
+   fn — адрес начала функции (нужен для ADRP). Возвращает 0, если затёртые инструкции перенести нельзя. */
+static int airc_make_tramp(u32* t, const u32* orig4, uptr fn, uptr hook) {
+    int i; uptr resume = fn + 16, page;
+    for (i = 0; i < AIRC_TRAMP_WORDS; i++) t[i] = 0;
+    t[0] = 0xA9BB07E0u; t[1] = 0xA9010FE2u; t[2] = 0xA90217E4u; t[3] = 0xA9031FE6u;
+    t[4] = 0xF90023FEu; t[5] = 0x580001B0u; t[6] = 0xD63F0200u;
+    t[7] = 0xF94023FEu; t[8] = 0xA9431FE6u; t[9] = 0xA94217E4u; t[10] = 0xA9410FE2u; t[11] = 0xA8C507E0u;
+    for (i = 0; i < 3; i++) { if (airc_pc_rel(orig4[i])) return 0; t[12 + i] = orig4[i]; }
+    if (airc_is_adrp(orig4[3])) {
+        page = airc_adrp_page(orig4[3], fn + 12);
+        t[15] = 0x58000000u | (7u << 5) | (orig4[3] & 31u);                 /* ldr Xd, [pc, +28] → слово 22 */
+        t[22] = (u32)(page & 0xFFFFFFFFu); t[23] = (u32)(((unsigned long long)page) >> 32);
+    } else {
+        if (airc_pc_rel(orig4[3])) return 0;
+        t[15] = orig4[3];
+    }
+    t[16] = 0x58000090u; t[17] = 0xD61F0200u;
+    t[18] = (u32)(hook & 0xFFFFFFFFu);   t[19] = (u32)(((unsigned long long)hook) >> 32);
+    t[20] = (u32)(resume & 0xFFFFFFFFu); t[21] = (u32)(((unsigned long long)resume) >> 32);
+    return 1;
+}
+static void airc_make_entry(u32* e, uptr tramp) {                   /* ldr x16,[pc,#8]; br x16; .quad адрес заглушки */
+    e[0] = 0x58000050u; e[1] = 0xD61F0200u;
+    e[2] = (u32)(tramp & 0xFFFFFFFFu); e[3] = (u32)(((unsigned long long)tramp) >> 32);
+}
+#ifdef AIRC_HOOK
+static void* g_airc_veneer; static uptr g_airc_site; static u32 g_airc_orig[4];
+static void airc_flush_cache(void* p, unsigned n) {
+#if defined(__aarch64__)
+    uptr ctr, dl, il, a, e;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    dl = 4u << ((ctr >> 16) & 15u); il = 4u << (ctr & 15u);
+    e = (uptr)p + n;
+    for (a = (uptr)p & ~(dl - 1); a < e; a += dl) __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (a = (uptr)p & ~(il - 1); a < e; a += il) __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+#else
+    (void)p; (void)n;
+#endif
+}
+static int airc_write_code(uptr addr, const u32* w, int n) {         /* слова пишутся с конца к началу; запасной путь — /proc/self/mem */
+    uptr p0 = addr & ~(uptr)4095, p1 = (addr + (uptr)n * 4 - 1) & ~(uptr)4095;
+    unsigned long len = (unsigned long)(p1 - p0) + 4096;
+    int i;
+    if (mprotect((void*)p0, len, 7) == 0) {
+        for (i = n - 1; i >= 0; i--) ((volatile u32*)addr)[i] = w[i];
+        airc_flush_cache((void*)addr, (unsigned)n * 4);
+        mprotect((void*)p0, len, 5);
+        return 1;
+    }
+    {
+        int fd = open("/proc/self/mem", 2); long r = -1;
+        if (fd >= 0) { r = pwrite(fd, w, (unsigned long)n * 4, (long)addr); close(fd); }
+        if (r == (long)n * 4) { airc_flush_cache((void*)addr, (unsigned)n * 4); return 1; }
+    }
+    return 0;
+}
+static int airc_install(void) {
+    void *kls, *m; uptr fn; u32 code[16], v[AIRC_TRAMP_WORDS], e[4]; int i;
+    if (g_airc_state == 1) return 1;
+    if (!g_safe || !il2cpp_light() || !g_img) return airc_fail("игра ещё не готова");
+    kls = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
+    m = kls ? A.class_get_method_from_name(kls, "AddChatMessage", 2) : NULL;
+    if (!m) return airc_fail("нет WebViewSystem.AddChatMessage(string, string)");
+    fn = *(uptr*)m;
+    if (!fn || (fn & 3) || !hm_range_ok((void*)fn, sizeof code)) return airc_fail("адрес AddChatMessage нечитаем");
+    for (i = 0; i < 16; i++) code[i] = ((const u32*)fn)[i];
+    if (g_airc_veneer && g_airc_site == fn) for (i = 0; i < 4; i++) code[i] = g_airc_orig[i];     /* уже патчили (снятие не удалось) — берём сохранённые исходные слова */
+    if (!airc_make_tramp(v, code, fn, (uptr)airc_hook)) return airc_fail("начало AddChatMessage зависит от адреса — перенести нельзя (другая сборка игры?)");
+    if (!(g_airc_veneer && g_airc_site == fn)) {
+        void* page = mmap(NULL, 4096, 3, 0x22, -1, 0);                 /* R|W, MAP_PRIVATE|MAP_ANONYMOUS */
+        if (page == (void*)-1 || !page) return airc_fail("не удалось выделить страницу под заглушку");
+        for (i = 0; i < AIRC_TRAMP_WORDS; i++) ((u32*)page)[i] = v[i];
+        airc_flush_cache(page, sizeof v);
+        if (mprotect(page, 4096, 5) != 0) { munmap(page, 4096); return airc_fail("не удалось сделать страницу заглушки исполняемой"); }
+        g_airc_veneer = page; g_airc_site = fn;
+        for (i = 0; i < 4; i++) g_airc_orig[i] = code[i];
+    }
+    airc_make_entry(e, (uptr)g_airc_veneer);
+    if (!airc_write_code(fn, e, 4)) return airc_fail("запись в код игры запрещена системой");
+    g_airc_state = 1;
+    dlog("air: exam: перехват AddChatMessage установлен");
+    return 1;
+}
+static void airc_unhook(void) {
+    if (g_airc_state != 1) return;
+    if (airc_write_code(g_airc_site, g_airc_orig, 4)) { g_airc_state = 0; dlog("air: exam: перехват AddChatMessage снят, код игры восстановлен"); }
+    else dlog("air: exam: не удалось вернуть исходные инструкции AddChatMessage");
+}
+#else
+static int airc_install(void) { return airc_fail("поддерживается только arm64"); }
+static void airc_unhook(void) {}
+#endif
+static int g_air_chHold;                          /* сейчас стоим по команде инструктора (чтобы писать в чат только смену состояния) */
+static int g_air_chStops;                         /* сколько раз встали по «Здесь аккуратней» (для /air status) */
+
 
 static int air_set_q(void* obj, const char* setter, const float* q) {   /* сеттер с одним Quaternion (4 float) */
     void *m, *exc = NULL, *args[1]; float v[4];
@@ -860,18 +1042,22 @@ static float air_ex_turn(float tx, float tz, float dt) {
     return g_air_hx * tx + g_air_hz * tz;
 }
 static void air_ex_start(const char* why, long long nowMs) {
-    g_air_exOn = 1; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1; g_air_exStops = 0; g_air_exLost = nowMs;
+    g_air_exOn = 1; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1; g_air_exStops = 0; g_air_exLost = nowMs; g_air_chHold = 0;
     { char m[220]; Buf b; b_init(&b, m, sizeof m); b_s(&b, "/air exam: "); b_s(&b, why); b_s(&b, " — курс по дороге, остановки у знаков STOP. Ремень — пристегните сами, светофоры мод не смотрит. /air exam off — выключить"); chat_say(m); }
     dlog2("air: exam: включён: ", why);
 }
 static void air_ex_end(const char* why) {                           /* why == NULL — молча (выход из полёта) */
     if (g_air_exOn && why) { char m[160]; Buf b; b_init(&b, m, sizeof m); b_s(&b, "/air exam: "); b_s(&b, why); chat_say(m); }
     if (g_air_exOn) dlog2("air: exam: выключен: ", why ? why : "выход из полёта");
-    g_air_exOn = 0; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1;
+    g_air_exOn = 0; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1; g_air_chHold = 0;
 }
 /* вызывается при каждом чтении цели автолёта (раз в 150 мс): включает/выключает режим экзамена. kind: 1 — маркер сервера (np — его позиция), иначе — нет маркера сервера */
 static void air_ex_watch(int kind, const float* np, long long nowMs) {
     if (g_air_exMode == 2) return;
+    if (g_airc_state == 1) {                                        /* перехват чата: инструктор поздоровался — экзамен начался */
+        long long gT = __atomic_load_n(&g_airc_startT, __ATOMIC_ACQUIRE);
+        if (gT != g_airc_startSeen) { g_airc_startSeen = gT; if (!g_air_exOn && g_air_mode == 1) air_ex_start("инструктор начал экзамен (по чату)", nowMs); }
+    }
     if (kind == 1) {
         g_air_exLost = nowMs;
         if (!g_air_exOn && g_air_mode == 1) {
@@ -897,6 +1083,32 @@ static int air_ex_drive(void* veh, const float* hold, const float* d, long long 
         if (hl <= 0.5f) { tx = g_air_hx; tz = g_air_hz; }
     }
     ac = air_ex_turn(tx, tz, dt);
+    if (g_airc_state == 1) {                                       /* чат: «Здесь аккуратней» — встаём сразу; едем после «Отлично» (или через AIRC_HOLD_MAX_MS) */
+        long long sT = __atomic_load_n(&g_airc_stopT, __ATOMIC_ACQUIRE), oT = __atomic_load_n(&g_airc_okT, __ATOMIC_ACQUIRE);
+        int hd = sT > 0 && sT > oT && nowMs - sT < AIRC_HOLD_MAX_MS;
+        if (hd && !g_air_chHold) {
+            char lg[120]; Buf x;
+            g_air_chHold = 1; g_air_chStops++;
+            b_init(&x, lg, sizeof lg); b_s(&x, "air: exam: чат: «Здесь аккуратней» — встал, с прихода строки прошло мс: "); b_int(&x, (int)(nowMs - sT)); dlog(lg);
+            chat_say("/air exam: инструктор: «Здесь аккуратней» — встал");
+        } else if (!hd && g_air_chHold) {
+            g_air_chHold = 0;
+            if (oT >= sT) {                                        /* знак засчитан: у ближайшего знака таблицы больше не стоим */
+                int k, nb = -1; float bd = 15.0f;
+                for (k = 0; k < AIR_EX_NSIGN; k++) {
+                    float qx = g_air_exSigns[k][0] - hold[0], qz = g_air_exSigns[k][1] - hold[2], qd = (float)__builtin_sqrt((double)qx * qx + (double)qz * qz);
+                    if (qd < bd) { bd = qd; nb = k; }
+                }
+                if (nb >= 0) g_air_exDone |= 1u << nb;
+                dlog("air: exam: чат: «Отлично» — едем дальше");
+                chat_say("/air exam: инструктор: «Отлично» — еду дальше");
+            } else {
+                dlog("air: exam: чат: «Отлично» не пришло за 5 с — едем дальше сами");
+                chat_say("/air exam: «Отлично» не пришло за 5 с — еду дальше");
+            }
+        }
+        if (hd) { *spd = 0.0f; return 0; }
+    }
     if (g_air_exSign >= 0) {                                       /* стоим у знака */
         if (nowMs < g_air_exUntil) { *spd = 0.0f; return 0; }
         g_air_exDone |= 1u << g_air_exSign;
@@ -1301,6 +1513,8 @@ static void air_status(void) {
     b_init(&b, m, sizeof m); b_s(&b, "  автошкола (/air exam): "); b_s(&b, g_air_exMode == 1 ? "включена вручную" : g_air_exMode == 2 ? "выключена" : "авто");
     b_s(&b, g_air_exOn ? ", СЕЙЧАС экзамен" : ", сейчас не экзамен"); b_s(&b, ", скорость "); b_fix(&b, g_air_exSpeed, 1); b_s(&b, " м/с, остановок у знаков "); b_int(&b, g_air_exStops);
     if (g_air_exSign >= 0) { b_s(&b, ", стою у знака №"); b_int(&b, g_air_exSign + 1); }
+    b_s(&b, "; чат: "); b_s(&b, g_airc_state == 1 ? "перехват вкл" : g_airc_state < 0 ? "перехват не вышел" : "перехват выкл");
+    if (g_airc_state == 1) { b_s(&b, ", строк "); b_int(&b, g_airc_seen); b_s(&b, ", остановок "); b_int(&b, g_air_chStops); if (g_air_chHold) b_s(&b, ", СТОЮ по чату"); }
     if (g_air_exOn && g_air_hOk) { b_s(&b, ", курс (x z) "); b_fix(&b, g_air_hx, 2); b_ch(&b, ' '); b_fix(&b, g_air_hz, 2); }
     chat_say(m);
     b_init(&b, m, sizeof m); b_s(&b, "  ввод ("); b_s(&b, g_air_inSrc ? "MovementDirection" : "m_MovementInput"); b_s(&b, "): ");
@@ -1388,6 +1602,17 @@ static void native_air_cmd(void* self, void* args, void* mi) {
             g_air_exMode = 2; air_ex_end(NULL); chat_say("/air exam: выключен — автолёт к метке обычный (прямо, без остановок у знаков). Вернуть: /air exam auto");
         } else if (nt >= 2 && (seq(tok[1], "auto") || seq(tok[1], "авто"))) {
             g_air_exMode = 0; chat_say("/air exam: авто — включится сам, когда маркер сервера окажется стартом экзамена в автошколе");
+        } else if (nt >= 2 && (seq(tok[1], "chat") || seq(tok[1], "чат"))) {
+            if (nt >= 3 && (seq(tok[2], "on") || seq(tok[2], "вкл"))) {
+                if (airc_install()) chat_say("/air exam chat: перехват чата включён — встану по «Здесь аккуратней», поеду после «Отлично». Снять: /air exam chat off");
+                else { b_init(&b, m, sizeof m); b_s(&b, "/air exam chat: не вышло — "); b_s(&b, g_airc_why); chat_say(m); }
+            } else if (nt >= 3 && (seq(tok[2], "off") || seq(tok[2], "выкл") || seq(tok[2], "0"))) {
+                airc_unhook(); g_air_chHold = 0;
+                chat_say(g_airc_state == 1 ? "/air exam chat: снять не удалось (смотрите HLOG/konstt.log)" : "/air exam chat: перехват чата снят — дальше только таблица знаков");
+            } else {
+                b_init(&b, m, sizeof m); b_s(&b, "/air exam chat: "); b_s(&b, g_airc_state == 1 ? "включён" : g_airc_state < 0 ? "не вышло" : "выключен");
+                b_s(&b, ", строк инструктора "); b_int(&b, g_airc_seen); b_s(&b, ", остановок по чату "); b_int(&b, g_air_chStops); b_s(&b, ". /air exam chat on|off"); chat_say(m);
+            }
         } else if (nt >= 2 && (seq(tok[1], "speed") || seq(tok[1], "скорость"))) {
             if (nt < 3 || !air_num(tok[2], &v)) { b_init(&b, m, sizeof m); b_s(&b, "/air exam: скорость сейчас "); b_fix(&b, g_air_exSpeed, 1); b_s(&b, " м/с. Задать: /air exam speed 14 (3…30)"); chat_say(m); return; }
             if (v < 3.0f) v = 3.0f;
@@ -1396,7 +1621,7 @@ static void native_air_cmd(void* self, void* args, void* mi) {
             b_init(&b, m, sizeof m); b_s(&b, "/air exam: скорость экзамена "); b_fix(&b, v, 1); b_s(&b, " м/с (≈ "); b_fix(&b, v * 3.6f, 0); b_s(&b, " км/ч)"); chat_say(m);
         } else {
             b_init(&b, m, sizeof m); b_s(&b, "/air exam: "); b_s(&b, g_air_exMode == 1 ? "включён вручную" : g_air_exMode == 2 ? "выключен" : "авто"); b_s(&b, g_air_exOn ? ", сейчас экзамен" : ", сейчас не экзамен");
-            b_s(&b, ". /air exam on|off|auto, /air exam speed N"); chat_say(m);
+            b_s(&b, ". /air exam on|off|auto, /air exam speed N, /air exam chat on|off"); chat_say(m);
         }
         return;
     }
