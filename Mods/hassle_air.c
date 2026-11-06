@@ -137,6 +137,7 @@ static int g_air_mkHave, g_air_mkArrived, g_air_mkKind, g_air_mkExact;   /* ес
 static float g_air_mkPos[3];                      /* последняя прочитанная цель (система Entity.Transform) */
 static long long g_air_mkT;
 static int g_air_vfix;                            /* сколько раз игра возвращала машине обычную физику, а мы снова выключали */
+static int g_air_face = 1;                        /* /air face: в машине нос поворачивается по направлению полёта (иначе машина летит боком, с прежним курсом) */
 
 /* ───────────── мелкие помощники ───────────── */
 static long long air_now_ns(void) { long ts[2]; ts[0] = 0; ts[1] = 0; clock_gettime(1, ts); return (long long)ts[0] * 1000000000LL + ts[1]; }
@@ -1030,9 +1031,9 @@ static int air_vheading(void* veh, float* hx, float* hz) {
     return 1;
 }
 /* довернуть курс (g_air_hx, g_air_hz) к направлению (tx, tz) — не быстрее AIR_EX_TURN_DEG °/с. Возвращает cos угла между курсом и целью после поворота */
-static float air_ex_turn(float tx, float tz, float dt) {
+static float air_turn(float tx, float tz, float dt, float deg) {
     float dot = g_air_hx * tx + g_air_hz * tz, sd = tx * g_air_hz - tz * g_air_hx;      /* sd > 0 — цель правее (ψ больше) */
-    float a = AIR_EX_TURN_DEG * dt * 0.0174533f, a2 = a * a, nx, nz, l;
+    float a = deg * dt * 0.0174533f, a2 = a * a, nx, nz, l;
     float cm = 1.0f - a2 * 0.5f + a2 * a2 * (1.0f / 24.0f), sm = a - a2 * a * (1.0f / 6.0f) + a2 * a2 * a * (1.0f / 120.0f);
     if (dot >= cm) { g_air_hx = tx; g_air_hz = tz; return 1.0f; }          /* угол меньше шага — сразу на цель */
     if (sd < 0.0f) sm = -sm;
@@ -1040,6 +1041,26 @@ static float air_ex_turn(float tx, float tz, float dt) {
     l = (float)__builtin_sqrt((double)nx * nx + (double)nz * nz);
     if (l > 1e-4f) { g_air_hx = nx / l; g_air_hz = nz / l; }
     return g_air_hx * tx + g_air_hz * tz;
+}
+static float air_ex_turn(float tx, float tz, float dt) { return air_turn(tx, tz, dt, AIR_EX_TURN_DEG); }
+
+/* Курс машины в обычном полёте (не экзамен): нос смотрит туда, куда летим. Раньше курс ставился только на экзамене (air_vyaw под g_air_exOn), а в остальное время
+   мы двигали одну позицию, и машина летела к метке боком — с той ориентацией, в которой стояла при включении.
+   d — смещение точки hold за этот кадр (м); по горизонтали берём направление, медленнее AIR_FACE_MIN_V м/с курс не меняем (стоим/висим/движемся только вверх-вниз).
+   allowTurn = 0 — едем назад (S): курс не трогаем, иначе машина развернулась бы кормой вперёд. */
+#define AIR_FACE_TURN_DEG 360.0f
+#define AIR_FACE_MIN_V 0.6f
+static void air_face_step(void* veh, const float* d, float dt, int allowTurn) {
+    float hl = (float)__builtin_sqrt((double)d[0] * d[0] + (double)d[2] * d[2]);
+    if (allowTurn && dt > 1e-4f && hl / dt >= AIR_FACE_MIN_V) {
+        float tx = d[0] / hl, tz = d[2] / hl;
+        if (!g_air_hOk) {                                            /* первый раз: стартуем с того курса, в котором машина стоит сейчас — без рывка */
+            if (!air_vheading(veh, &g_air_hx, &g_air_hz)) { g_air_hx = tx; g_air_hz = tz; }
+            g_air_hOk = 1;
+        }
+        air_turn(tx, tz, dt, AIR_FACE_TURN_DEG);
+    }
+    if (g_air_hOk) air_vyaw(veh, g_air_hx, g_air_hz);                /* курс держим каждый кадр (ставит и Rigidbody, если он на том же Transform) */
 }
 static void air_ex_start(const char* why, long long nowMs) {
     g_air_exOn = 1; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1; g_air_exStops = 0; g_air_exLost = nowMs; g_air_chHold = 0;
@@ -1260,6 +1281,7 @@ static void* air_worker(void* arg) {
 static void air_state_init(const float* hold) {
     g_air_hold[0] = g_air_last[0] = hold[0]; g_air_hold[1] = g_air_last[1] = hold[1]; g_air_hold[2] = g_air_last[2] = hold[2];
     g_air_tPrev = air_now_ns(); g_air_jumps = 0; g_air_watchId = -1; g_air_watchT = 0; g_air_pending = 0;
+    g_air_hOk = 0;                                                   /* новая машина/новый полёт — курс перечитаем с неё */
     g_air_pj = g_air_pc = 1; g_air_kSrc = -1;                        /* если кнопка уже зажата в момент включения — это не «новое нажатие» */
 }
 /* пешком: флаги + постановка в точку hold (система transform движения). 0 — не вышло, флаги возвращены */
@@ -1347,7 +1369,7 @@ static void air_exit(const char* why, int land) {
 
 /* ───────────── тик (главный поток) ───────────── */
 static void air_tick(void) {
-    AirCtx c; float cur[3], mv3[3], dt; long long now; int manual = 0;
+    AirCtx c; float cur[3], mv3[3], h0[3], dt; long long now; int manual = 0;
     g_air_pending = 0;
     if (!__atomic_load_n(&g_air_on, __ATOMIC_ACQUIRE)) return;
     if (!air_ctx(&c, 1) || (!c.veh && !c.mv)) { air_exit("персонаж недоступен", 0); chat_say("/air: персонаж пропал (смерть/смена мира) — полёт выключен"); return; }
@@ -1393,6 +1415,7 @@ static void air_tick(void) {
         g_air_jumps++;
         dlog("air: вас переставили далеко — держу новую точку");
     }
+    h0[0] = g_air_hold[0]; h0[1] = g_air_hold[1]; h0[2] = g_air_hold[2];   /* точка до движения этого кадра — по смещению считаем курс машины */
     if (g_air_keys) {                                                /* прыжок — вверх, присед — вниз (как клавиши высоты в airbrake) */
         int kj = 0, kc = 0, src = air_buttons(g_air_mode == 1 ? NULL : c.ctrl, &kj, &kc);   /* в машине Character.Keys не читаем: там другие клавиши */
         if (src != g_air_kSrc) {
@@ -1418,7 +1441,13 @@ static void air_tick(void) {
         }
     }
     if (g_air_mark) air_mark_step(&c, dt, manual);
-    if (g_air_exOn && g_air_hOk && g_air_mode == 1) air_vyaw(c.veh, g_air_hx, g_air_hz);   /* экзамен: курс машины держим каждый кадр */
+    if (g_air_mode == 1) {
+        if (g_air_exOn) { if (g_air_hOk) air_vyaw(c.veh, g_air_hx, g_air_hz); }          /* экзамен: курс машины держим каждый кадр */
+        else if (g_air_face) {                                                           /* обычный полёт: нос — по направлению движения */
+            float dd[3]; dd[0] = g_air_hold[0] - h0[0]; dd[1] = 0.0f; dd[2] = g_air_hold[2] - h0[2];
+            air_face_step(c.veh, dd, dt, g_air_rawIn[1] >= -0.2f);
+        }
+    }
     if (g_air_mode == 1) air_vset(c.veh, g_air_hold);
     else if (air_call_setpos(c.mv, g_air_hold, "движению")) air_zero_vel(c.mv);
     g_air_last[0] = g_air_hold[0]; g_air_last[1] = g_air_hold[1]; g_air_last[2] = g_air_hold[2];
@@ -1477,6 +1506,7 @@ static void air_usage(void) {
     chat_usage("Вышли из машины в полёте — она встанет на землю, вы продолжите лететь пешком");
     chat_usage("/air mark — автолёт к красной метке (маркер сервера или метка карты); появилась/сменилась — летит к новой. /air mark gps|cp — только карта|только маркер, /air mark off — выключить");
     chat_usage("/air exam [on|off|auto] — режим автошколы для /air mark cp: курс машины по дороге и остановки у знаков STOP (авто — включается на старте экзамена);  /air exam speed N — скорость экзамена, м/с (3…30, по умолчанию 14)");
+    chat_usage("/air face [on|off] — в машине нос по направлению полёта (по умолчанию ВКЛ; выкл — машина летит боком с прежним курсом)");
     chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
 static void air_status(void) {
@@ -1485,6 +1515,7 @@ static void air_status(void) {
     b_s(&b, "/air: "); b_s(&b, g_air_on ? "ВКЛ" : "выкл");
     b_s(&b, ", скорость "); b_fix(&b, g_air_speed, 1); b_s(&b, " м/с, режим "); b_s(&b, g_air_look3d ? "3d (куда смотрит камера)" : "flat (горизонтально)");
     b_s(&b, ", летим: "); b_s(&b, g_air_on ? (g_air_mode == 1 ? "МАШИНОЙ" : "пешком") : "—");
+    b_s(&b, ", нос по курсу (/air face): "); b_s(&b, g_air_face ? "да" : "нет");
     b_s(&b, ", слежка за NPC: "); b_s(&b, g_air_watch ? "да" : "нет");
     b_s(&b, ", как на ровном: "); b_s(&b, g_air_stand ? (g_air_fall ? "да (Fall найден)" : "да") : "нет");
     chat_say(m);
@@ -1630,6 +1661,14 @@ static void native_air_cmd(void* self, void* args, void* mi) {
     if (seq(tok[0], "keys") || seq(tok[0], "кнопки")) {
         g_air_keys = !g_air_keys;
         chat_say(g_air_keys ? "/air: кнопки включены — ПРЫЖОК (держать) вверх, ПРИСЕД (двойной тап по джойстику и держать) вниз" : "/air: кнопки вверх/вниз выключены (высота — камерой в 3d или /air up|down)");
+        return;
+    }
+    if (seq(tok[0], "face") || seq(tok[0], "нос") || seq(tok[0], "курс")) {
+        if (nt >= 2 && (seq(tok[1], "off") || seq(tok[1], "выкл") || seq(tok[1], "0"))) g_air_face = 0;
+        else if (nt >= 2 && (seq(tok[1], "on") || seq(tok[1], "вкл") || seq(tok[1], "1"))) g_air_face = 1;
+        else g_air_face = !g_air_face;
+        g_air_hOk = 0;
+        chat_say(g_air_face ? "/air face: вкл — в машине нос поворачивается по направлению полёта (к метке — носом вперёд)" : "/air face: выкл — машина летит с прежним курсом (может лететь боком)");
         return;
     }
     if (seq(tok[0], "stand") || seq(tok[0], "ровно2") || seq(tok[0], "анимация")) {
