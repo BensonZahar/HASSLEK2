@@ -28,6 +28,13 @@
  *   (по порядку ID, в пределах зоны стрима ~300 м); на кнопке видно «ТП 2/5». Встаёте у руды на SHX_TP_BACK м в вашу сторону, Transform на SHX_TP_DY ниже точки
  *   объекта (так сервер видит игрока ровно в точке руды). Если оказались в стене — поправьте SHX_TP_BACK или вернитесь «/tpl pos».
  *
+ * Переключатель «Автоцикл шахты» (JS меню; C только сообщает, показан ли маркер сервера — поле k в состоянии): раз в 1.4 с (шаг больше 1 с — серверный интервал
+ *   между кликами по меню взаимодействий, interactions.pwn OnInteractionsClick). Порядок: идёт кружок — ждём (автонажатие включается вместе с циклом); есть меню
+ *   взаимодействий — кликаем первую строку (не больше 2 раз подряд, чтобы не застрять у места, где делать нечего); иначе через 3.2 с покоя — «/tpl gps» к маркеру
+ *   сервера, а если маркера нет (после перфоратора сервер его не ставит) — «ТП» к руде того вида, который вы нажимали последним. Маркер ведёт сам: стойка после
+ *   каждого этапа (перфоратор → кирка → тележка → лопата), потом месторождение, потом вагонетка/склад — отдельно проверять, какой инструмент в руках, не нужно:
+ *   стойка выдаёт нужный сама, а сервер показывает пункт «взять инструмент» только когда рук свободны (Interactions:IsAccess, MINER_TOOLS_INTERACT).
+ *
  * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): раз в 0.9 с шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
  *   для кружков с подписью «Нажимайте Y …» — это этап кирки. Бурение и лопата сервер заполняет сам по таймеру, их нажимать не нужно. Быстрее 0.9 с нельзя:
  *   сервер (progress_bar.pwn, OnKeyPress) считает нажатие чаще 700 мс ошибкой — шкала откатывается, а после 5 ошибок этап срывается.
@@ -88,6 +95,7 @@ static ShxSlot g_shx_slot[SHX_MAXL];
 #define SHX_TP_NEAR 8.0f                 /* сдвиг в вашу сторону — только если вы ближе (по горизонтали); дальше направление «к вам» может вести сквозь скалу */
 typedef struct { int id; float p[3]; } ShxTp;
 static ShxTp g_shx_tp[4][SHX_TPK]; static int g_shx_ntp[4];
+static int g_shx_mark;                   /* 1 — сервер сейчас показывает маркер (см. shx_marker_active) */
 static int g_shx_present[SHX_RANGE];
 static int g_shx_total[SHX_NT];          /* сколько объектов каждого вида в пуле при последнем скане (весь стрим, не только радиус) */
 static int g_shx_inrad[SHX_NT];          /* то же в радиусе */
@@ -146,10 +154,10 @@ static const char g_shx_menu_js[] =
 "{k:'iron',n:'Железо',c:'#FF8030'},\n"
 "{k:'coal',n:'Уголь',c:'#9A9A9A'},\n"
 "{k:'ground',n:'Руда на земле',c:'#66FF66'}];\n"
-"var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0,t:[[],[],[],[]]},ix=[0,0,0,0];\n"
+"var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0,k:0,t:[[],[],[],[]]},ix=[0,0,0,0],cycTgt=0;\n"
 "var open=false,dragged=false,syncT=null;\n"
 "function cmd(x){try{window.sendChatInput('/shaxta q '+x);}catch(e){}}\n"
-"function go(i){var a=S.t[i];if(!a||!a.length)return;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}}\n"
+"function go(i){cycTgt=i;var a=S.t[i];if(!a||!a.length)return;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}}\n"
 "function el(tag,id,cls,txt){var e=document.createElement(tag);if(id)e.id=id;if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e;}\n"
 "var css='#shx-fab{position:fixed;right:1.4vh;top:34vh;width:6.6vh;height:6.6vh;border-radius:50%;background:rgba(12,10,6,.82);border:0.35vh solid #ffb110;z-index:999990;pointer-events:auto;display:flex;align-items:center;justify-content:center}'\n"
 "+'#shx-fab.on{background:rgba(255,177,16,.9)}'\n"
@@ -201,6 +209,8 @@ static const char g_shx_menu_js[] =
 "rc.appendChild(bm);rc.appendChild(rv);rc.appendChild(bp);rr.appendChild(rc);panel.appendChild(rr);\n"
 "var ar=el('div',null,'shx-row');var al=el('div',null,'shx-l');al.appendChild(el('div',null,'shx-n','Автонажатие кружка'));\n"
 "var asub=el('div',null,'shx-s','выкл');al.appendChild(asub);ar.appendChild(al);var asw=mkSw();ar.appendChild(asw);panel.appendChild(ar);\n"
+"var cr=el('div',null,'shx-row');var cl=el('div',null,'shx-l');cl.appendChild(el('div',null,'shx-n','Автоцикл шахты'));\n"
+"var csub=el('div',null,'shx-s','выкл · цель — последняя нажатая руда');cl.appendChild(csub);cr.appendChild(cl);var csw=mkSw();cr.appendChild(csw);panel.appendChild(cr);\n"
 "var ft=el('div',null,'shx-f');var hint=el('div',null,'shx-hint','');var rs=el('div',null,'shx-b shx-rs','Сбросить счётчик');\n"
 "ft.appendChild(hint);ft.appendChild(rs);panel.appendChild(ft);\n"
 "document.body.appendChild(fab);document.body.appendChild(panel);\n"
@@ -228,8 +238,20 @@ static const char g_shx_menu_js[] =
 "var auto=false,autoT=null,autoN=0;\n"
 "function autoTick(){try{var L=document.querySelectorAll('.preloader-list');for(var i=0;i<L.length;i++){var t=L[i].querySelector('.preloader-title');\n"
 "if(t&&/Нажимайте/.test(t.textContent||'')){sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,'OnProgressBarClick',i);autoN++;asub.textContent='вкл · нажатий '+autoN;}}}catch(e){}}\n"
-"ar.addEventListener('click',function(){auto=!auto;asw.className='shx-sw'+(auto?' on':'');\n"
-"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';autoT=setInterval(autoTick,900);}else asub.textContent='выкл';});\n"
+"function setAuto(v){if(v===auto)return;auto=v;asw.className='shx-sw'+(auto?' on':'');\n"
+"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';autoT=setInterval(autoTick,900);}else asub.textContent='выкл';}\n"
+"ar.addEventListener('click',function(){setAuto(!auto);});\n"
+"var cyc=false,cycT=null,cycLast=0,clk=0;\n"
+"function cycTick(){try{cmd('sync');var now=Date.now();\n"
+"if(document.querySelector('.preloader-list')){cycLast=now;clk=0;csub.textContent='кружок идёт';return;}\n"
+"var I=document.querySelectorAll('.interactions-list');\n"
+"if(I.length){if(clk<2){I[0].click();clk++;cycLast=now;csub.textContent='взаимодействие';return;}}else clk=0;\n"
+"if(now-cycLast<3200)return;cycLast=now;clk=0;\n"
+"if(S.k){window.sendChatInput('/tpl gps');csub.textContent='к маркеру сервера';}\n"
+"else{go(cycTgt);csub.textContent='к руде: '+T[cycTgt].n;}}catch(e){}}\n"
+"cr.addEventListener('click',function(){cyc=!cyc;csw.className='shx-sw'+(cyc?' on':'');\n"
+"if(cycT){clearInterval(cycT);cycT=null;}\n"
+"if(cyc){setAuto(true);clk=0;cycLast=0;csub.textContent='вкл';cycT=setInterval(cycTick,1400);}else csub.textContent='выкл · цель — последняя нажатая руда';});\n"
 "var dx=0,dy=0,sx=0,sy=0,tch=false;\n"
 "fab.addEventListener('touchstart',function(e){var t=e.touches[0];sx=t.clientX;sy=t.clientY;var b=fab.getBoundingClientRect();dx=t.clientX-b.left;dy=t.clientY-b.top;tch=true;dragged=false;});\n"
 "fab.addEventListener('touchmove',function(e){if(!tch)return;var t=e.touches[0];if(Math.abs(t.clientX-sx)+Math.abs(t.clientY-sy)<12&&!dragged)return;dragged=true;\n"
@@ -268,7 +290,7 @@ static void shx_ui_push(int force) {                                /* сост�
     for (i = 0; i < SHX_NT; i++) { if (i) b_ch(&b, ','); b_int(&b, g_shx_total[i]); }
     b_s(&b, "],s:[");
     for (i = 0; i < SHX_NT; i++) { if (i) b_ch(&b, ','); b_int(&b, g_shx_spawn[i]); }
-    b_s(&b, "],t:[");
+    b_s(&b, "],k:"); b_int(&b, g_shx_mark); b_s(&b, ",t:[");
     for (i = 0; i < 4; i++) {                                       /* куда ставить игрока: точка руды, Transform на SHX_TP_DY ниже, чуть в вашу сторону */
         if (i) b_ch(&b, ',');
         b_ch(&b, '[');
@@ -393,11 +415,46 @@ static void shx_obj_cb(void* it, void* ctx) {
     if (tid < 4) shx_tp_add(tid, (int)num_field(it, "ID", NULL), p);
     if (shx_dist(p, g_shx_ref) <= g_shx_radius) shx_add(tid, (int)num_field(it, "ID", NULL), p, model);
 }
+/* Маркер сервера: Checkpoint.Simple / Checkpoint.Race (статические, по одному на игрока). Сервер шахты сам ставит маркер на следующую цель:
+   стойка с инструментом после каждого этапа, месторождение после взятия кирки/тележки/лопаты, вагонетка/склад при сдаче. Спрятанный маркер уезжает в (0,0,0). */
+static void* shx_call0(void* obj, const char* name) {
+    void *m, *exc = NULL, *r;
+    if (!obj || !hm_obj_ok(obj)) return NULL;
+    m = find_method(A.object_get_class(obj), name, 0);
+    if (!m) return NULL;
+    r = A.runtime_invoke(m, obj, NULL, &exc);
+    return (exc || !r || !hm_obj_ok(r)) ? NULL : r;
+}
+static int shx_marker_one(const char* fld) {
+    void *cls, *f, *obj = NULL, *tr, *go, *m, *exc = NULL, *r; const float* v;
+    if (!g_safe || !il2cpp_light() || !g_img) return 0;
+    cls = A.class_from_name(g_img, "Hassle.Entities", "Checkpoint");
+    f = cls ? A.class_get_field_from_name(cls, fld) : NULL;
+    if (!f) return 0;
+    A.field_static_get_value(f, &obj);
+    if (!obj || !hm_obj_ok(obj)) return 0;
+    go = shx_call0(obj, "get_gameObject");
+    if (go) {                                                       /* GameObject.activeInHierarchy: выключенный маркер — это «маркера нет» */
+        m = find_method(A.object_get_class(go), "get_activeInHierarchy", 0);
+        if (m) { r = A.runtime_invoke(m, go, NULL, &exc); if (!exc && r && hm_readable((char*)r + HDR, 1) && *((u8*)r + HDR) == 0) return 0; }
+    }
+    tr = shx_call0(obj, "get_transform");
+    if (!tr) return 0;
+    m = find_method(A.object_get_class(tr), "get_position", 0);
+    if (!m) return 0;
+    exc = NULL; r = A.runtime_invoke(m, tr, NULL, &exc);
+    if (exc || !r || !hm_readable((char*)r + HDR, 12)) return 0;
+    v = (const float*)((char*)r + HDR);
+    if (!(v[0] == v[0] && v[1] == v[1] && v[2] == v[2])) return 0;
+    return !(v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f);
+}
+static int shx_marker_active(void) { return shx_marker_one("Simple") || shx_marker_one("Race"); }
 static void shx_collect(void) {                                     /* заполняет g_shx_c ближайшими рудами к g_shx_ref */
     int i;
     g_shx_nc = 0;
     for (i = 0; i < SHX_NT; i++) { g_shx_total[i] = 0; g_shx_inrad[i] = 0; }
     for (i = 0; i < 4; i++) g_shx_ntp[i] = 0;
+    g_shx_mark = shx_marker_active();
     for (i = 0; i < g_shx_np; i++) g_shx_pos[i].seen = 0;
     g_shx_poolN = shx_scan_pool("Objects", shx_obj_cb);
     if (g_shx_poolN < 0) return;
