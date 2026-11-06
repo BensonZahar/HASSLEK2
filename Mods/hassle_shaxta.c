@@ -28,15 +28,15 @@
  *   (по порядку ID, в пределах зоны стрима ~300 м); на кнопке видно «ТП 2/5». Встаёте у руды на SHX_TP_BACK м в вашу сторону, Transform на SHX_TP_DY ниже точки
  *   объекта (так сервер видит игрока ровно в точке руды). Если оказались в стене — поправьте SHX_TP_BACK или вернитесь «/tpl pos».
  *
- * Переключатель «Автоцикл шахты» (JS меню; C только сообщает, показан ли маркер сервера — поле k в состоянии): раз в 1.4 с (шаг больше 1 с — серверный интервал
+ * Переключатель «Автоцикл шахты» (JS меню; C только сообщает, показан ли маркер сервера — поле k в состоянии): раз в 1.2 с (шаг больше 1 с — серверный интервал
  *   между кликами по меню взаимодействий, interactions.pwn OnInteractionsClick). Порядок: идёт кружок — ждём (автонажатие включается вместе с циклом); есть меню
- *   взаимодействий — кликаем первую строку (не больше 2 раз подряд, чтобы не застрять у места, где делать нечего); иначе через 3.2 с покоя — «/tpl gps» к маркеру
+ *   взаимодействий — кликаем первую строку (не больше 2 раз подряд, чтобы не застрять у места, где делать нечего); иначе через 1.8 с покоя — «/tpl gps» к маркеру
  *   сервера, а если маркера нет (после перфоратора сервер его не ставит) — «ТП» к руде того вида, который вы нажимали последним. Маркер ведёт сам: стойка после
  *   каждого этапа (перфоратор → кирка → тележка → лопата), потом месторождение, потом вагонетка/склад — отдельно проверять, какой инструмент в руках, не нужно:
  *   стойка выдаёт нужный сама, а сервер показывает пункт «взять инструмент» только когда рук свободны (Interactions:IsAccess, MINER_TOOLS_INTERACT).
  *
- * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): раз в 0.9 с шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
- *   для кружков с подписью «Нажимайте Y …» — это этап кирки. Бурение и лопата сервер заполняет сам по таймеру, их нажимать не нужно. Быстрее 0.9 с нельзя:
+ * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): раз в 0.8 с шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
+ *   для кружков с подписью «Нажимайте Y …» — это этап кирки. Бурение и лопата сервер заполняет сам по таймеру, их нажимать не нужно. Быстрее 0.7 с нельзя:
  *   сервер (progress_bar.pwn, OnKeyPress) считает нажатие чаще 700 мс ошибкой — шкала откатывается, а после 5 ошибок этап срывается.
  *
  * Меню (как оно устроено): мод сам внедряет JS в веб-интерфейс игры через WebViewSystem.ExecuteJavaScript (APK пересобирать не нужно).
@@ -160,7 +160,9 @@ static const char g_shx_menu_js[] =
 "var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0,k:0,rk:[],t:[[],[],[],[]]},ix=[0,0,0,0],cycTgt=0;\n"
 "var open=false,dragged=false,syncT=null;\n"
 "function cmd(x){try{window.sendChatInput('/shaxta q '+x);}catch(e){}}\n"
-"function go(i){cycTgt=i;var a=S.t[i];if(!a||!a.length)return;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}}\n"
+"function goPt(i){var a=S.t[i];if(!a||!a.length)return 0;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}return 1;}\n"
+"function go(i){cycTgt=i;goPt(i);}\n"
+"function pickTgt(){var o=[cycTgt,0,1,2,3];for(var j=0;j<o.length;j++){var a=S.t[o[j]];if(a&&a.length)return o[j];}return -1;}\n"
 "function el(tag,id,cls,txt){var e=document.createElement(tag);if(id)e.id=id;if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e;}\n"
 "var css='#shx-fab{position:fixed;right:1.4vh;top:34vh;width:6.6vh;height:6.6vh;border-radius:50%;background:rgba(12,10,6,.82);border:0.35vh solid #ffb110;z-index:999990;pointer-events:auto;display:flex;align-items:center;justify-content:center}'\n"
 "+'#shx-fab.on{background:rgba(255,177,16,.9)}'\n"
@@ -244,7 +246,7 @@ static const char g_shx_menu_js[] =
 "function intr(){try{var d=document.querySelectorAll('.interactions-list').length;if(!d&&!window.getInterfaceStatus('Interactions'))return null;var v=window.interface('Interactions');if(v&&v.list&&v.list.length)return v.list;}catch(e){}return null;}\n"
 "function autoTick(){try{var n=bars();for(var i=0;i<n;i++){ev('OnProgressBarClick',i);autoN++;}if(n)asub.textContent='вкл · нажатий '+autoN;}catch(e){}}\n"
 "function setAuto(v){if(v===auto)return;auto=v;asw.className='shx-sw'+(auto?' on':'');\n"
-"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';autoT=setInterval(autoTick,900);}else asub.textContent='выкл';}\n"
+"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';autoT=setInterval(autoTick,800);}else asub.textContent='выкл';}\n"
 "ar.addEventListener('click',function(){setAuto(!auto);});\n"
 "var cyc=false,cycT=null,cycLast=0,clk=0,phase='rack',fails=0,rix=0,rkWait=false;\n"
 "function toRack(){var a=S.rk;if(!a||!a.length){csub.textContent='стоек не видно (подойдите к шахте)';return;}\n"
@@ -254,13 +256,14 @@ static const char g_shx_menu_js[] =
 "if(bars()){cycLast=now;clk=0;fails=0;phase='ore';csub.textContent='кружок идёт';return;}\n"
 "var L=intr();\n"
 "if(L){if(clk<2){var tt=L[0].title;ev('OnInteractionsClick',L[0].type);clk++;cycLast=now;rkWait=false;csub.textContent='взаимодействие: '+String(tt).replace(/<[^>]*>/g,' ');return;}}else clk=0;\n"
-"if(now-cycLast<3200)return;cycLast=now;clk=0;\n"
+"if(now-cycLast<1800)return;cycLast=now;clk=0;\n"
 "if(S.k){window.sendChatInput('/tpl gps');csub.textContent='к маркеру сервера';return;}\n"
-"if(phase==='ore'&&fails<2){fails++;go(cycTgt);csub.textContent='к руде: '+T[cycTgt].n+' ('+fails+')';}\n"
+"if(phase==='ore'&&fails<2){var ti=pickTgt();if(ti<0){csub.textContent='руды рядом нет: подойдите к месторождениям';return;}\n"
+"fails++;goPt(ti);csub.textContent='к руде: '+T[ti].n+(ti===cycTgt?'':' (запасная)')+' ('+fails+')';}\n"
 "else{phase='ore';fails=0;toRack();}}catch(e){csub.textContent='ошибка: '+e;}}\n"
 "cr.addEventListener('click',function(){cyc=!cyc;csw.className='shx-sw'+(cyc?' on':'');\n"
 "if(cycT){clearInterval(cycT);cycT=null;}\n"
-"if(cyc){setAuto(true);clk=0;cycLast=0;phase='rack';fails=0;rkWait=false;csub.textContent='вкл';cycT=setInterval(cycTick,1400);}else csub.textContent='выкл · цель — последняя нажатая руда';});\n"
+"if(cyc){setAuto(true);clk=0;cycLast=0;phase='rack';fails=0;rkWait=false;csub.textContent='вкл';cycT=setInterval(cycTick,1200);}else csub.textContent='выкл · цель — последняя нажатая руда';});\n"
 "var dx=0,dy=0,sx=0,sy=0,tch=false;\n"
 "fab.addEventListener('touchstart',function(e){var t=e.touches[0];sx=t.clientX;sy=t.clientY;var b=fab.getBoundingClientRect();dx=t.clientX-b.left;dy=t.clientY-b.top;tch=true;dragged=false;});\n"
 "fab.addEventListener('touchmove',function(e){if(!tch)return;var t=e.touches[0];if(Math.abs(t.clientX-sx)+Math.abs(t.clientY-sy)<12&&!dragged)return;dragged=true;\n"
