@@ -25,6 +25,8 @@
  *   /air exam chat [on|off]  перехват чата: стоять по словам инструктора «Здесь аккуратней» (мгновенно), ехать после «Отлично…» (см. блок про автошколу ниже)
  *   /air exam [on|off|auto]  автошкола: на экзамене по вождению /air mark cp ведёт машину как по правилам — курс по дороге, остановка у знаков STOP (подробно — в блоке
  *                         «автошкола: экзамен по вождению» ниже). auto (по умолчанию) — включается само на старте экзамена; /air exam speed N — скорость экзамена, м/с
+ *   /air exam go [chat]   ЕХАТЬ ЭКЗАМЕН одной командой (сидя за рулём): включает полёт, слежку за маркером сервера и режим экзамена (остановки у знаков STOP) — не зависит от того,
+ *                         «увидел» ли мод старт экзамена, можно включать и посреди экзамена. chat — заодно перехват чата. /air go — то же. /air exam stop — остановить и отпустить машину
  *   /air status           состояние и сырые значения ввода;  /air help — подсказка
  *
  * Метки (/air mark): маркер сервера — статические Hassle.Entities.Checkpoint.Race / .Simple (их ставят SetPlayerRaceCheckpoint / SetPlayerCheckpoint; активный — тот, чей
@@ -816,6 +818,7 @@ static float g_air_exSpeed = AIR_EX_SPEED;
 static float g_air_hx, g_air_hz;                  /* курс машины, который держим: единичный вектор (Unity x, z) */
 static int g_air_hOk, g_air_exRotWarn;
 static unsigned g_air_exDone;                     /* биты знаков, у которых уже стояли на этом проходе */
+static unsigned g_air_exGateLog;                  /* биты знаков, про которые уже написали в журнал «курс не подходит» (на этом проходе) */
 static int g_air_exSign = -1;                     /* у какого знака стоим сейчас (-1 — ни у какого) */
 static long long g_air_exUntil, g_air_exLost;
 static int g_air_exStops;                         /* сколько остановок у знаков сделано (для /air status) */
@@ -1062,8 +1065,24 @@ static void air_face_step(void* veh, const float* d, float dt, int allowTurn) {
     }
     if (g_air_hOk) air_vyaw(veh, g_air_hx, g_air_hz);                /* курс держим каждый кадр (ставит и Rigidbody, если он на том же Transform) */
 }
+/* Проверка «курс держится?»: раз в секунду, ДО того как ставим курс в этом кадре, читаем Transform.forward и сравниваем с тем, что поставили в прошлом кадре.
+   Если расходится — что-то в игре перезаписывает поворот машины (или set_rotation не работает): тогда машина будет ехать боком, сколько ни крути g_air_hx/hz.
+   Пишет в konstt.log (не больше 20 раз) и показывает в /air status. */
+static float g_air_hdot = 2.0f; static long long g_air_hchkT; static int g_air_hbad;
+static void air_head_check(void* veh, long long nowMs) {
+    float ax, az;
+    if (nowMs - g_air_hchkT < 1000) return;
+    g_air_hchkT = nowMs;
+    if (!air_vheading(veh, &ax, &az)) { g_air_hdot = 2.0f; return; }
+    g_air_hdot = ax * g_air_hx + az * g_air_hz;
+    if (g_air_hdot < 0.9f && g_air_hbad < 20) {
+        char lg[200]; Buf x; g_air_hbad++;
+        b_init(&x, lg, sizeof lg); b_s(&x, "air: курс не держится: поставили (x z) "); b_fix(&x, g_air_hx, 2); b_ch(&x, ' '); b_fix(&x, g_air_hz, 2);
+        b_s(&x, ", машина смотрит "); b_fix(&x, ax, 2); b_ch(&x, ' '); b_fix(&x, az, 2); b_s(&x, g_air_exOn ? " (экзамен)" : " (обычный полёт)"); dlog(lg);
+    }
+}
 static void air_ex_start(const char* why, long long nowMs) {
-    g_air_exOn = 1; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1; g_air_exStops = 0; g_air_exLost = nowMs; g_air_chHold = 0;
+    g_air_exOn = 1; g_air_hOk = 0; g_air_exDone = 0; g_air_exGateLog = 0; g_air_exSign = -1; g_air_exStops = 0; g_air_exLost = nowMs; g_air_chHold = 0;
     { char m[220]; Buf b; b_init(&b, m, sizeof m); b_s(&b, "/air exam: "); b_s(&b, why); b_s(&b, " — курс по дороге, остановки у знаков STOP. Ремень — пристегните сами, светофоры мод не смотрит. /air exam off — выключить"); chat_say(m); }
     dlog2("air: exam: включён: ", why);
 }
@@ -1073,7 +1092,18 @@ static void air_ex_end(const char* why) {                           /* why == NU
     g_air_exOn = 0; g_air_hOk = 0; g_air_exDone = 0; g_air_exSign = -1; g_air_chHold = 0;
 }
 /* вызывается при каждом чтении цели автолёта (раз в 150 мс): включает/выключает режим экзамена. kind: 1 — маркер сервера (np — его позиция), иначе — нет маркера сервера */
-static void air_ex_watch(int kind, const float* np, long long nowMs) {
+/* Ближайший знак STOP к точке (x, z) — расстояние по горизонтали, м. Знаки лежат на точках маршрута (маркер сервера стоит прямо у знака), так что «маркер у знака» = «экзамен» */
+static float air_sign_dist(float x, float z) {
+    float best = 1e9f; int i;
+    for (i = 0; i < AIR_EX_NSIGN; i++) {
+        float dx = g_air_exSigns[i][0] - x, dz = g_air_exSigns[i][1] - z, d = (float)__builtin_sqrt((double)dx * dx + (double)dz * dz);
+        if (d < best) best = d;
+    }
+    return best;
+}
+#define AIR_EX_AUTO_MARK_R 15.0f                  /* маркер сервера ближе этого к знаку STOP — считаем, что это экзамен */
+#define AIR_EX_AUTO_CAR_R 45.0f                   /* машина ближе этого к знаку, летит к маркеру сервера — тоже экзамен */
+static void air_ex_watch(int kind, const float* np, const float* me, long long nowMs) {
     if (g_air_exMode == 2) return;
     if (g_airc_state == 1) {                                        /* перехват чата: инструктор поздоровался — экзамен начался */
         long long gT = __atomic_load_n(&g_airc_startT, __ATOMIC_ACQUIRE);
@@ -1086,6 +1116,8 @@ static void air_ex_watch(int kind, const float* np, long long nowMs) {
             else {
                 float dx = np[0] - g_air_exStart[0], dz = np[2] - g_air_exStart[1];
                 if (dx * dx + dz * dz <= AIR_EX_START_R * AIR_EX_START_R) air_ex_start("вижу старт экзамена в автошколе", nowMs);
+                else if (air_sign_dist(np[0], np[2]) <= AIR_EX_AUTO_MARK_R) air_ex_start("маркер стоит у знака STOP экзамена (старт пропущен — включаюсь по пути)", nowMs);
+                else if (me && air_sign_dist(me[0], me[2]) <= AIR_EX_AUTO_CAR_R) air_ex_start("рядом знак STOP экзамена (старт пропущен — включаюсь по пути)", nowMs);
             }
         }
     } else if (g_air_exOn && g_air_exMode == 0 && nowMs - g_air_exLost > AIR_EX_LOST_MS) air_ex_end("маркера экзамена давно нет — режим выключен");
@@ -1139,10 +1171,17 @@ static int air_ex_drive(void* veh, const float* hold, const float* d, long long 
     if (ac < AIR_EX_ALIGN_COS) { *spd = 0.0f; return 0; }          /* курс ещё не тот — крутимся на месте */
     for (i = 0; i < AIR_EX_NSIGN; i++) {
         float sx = g_air_exSigns[i][0] - hold[0], sz = g_air_exSigns[i][1] - hold[2], dn = (float)__builtin_sqrt((double)sx * sx + (double)sz * sz);
-        if (dn > AIR_EX_REARM_R) { g_air_exDone &= ~(1u << i); continue; }
+        if (dn > AIR_EX_REARM_R) { g_air_exDone &= ~(1u << i); g_air_exGateLog &= ~(1u << i); continue; }
         if ((g_air_exDone >> i) & 1u) continue;                    /* на этом проходе уже стояли */
         if (dn > AIR_EX_SLOW_R) continue;
-        if (g_air_hx * g_air_exSigns[i][2] + g_air_hz * g_air_exSigns[i][3] < AIR_EX_GATE_COS) continue;   /* курс не тот: сервер этот знак не засчитает (и не накажет) */
+        if (g_air_hx * g_air_exSigns[i][2] + g_air_hz * g_air_exSigns[i][3] < AIR_EX_GATE_COS) {            /* курс не тот: сервер этот знак не засчитает (и не накажет) */
+            if (!((g_air_exGateLog >> i) & 1u)) {
+                char lg[200]; Buf x; g_air_exGateLog |= 1u << i;
+                b_init(&x, lg, sizeof lg); b_s(&x, "air: exam: знак №"); b_int(&x, i + 1); b_s(&x, " пропускаю: курс не подходит, cos "); b_fix(&x, g_air_hx * g_air_exSigns[i][2] + g_air_hz * g_air_exSigns[i][3], 2);
+                b_s(&x, ", до знака "); b_fix(&x, dn, 1); b_s(&x, " м, мой курс (x z) "); b_fix(&x, g_air_hx, 2); b_ch(&x, ' '); b_fix(&x, g_air_hz, 2); dlog(lg);
+            }
+            continue;
+        }
         if (sx * g_air_hx + sz * g_air_hz < -2.0f && dn > 2.0f) continue;                                /* знак уже позади */
         if (dn < bestD) { bestD = dn; best = i; }
     }
@@ -1231,7 +1270,7 @@ static void air_mark_step(const AirCtx* c, float dt, int manual) {
         float np[3]; int ex = 1, kind;
         g_air_mkT = nowMs;
         kind = air_mark_target(g_air_mark == 2 ? 2 : g_air_mark == 3 ? 3 : 1, np, &ex);
-        air_ex_watch(kind, np, nowMs);                              /* автошкола: старт экзамена → режим экзамена (курс, остановки у знаков STOP) */
+        air_ex_watch(kind, np, g_air_hold, nowMs);                              /* автошкола: старт экзамена → режим экзамена (курс, остановки у знаков STOP) */
         if (!kind) {
             if (g_air_mkHave) { g_air_mkHave = 0; g_air_mkArrived = 0; chat_say("/air mark: метка пропала — жду следующую"); }
         } else if (!g_air_mkHave || air_dist(np, g_air_mkPos) > 1.0f || kind != g_air_mkKind) {
@@ -1405,6 +1444,7 @@ static void air_tick(void) {
         rb = air_veh_rb(c.veh);                                      /* игра (Entity.SetPosition по приказу сервера) могла вернуть машине обычную физику — снова выключаем */
         if (rb && air_get_bool(rb, "get_isKinematic", 1) == 0) { air_vflags(c.veh, 1); g_air_vfix++; dlog("air: игра вернула машине физику — выключил снова"); }
     }
+    if (g_air_mode == 1 && g_air_hOk) air_head_check(c.veh, air_now_ns() / 1000000);   /* дошёл ли до игры наш поворот с прошлого кадра */
     now = air_now_ns();
     dt = (float)((double)(now - g_air_tPrev) / 1e9);
     g_air_tPrev = now;
@@ -1505,6 +1545,7 @@ static void air_usage(void) {
     chat_usage("В машине: W/газ — вперёд, S/тормоз — назад, руль (A/D или стик) — вбок, всё относительно камеры. Вверх/вниз: зажмите РУЧНИК (пробел) — тогда газ летит вверх, тормоз вниз; или взгляд камерой в 3d, или /air up|down N");
     chat_usage("Вышли из машины в полёте — она встанет на землю, вы продолжите лететь пешком");
     chat_usage("/air mark — автолёт к красной метке (маркер сервера или метка карты); появилась/сменилась — летит к новой. /air mark gps|cp — только карта|только маркер, /air mark off — выключить");
+    chat_usage("/air exam go [chat] — СЕЙЧАС ЕХАТЬ ЭКЗАМЕН: за рулём, одной командой (полёт + маркер сервера + режим экзамена + остановки у знаков STOP; chat — ещё и перехват чата). /air exam stop — остановить и отпустить машину");
     chat_usage("/air exam [on|off|auto] — режим автошколы для /air mark cp: курс машины по дороге и остановки у знаков STOP (авто — включается на старте экзамена);  /air exam speed N — скорость экзамена, м/с (3…30, по умолчанию 14)");
     chat_usage("/air face [on|off] — в машине нос по направлению полёта (по умолчанию ВКЛ; выкл — машина летит боком с прежним курсом)");
     chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
@@ -1527,6 +1568,10 @@ static void air_status(void) {
         b_init(&b, m, sizeof m); b_s(&b, "  кнопки HUD машины W S A D пробел: ");
         if (g_air_vkFound == 1) { b_int(&b, g_air_vkeys.w); b_ch(&b, ' '); b_int(&b, g_air_vkeys.s); b_ch(&b, ' '); b_int(&b, g_air_vkeys.a); b_ch(&b, ' '); b_int(&b, g_air_vkeys.d); b_ch(&b, ' '); b_int(&b, g_air_vkeys.sp); b_s(&b, " — зажмите газ: W станет 1"); }
         else b_s(&b, "НЕ НАЙДЕНЫ (список экранных контролов — в konstt.log, строки «экранный контрол»)");
+        chat_say(m);
+        b_init(&b, m, sizeof m); b_s(&b, "  курс машины: "); b_s(&b, g_air_exOn ? "ЭКЗАМЕН" : g_air_face ? "обычный полёт, нос по ходу" : "не меняю (face выкл)");
+        if (g_air_hOk) { b_s(&b, ", поставил (x z) "); b_fix(&b, g_air_hx, 2); b_ch(&b, ' '); b_fix(&b, g_air_hz, 2); b_s(&b, g_air_hdot > 1.5f ? ", проверка: не читается" : g_air_hdot >= 0.9f ? ", проверка: держится" : ", проверка: НЕ ДЕРЖИТСЯ (игра перезаписывает поворот, см. konstt.log)"); }
+        else b_s(&b, ", ещё не ставил (нет движения)");
         chat_say(m);
         b_init(&b, m, sizeof m); b_s(&b, "  физика машины, руль/газ/тормоз: ");
         if (g_air_vinOk == 1) { b_fix(&b, g_air_vin[0], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[1], 2); b_ch(&b, ' '); b_fix(&b, g_air_vin[2], 2); }
@@ -1557,6 +1602,30 @@ static void air_status(void) {
     b_s(&b, ", прыжок "); b_s(&b, g_air_kj ? "НАЖАТ" : "нет");
     b_s(&b, ", присед "); b_s(&b, g_air_kc ? "НАЖАТ" : "нет"); b_s(&b, " — зажмите прыжок: должно стать «НАЖАТ»");
     chat_say(m);
+}
+/* /air exam go — «ехать экзамен» одной командой: за рулём → полёт (без подъёма над дорогой) + слежка только за маркером сервера + режим экзамена включён принудительно
+   (не ждём, «увидим» ли старт экзамена: можно включать и посреди экзамена). withChat — заодно поставить перехват чата (запасной способ встать по «Здесь аккуратней») */
+static void air_exam_go(int withChat) {
+    AirCtx c; char m[200]; Buf b;
+    if (!air_ctx(&c, 0)) return;
+    if (!c.veh) { chat_say("/air exam go: вы не в машине — сядьте за руль экзаменационной машины и повторите команду"); return; }
+    if (!c.drv) { chat_say("/air exam go: вы пассажир — машиной правит водитель. Нужно быть за рулём"); return; }
+    if (withChat && g_airc_state != 1) {
+        if (airc_install()) chat_say("/air exam go: перехват чата включён — встану и по «Здесь аккуратней»");
+        else { b_init(&b, m, sizeof m); b_s(&b, "/air exam go: перехват чата не вышел (еду по таблице знаков) — "); b_s(&b, g_airc_why); chat_say(m); }
+    }
+    if (!g_air_on && !air_enter(0.0f, NULL)) return;                 /* полёт выключен — включаем; подъём 0 м: экзамен проходит на уровне дороги */
+    g_air_exMode = 1;                                                /* режим экзамена — принудительно, пока не /air exam stop|off|auto */
+    g_air_mark = 3; g_air_mkHave = 0; g_air_mkArrived = 0; g_air_mkT = 0;   /* только маркер сервера (чекпоинт экзамена) */
+    if (!g_air_exOn) air_ex_start("команда /air exam go", air_now_ns() / 1000000);
+    chat_say("/air exam go: поехали — лечу по маркерам экзамена, у знаков STOP встаю. Перехват — джойстик/газ. Остановить и отпустить машину: /air exam stop");
+}
+/* /air exam stop — выключить экзамен и автолёт, вернуть машине физику (машина встанет на землю, если зависла) */
+static void air_exam_stop(void) {
+    int wasOn = g_air_on;
+    g_air_mark = 0; g_air_mkHave = 0; g_air_mkArrived = 0; g_air_exMode = 0; air_ex_end(NULL);
+    if (wasOn) air_exit("/air exam stop", 0);
+    chat_say("/air exam stop: экзамен и автолёт выключены, машина свободна (режим экзамена — авто)");
 }
 static void native_air_cmd(void* self, void* args, void* mi) {
     char tok[6][32]; int nt; char m[240]; Buf b; float v;
@@ -1626,13 +1695,18 @@ static void native_air_cmd(void* self, void* args, void* mi) {
                : "/air mark: слежу за красной меткой (маркер сервера, иначе метка карты). Появится/сменится — полечу к ней. Джойстик — перехват; /air mark off — выключить");
         return;
     }
+    if (seq(tok[0], "go") || seq(tok[0], "поехали")) { air_exam_go(nt >= 2 && (seq(tok[1], "chat") || seq(tok[1], "чат"))); return; }   /* то же, что /air exam go */
     if (seq(tok[0], "exam") || seq(tok[0], "экзамен") || seq(tok[0], "автошкола")) {
-        if (nt >= 2 && (seq(tok[1], "on") || seq(tok[1], "вкл"))) {
+        if (nt >= 2 && (seq(tok[1], "go") || seq(tok[1], "start") || seq(tok[1], "старт") || seq(tok[1], "поехали"))) {
+            air_exam_go(nt >= 3 && (seq(tok[2], "chat") || seq(tok[2], "чат")));
+        } else if (nt >= 2 && (seq(tok[1], "stop") || seq(tok[1], "стоп") || seq(tok[1], "конец"))) {
+            air_exam_stop();
+        } else if (nt >= 2 && (seq(tok[1], "on") || seq(tok[1], "вкл"))) {
             g_air_exMode = 1; chat_say("/air exam: режим экзамена включён (работает, когда летите на машине к маркеру сервера: /air mark cp). Выключить: /air exam off");
         } else if (nt >= 2 && (seq(tok[1], "off") || seq(tok[1], "выкл") || seq(tok[1], "0"))) {
             g_air_exMode = 2; air_ex_end(NULL); chat_say("/air exam: выключен — автолёт к метке обычный (прямо, без остановок у знаков). Вернуть: /air exam auto");
         } else if (nt >= 2 && (seq(tok[1], "auto") || seq(tok[1], "авто"))) {
-            g_air_exMode = 0; chat_say("/air exam: авто — включится сам, когда маркер сервера окажется стартом экзамена в автошколе");
+            g_air_exMode = 0; chat_say("/air exam: авто — включится сам: на старте экзамена, а если /air mark cp включили позже — как только маркер сервера окажется у знака STOP (или знак рядом)");
         } else if (nt >= 2 && (seq(tok[1], "chat") || seq(tok[1], "чат"))) {
             if (nt >= 3 && (seq(tok[2], "on") || seq(tok[2], "вкл"))) {
                 if (airc_install()) chat_say("/air exam chat: перехват чата включён — встану по «Здесь аккуратней», поеду после «Отлично». Снять: /air exam chat off");
@@ -1652,7 +1726,7 @@ static void native_air_cmd(void* self, void* args, void* mi) {
             b_init(&b, m, sizeof m); b_s(&b, "/air exam: скорость экзамена "); b_fix(&b, v, 1); b_s(&b, " м/с (≈ "); b_fix(&b, v * 3.6f, 0); b_s(&b, " км/ч)"); chat_say(m);
         } else {
             b_init(&b, m, sizeof m); b_s(&b, "/air exam: "); b_s(&b, g_air_exMode == 1 ? "включён вручную" : g_air_exMode == 2 ? "выключен" : "авто"); b_s(&b, g_air_exOn ? ", сейчас экзамен" : ", сейчас не экзамен");
-            b_s(&b, ". /air exam on|off|auto, /air exam speed N, /air exam chat on|off"); chat_say(m);
+            b_s(&b, ". /air exam go [chat] — поехали, /air exam stop — стоп, /air exam on|off|auto, /air exam speed N, /air exam chat on|off"); chat_say(m);
         }
         return;
     }
