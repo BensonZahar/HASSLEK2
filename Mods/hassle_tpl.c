@@ -36,8 +36,13 @@
  *                        Номер никуда не переносит; чтобы оказаться внутри, нужно оказаться в его координатах. Поэтому «/tpl save» запоминает
  *                        точку ВМЕСТЕ с номером интерьера, а «/tpl go» переносит и включает тот же интерьер. Если застряла тёмная
  *                        «комнатная» картинка на улице — «/tpl int 0».
- *   /tpl gps             телепорт на метку, поставленную на карте (/gps → точка/маршрут). Высота — по земле. Метки нет, а сервер показал маркер (чекпоинт) — на маркер.
- *                        Синонимы: /tpl метка, /tpl гпс, /tpl mark, /tpl wp
+ *   /tpl gps             ПЕРЕКЛЮЧАТЕЛЬ окна «телепортироваться на метку?»: пока включён, при каждой НОВОЙ метке GPS (тап по карте или «выбрать в GPS») на экране появляется
+ *                        окно «Подтверждение — Вы действительно хотите телепортироваться в данное место?» Да / Нет (как у администраторов на сервере, gps.pwn).
+ *                        «Да» — телепорт на метку, «Нет» — закрыть. Режим сохраняется в HLOG/tpl_gps.txt и после перезапуска игры включается сам
+ *                        (окно заработает после первой команды /tpl — см. описание ниже). Метка, стоявшая до включения, окна не вызывает.
+ *   /tpl gps on | off    включить / выключить явно;  /tpl gps status — состояние
+ *   /tpl gps go          телепорт на метку, поставленную на карте, СЕЙЧАС (раньше это делал просто «/tpl gps»). Высота — по земле. Метки нет, а сервер показал маркер
+ *                        (чекпоинт) — на маркер.   Синонимы слова gps: /tpl метка, /tpl гпс, /tpl mark, /tpl wp
  *   /tpl pick            пикапы и маркеры РЯДОМ с вами (их присылает сервер, и клиент держит только тех, что в зоне стрима) — список по расстоянию, у каждого
  *                        свой номер 1, 2, 3 … (ID пикапа, расстояние, название — если рядом есть 3D-подпись, и координаты). Синонимы: /tpl пикап, /tpl маркеры, /tpl pk
  *                        В строке: номер в списке (для «pick N»), ID пикапа, [модель N] («?» — не прочиталась, причина в konstt.log), расстояние, 3D-подпись рядом и координаты.
@@ -145,6 +150,10 @@ enum { TPL_L = 0, TPL_R = 1, TPL_F = 2, TPL_B = 3 };
 static const char* const g_tpl_sideName[4] = { "влево", "вправо", "вперёд", "назад" };
 
 static volatile int g_tpl_alt;                           /* 1 — двигать через движение персонажа (запасной способ) */
+static volatile int g_tpl_gpsAsk;                        /* 1 — «/tpl gps on»: на новую метку GPS показываем окно «телепортироваться?» (хранится в tpl_gps.txt) */
+#define TPL_GPS_FILE "tpl_gps.txt"
+#define TPLG_TICK_US 250000                              /* период проверки метки, когда других наблюдателей нет */
+static void tplg_tick(void);                             /* главный поток, из tplw_tick (определена рядом с /tpl gps) */
 static int g_tpl_modId = -1;                             /* номер в реестре модов (экран загрузки) */
 
 /* ───────────── мелкие помощники ───────────── */
@@ -529,14 +538,23 @@ static void tplw_post(void) {
 static void* tplw_worker(void* arg) {
     (void)arg;
     for (;;) {
-        if (!__atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE) && !__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
+        int busy = __atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE);
+        if (!busy && !__atomic_load_n(&g_tpl_gpsAsk, __ATOMIC_ACQUIRE)) { usleep(100000); continue; }
         if (!g_tplw_pending || gh_now_ms() - g_tplw_pendT > 1000) {      /* прошлый тик не дошёл (игра на паузе/грузится) — шлём новый */
             g_tplw_pending = 1; g_tplw_pendT = gh_now_ms();
             tplw_post();
         }
-        usleep(TPLW_TICK_US);
+        usleep(busy ? TPLW_TICK_US : TPLG_TICK_US);                      /* только окно метки GPS — тик реже (250 мс) */
     }
     return NULL;
+}
+/* поток тиков запущен (создаём при первой необходимости). 1 — работает */
+static int tpl_worker_ensure(void) {
+    unsigned long t = 0;
+    if (g_tplw_thread) return 1;
+    if (pthread_create(&t, NULL, tplw_worker, NULL) != 0) { dlog("/tpl: не создался поток тиков"); return 0; }
+    g_tplw_thread = 1;
+    return 1;
 }
 /* ───────────── «как на ровном» после телепорта (так же, как /air stand) ─────────────
    После телепорта персонаж на миг в воздухе (высота точки выше пола) — включается способность Fall: клип падения, руки в стороны.
@@ -693,6 +711,7 @@ static void tplu_tick(long long now) {
 static void tplw_tick(void) {
     TplCtx c; float p[3]; long long now = gh_now_ms(); int st; Buf b; char msg[300];
     g_tplw_pending = 0;
+    if (__atomic_load_n(&g_tpl_gpsAsk, __ATOMIC_ACQUIRE)) tplg_tick();         /* окно «телепорт на метку GPS?» */
     if (__atomic_load_n(&g_tplf_on, __ATOMIC_ACQUIRE)) tplf_tick(now);
     if (__atomic_load_n(&g_tplu_on, __ATOMIC_ACQUIRE)) tplu_tick(now);
     st = __atomic_load_n(&g_tplw_on, __ATOMIC_ACQUIRE);
@@ -1046,6 +1065,7 @@ static void tpl_status_extra(void) {
     b_s(&b, g_gh_state ? ", перехват стоит" : ", перехват не поставлен");
     b_s(&b, ", пакетов не отправлено: "); b_int(&b, (long)g_gh_hits);
     chat_say(m);
+    chat_say(g_tpl_gpsAsk ? "Окно при установке метки GPS: ВКЛ (/tpl gps off — выключить)" : "Окно при установке метки GPS: выкл (/tpl gps on — включить)");
 }
 
 /* «/tpl int N»: сменить интерьер на N (только номер). have=0 — номер не указан, показать текущий */
@@ -1139,6 +1159,13 @@ static int tpl_gword(const char* t) {
     if (seq(t, "log") || seq(t, "лог") || seq(t, "count") || seq(t, "счёт")) return 6;
     return 0;
 }
+/* подслово после «gps»: 1 on, 2 off, 3 go (телепорт прямо сейчас), 0 — не оно (status разбирается общим словом) */
+static int tpl_gpsword(const char* t) {
+    if (seq(t, "on") || seq(t, "вкл") || seq(t, "включить") || seq(t, "1")) return 1;
+    if (seq(t, "off") || seq(t, "выкл") || seq(t, "выключить") || seq(t, "0")) return 2;
+    if (seq(t, "go") || seq(t, "now") || seq(t, "tp") || seq(t, "тп") || seq(t, "иди") || seq(t, "сейчас") || seq(t, "телепорт")) return 3;
+    return 0;
+}
 /* вся строка — число («2», «2.5», «2,5»)? */
 static int tpl_num(const char* t, float* out) {
     float v = 0.0f, f = 0.1f; int k = 0, dot = 0, digits = 0;
@@ -1192,6 +1219,7 @@ static void tpl_token(const char* tok, TplArgs* a) {
         return;
     }
     if (a->mode == 7 || a->mode == 13) { int g = tpl_gword(tok); if (g) { a->gsub = g; return; } }     /* после «ghost»: on / off / back / unhook / tap */
+    if (a->mode == 9) { int g = tpl_gpsword(tok); if (g) { a->gsub = g; return; } }                    /* после «gps»: on / off / go */
     if (a->mode == 8 && tpl_num(tok, &v)) { a->iid = (int)(v + 0.5f); a->iidSet = 1; return; }   /* после «int»: номер (0 — валидный, не подрезаем) */
     if (a->mode == 2 && tpl_snum(tok, &v)) {                       /* после «to» числа — это координаты (с минусом можно) */
         if (a->nc < 3) a->c[a->nc++] = v; else a->bad = 1;
@@ -1822,6 +1850,158 @@ static void tpl_cmd_gps(void) {
     { char lg[160]; Buf x; b_init(&x, lg, sizeof lg); b_s(&x, "tpl: gps: m_NavigationPoint = "); tpl_b_xyz(&x, np); b_s(&x, ", активна "); b_int(&x, act); dlog(lg); }
 }
 
+/* ───────────── «/tpl gps»: окно «телепортироваться на метку?» ─────────────
+   Как на сервере (gps.pwn: EnablePlayerGPS показывает DIALOG_TYPE_TELEPORT_GPS «Подтверждение — Вы действительно хотите телепортироваться в данное место?» Да/Нет;
+   его зовут и «поставить метку на карте» — GPS_OnPlayerSetPoint, и «выбрать в GPS» — GPS_OnPlayerGetDirection), только на клиенте и у любого игрока.
+   Что видит клиент: и тап по карте, и выбор в списке GPS кончаются тем, что JS зовёт getNavigationPath(x, y, z), а MiniMap.GetNavigationPath пишет
+   m_NavigationPoint (+ m_IsNavigationActive) — то же поле читает «/tpl gps go». Пока режим включён, каждый тик (250 мс, главный поток) сравнивает поле с прошлым:
+   метка появилась (была выключена) или прыгнула дальше TPLG_JUMP м по горизонтали — это новая метка, показываем окно. Метку, что уже стояла в момент включения (или
+   в момент первого тика после запуска игры), не трогаем — окно только на НОВУЮ. Тот же getNavigationPath зовётся каждые 500 мс, пока идёт маршрут (startNavigationInterval),
+   но точка при этом та же — повторных окон нет; после показа TPLG_QUIET_MS молчим, чтобы метка, которая едет сама (отслеживание машины, такси), не засыпала окнами.
+   Окно — HTML в веб-интерфейсе игры (WebViewSystem.ExecuteJavaScript, как у /rec и /shaxta menu), стиль как у модальных окон игры; «Да» зовёт «/tpl gps go»
+   через window.sendChatInput (то есть тот же телепорт, что и командой), «Нет» / 30 секунд — закрывает. Режим хранится в HLOG/tpl_gps.txt («1»/«0») и после перезапуска игры
+   включается сам. ВАЖНО: тики идут через UnitySynchronizationContext главного потока, а мод получает его только из обработчика команды (mt_capture_ctx) —
+   поэтому после ПЕРЕЗАПУСКА игры окно заработает после первой команды /tpl (любой, хоть «/tpl gps status»); при реконнекте внутри одного запуска ничего вводить не нужно. */
+#define TPLG_JUMP 3.0f                                   /* м по горизонтали: сдвиг метки между тиками, который считается новой меткой */
+#define TPLG_QUIET_MS 2500LL                             /* после показа окна новое не показываем столько мс */
+#define TPLG_DLG_ID "hm-tpl-dlg"
+static int g_tplg_init, g_tplg_was, g_tplg_jsErr;        /* init — прошлое состояние уже прочитано; was — метка была активна; jsErr — сколько раз писали про ошибку JS */
+static float g_tplg_prev[3];
+static long long g_tplg_shownT = -1000000LL;             /* когда показали последнее окно (мс); изначально «давно» */
+
+/* файл рядом с tpl_points.txt (папка журнала HLOG). 0 — журнал ещё не открыт */
+static int tpl_cfg_path(char* out, int cap, const char* name) {
+    int i, last = -1; Buf b;
+    if (!g_flog[0]) return 0;
+    for (i = 0; g_flog[i]; i++) if (g_flog[i] == '/') last = i;
+    if (last < 0 || last + (int)slen(name) + 8 > cap) return 0;
+    b_init(&b, out, (unsigned)cap);
+    for (i = 0; i <= last; i++) b_ch(&b, g_flog[i]);
+    b_s(&b, name);
+    return 1;
+}
+static int tpl_gps_save(void) {                          /* 1 — записалось */
+    char path[320];
+    if (!tpl_cfg_path(path, sizeof path, TPL_GPS_FILE)) return 0;
+    return tpl_write_all(path, g_tpl_gpsAsk ? "1\n" : "0\n", 2);
+}
+/* читаем файл в g_tpl_gpsAsk. 1 — путь известен (файла может и не быть — тогда выключено), 0 — HLOG ещё нет, попробуйте позже */
+static int tpl_gps_load(void) {
+    char path[320], buf[16]; int fd; long r;
+    if (!tpl_cfg_path(path, sizeof path, TPL_GPS_FILE)) return 0;
+    fd = open(path, 0);
+    if (fd < 0) return 1;
+    r = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (r > 0) { int i; for (i = 0; i < r && (buf[i] == ' ' || buf[i] == '\r' || buf[i] == '\n'); i++) {} __atomic_store_n(&g_tpl_gpsAsk, (i < r && buf[i] == '1') ? 1 : 0, __ATOMIC_RELEASE); }
+    return 1;
+}
+/* WebViewSystem.ExecuteJavaScript(js) — только из главного потока (как в shaxta/rec). 1 — вызвалось без исключения */
+static int tpl_js_run(const char* js) {
+    void *k, *m, *exc = NULL, *args[1]; char et[200];
+    if (!g_safe || !il2cpp_light() || !g_img) return 0;
+    ensure_attached();
+    k = A.class_from_name(g_img, "Hassle.WebView", "WebViewSystem");
+    m = k ? find_method(k, "ExecuteJavaScript", 1) : NULL;
+    if (!m) { if (g_tplg_jsErr < 4) { g_tplg_jsErr++; dlog("tpl: gps: нет WebViewSystem.ExecuteJavaScript(string)"); } return 0; }
+    args[0] = A.string_new(js);
+    if (!args[0]) return 0;
+    A.runtime_invoke(m, NULL, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); if (g_tplg_jsErr < 4) { g_tplg_jsErr++; dlog2("tpl: gps: ExecuteJavaScript бросил исключение: ", et); } return 0; }
+    return 1;
+}
+/* окно: dist — метров до метки по горизонтали (0 — не знаем, строку не показываем). Только одинарные кавычки — чтобы не экранировать их в C.
+   Повторный вызов сносит старое окно (новая метка заменяет вопрос про прежнюю). */
+static int tplg_dialog(int dist) {
+    char js[3600]; Buf b;
+    b_init(&b, js, sizeof js);
+    b_s(&b,
+        "(function(d){try{var w=window,doc=document,id='" TPLG_DLG_ID "',old=doc.getElementById(id);"
+        "if(old&&old.parentNode)old.parentNode.removeChild(old);"
+        "if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}"
+        "function el(t,css,txt){var e=doc.createElement(t);if(css)e.style.cssText=css;if(txt)e.textContent=txt;return e;}"
+        "var root=el('div','position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:2147483000;display:flex;align-items:center;justify-content:center;"
+        "background:rgba(1,1,6,.6);pointer-events:auto;font-family:Open Sans,sans-serif');root.id=id;"
+        "var box=el('div','min-width:46vh;max-width:80vw;background:rgba(20,20,25,.95);border:.19vh solid rgba(255,255,255,.08);border-radius:.74vh;"
+        "padding:2.4vh 2.6vh;box-sizing:border-box;color:#fff;text-align:center');"
+        "box.appendChild(el('div','font-weight:700;font-size:2.3vh;color:#ffcd00;margin-bottom:1.4vh','Подтверждение'));"
+        "box.appendChild(el('div','font-weight:600;font-size:1.9vh;line-height:1.35;margin-bottom:1vh','Вы действительно хотите телепортироваться в данное место?'));"
+        "if(d>0)box.appendChild(el('div','font-size:1.55vh;color:#b8b8c0;margin-bottom:1vh','До метки: около '+d+' м'));"
+        "var row=el('div','display:flex;justify-content:center;margin-top:1.2vh');"
+        "var bs='min-width:15vh;padding:1.2vh 2vh;border-radius:.74vh;font-weight:700;font-size:1.9vh;color:#fff;cursor:pointer;margin:0 .8vh;';"
+        "var yes=el('div',bs+'background:#0a9947','Да'),no=el('div',bs+'background:rgba(255,255,255,.14)','Нет');"
+        "function close(){if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}if(root.parentNode)root.parentNode.removeChild(root);}"
+        "yes.addEventListener('click',function(e){e.stopPropagation();close();try{w.sendChatInput('/tpl gps go');}catch(x){}});"
+        "no.addEventListener('click',function(e){e.stopPropagation();close();});"
+        "row.appendChild(yes);row.appendChild(no);box.appendChild(row);root.appendChild(box);"
+        "(doc.body||doc.documentElement).appendChild(root);w.__hmTplDlgT=setTimeout(close,30000);}catch(x){}})(");
+    b_int(&b, dist > 0 ? dist : 0);
+    b_s(&b, ");");
+    return tpl_js_run(js);
+}
+static void tplg_dialog_close(void) {                    /* убрать окно (режим выключили) */
+    tpl_js_run("(function(){try{var e=document.getElementById('" TPLG_DLG_ID "');if(e&&e.parentNode)e.parentNode.removeChild(e);"
+               "if(window.__hmTplDlgT){clearTimeout(window.__hmTplDlgT);window.__hmTplDlgT=0;}}catch(x){}})();");
+}
+/* Главный поток, по тику (только когда режим включён) */
+static void tplg_tick(void) {
+    void* mm; float np[3], me[3]; int act = -1, nz, active, jump = 0, haveMe = 0; long long now = gh_now_ms(); TplCtx c;
+    mm = tpl_minimap();
+    if (!mm || !tpl_nav_point(mm, np, &act)) return;
+    nz = (np[0] != 0.0f || np[1] != 0.0f || np[2] != 0.0f);
+    active = nz && act != 0;                                         /* поля m_IsNavigationActive нет (act = -1) — считаем по координатам */
+    if (!g_tplg_init) {                                              /* первое чтение: что уже стоит, то не «новая» метка */
+        g_tplg_init = 1; g_tplg_was = active; g_tplg_prev[0] = np[0]; g_tplg_prev[1] = np[1]; g_tplg_prev[2] = np[2];
+        dlog(active ? "tpl: gps: окно включено, метка уже стоит — ждём новую" : "tpl: gps: окно включено, метки нет — ждём");
+        return;
+    }
+    if (active) {
+        if (!g_tplg_was) jump = 1;                                   /* была выключена, появилась */
+        else if (tplw_dxz(np, g_tplg_prev) > TPLG_JUMP) jump = 1;    /* переставили */
+    }
+    if (jump && now - g_tplg_shownT < TPLG_QUIET_MS) return;         /* рано: состояние не обновляем — следующий тик увидит её снова */
+    g_tplg_was = active; g_tplg_prev[0] = np[0]; g_tplg_prev[1] = np[1]; g_tplg_prev[2] = np[2];
+    if (!jump) return;
+    g_tplg_shownT = now;
+    if (tpl_ctx_q(&c, 0, 1) && tpl_cur_pos(&c, me) == 1) haveMe = 1;
+    {
+        int dist = haveMe ? (int)(tplw_dxz(np, me) + 0.5f) : 0;
+        char lg[160]; Buf x; b_init(&x, lg, sizeof lg);
+        b_s(&x, "tpl: gps: новая метка "); tpl_b_xyz(&x, np); b_s(&x, ", до неё м "); b_int(&x, dist); b_s(&x, ", окно ");
+        if (tplg_dialog(dist)) b_s(&x, "показано");
+        else {                                                       /* JS не прошёл — хотя бы подсказка в чат */
+            b_s(&x, "НЕ показано (JS)");
+            chat_say("Метка GPS поставлена. Телепорт на неё: /tpl gps go");
+        }
+        dlog(lg);
+    }
+}
+static void tpl_gps_say(int saved) {
+    chat_say(g_tpl_gpsAsk ? "Окно «телепортироваться на метку?» при установке метки GPS: ВКЛ (сохраняется после перезапуска). Сейчас на метку: /tpl gps go"
+                          : "Окно «телепортироваться на метку?» при установке метки GPS: ВЫКЛ. Сейчас на метку: /tpl gps go");
+    if (!saved) chat_usage("Не удалось записать tpl_gps.txt — после перезапуска игры режим придётся включить заново (подробности: konstt.log)");
+}
+/* «/tpl gps [on|off|go|status]»: без слова — переключить режим «окно при новой метке GPS»; on / off — включить / выключить; go — телепорт на метку сейчас */
+static void tpl_cmd_gps_mode(int sub, int status) {
+    int want, saved;
+    if (sub == 3) { tpl_cmd_gps(); return; }
+    if (status) {
+        tpl_gps_say(1);
+        if (g_tpl_gpsAsk && (!g_mt_ctx || !g_mt_postM || !g_mt_kCb)) chat_usage("Нет канала в главный поток — окно не появится (подробности: konstt.log)");
+        return;
+    }
+    want = sub == 1 ? 1 : (sub == 2 ? 0 : !g_tpl_gpsAsk);
+    if (want) {
+        if (!tpl_worker_ensure() || !g_mt_ctx || !g_mt_postM || !g_mt_kCb) { chat_say("/tpl gps: нет канала в главный поток — окно показать не смогу (подробности: konstt.log)"); return; }
+        g_tplg_init = 0;                                             /* метка, что стоит сейчас, окна не вызовет — только новая */
+    }
+    __atomic_store_n(&g_tpl_gpsAsk, want, __ATOMIC_RELEASE);
+    if (!want) tplg_dialog_close();
+    saved = tpl_gps_save();
+    dlog2("tpl: gps: режим окна ", want ? "ВКЛ" : "ВЫКЛ");
+    tpl_gps_say(saved);
+}
+
 /* ───────────── команда ───────────── */
 static void tpl_usage(void) {
     chat_usage("Используйте: /tpl [влево|вправо|вперёд|назад] [метры] — например «/tpl назад 2», «/tpl вправо 3», «/tpl 4» (по умолчанию влево 1.5 м)");
@@ -1830,7 +2010,7 @@ static void tpl_usage(void) {
     chat_usage("/tpl pick N use (или /tpl use N) — войти в пикап №N, не двигаясь с места (стойте рядом, до ~5 м): клиент сам шлёт серверу вход в пикап. Раздевалка: /dress use");
     chat_usage("В машине сервер может вернуть вас назад после прыжка: /tpl keep log — проверить, приходит ли от него SetVehiclePos;  /tpl keep on [сек] — не давать вернуть машину;  /tpl keep off");
     chat_usage("Точки: /tpl save имя — запомнить место;  /tpl go имя (или просто /tpl имя) — вернуться;  /tpl list — список;  /tpl del имя — удалить");
-    chat_usage("/tpl gps — телепорт на метку, поставленную на карте (/gps);  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место;  /tpl depth [м] — глубина нырка (по умолчанию 1)");
+    chat_usage("/tpl gps — включить/выключить окно «телепортироваться на метку?» при установке метки в GPS (сохраняется после перезапуска; on / off — явно);  /tpl gps go — телепорт на метку сейчас;  /tpl pick — список пикапов и маркеров рядом с номерами (с названием, если у них есть 3D-подпись);  /tpl pick N — телепорт к номеру N;  /tpl pick N under [сек] — нырок под пол: пикап срабатывает, а вы возвращаетесь на место;  /tpl depth [м] — глубина нырка (по умолчанию 1)");
 }
 /* Вызывается игрой в главном потоке при вводе /tpl [аргументы] */
 static void native_tpl_cmd(void* self, void* args, void* mi) {
@@ -1853,6 +2033,7 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         }
     }
     if (a.bad || a.help) { tpl_usage(); return; }
+    if (a.mode == 9) { tpl_cmd_gps_mode(a.gsub, a.status); return; }          /* gps [on|off|go|status] — раньше общего «status» и «alt» */
     if (a.mode == 13) { tpl_cmd_keep(a.gsub, a.numSet ? a.rawNum : -1.0f); return; }       /* число после «keep on» — секунды окна */
     if (a.alt) {
         g_tpl_alt = !g_tpl_alt;
@@ -1877,7 +2058,6 @@ static void native_tpl_cmd(void* self, void* args, void* mi) {
         tpl_cmd_int(id, have);
         return;
     }
-    if (a.mode == 9) { tpl_cmd_gps(); return; }
     if (a.mode == 12) { tpl_cmd_up(); return; }
     if (a.under && a.mode != 10) { chat_usage("Нырок под пол — только к пикапу: /tpl pick N under [секунды]  (сначала /tpl pick — список с номерами)"); return; }
     if (a.mode == 11) { tpl_cmd_depth(a.numSet ? a.rawNum : -1.0f); return; }
@@ -1898,7 +2078,9 @@ static void* tpl_main(void* arg) {
     (void)arg;
     if (!hm_cmd_install("tpl", native_tpl_cmd)) return NULL;     /* konstt_off — мод выключен; иначе ждём игру и регистрируем /tpl */
     hm_mod_ready(g_tpl_modId);
-    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | keep [on|log|off] | int N | gps | pick [N] [under [сек]] | depth [м]");
+    { int i; for (i = 0; i < 40 && !tpl_gps_load(); i++) usleep(500000); }       /* HLOG появляется не сразу; режим окна метки GPS — из tpl_gps.txt */
+    if (g_tpl_gpsAsk && tpl_worker_ensure()) dlog("tpl: gps: режим окна метки включён (tpl_gps.txt); окно заработает после первой команды /tpl — до неё у мода нет главного потока");
+    dlog("tpl: мод загружен, команда /tpl [сторона] [метры] | pos | to X Y Z | save/go/list/del имя | ghost [on|off|back|tap] | keep [on|log|off] | int N | gps [on|off|go] | pick [N] [under [сек]] | depth [м]");
     return NULL;
 }
 #ifndef KONSTT_TEST
