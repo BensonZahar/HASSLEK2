@@ -1863,7 +1863,7 @@ static void tpl_cmd_gps(void) {
    включается сам. ВАЖНО: тики идут через UnitySynchronizationContext главного потока, а мод получает его только из обработчика команды (mt_capture_ctx) —
    поэтому после ПЕРЕЗАПУСКА игры окно заработает после первой команды /tpl (любой, хоть «/tpl gps status»); при реконнекте внутри одного запуска ничего вводить не нужно. */
 #define TPLG_JUMP 3.0f                                   /* м по горизонтали: сдвиг метки между тиками, который считается новой меткой */
-#define TPLG_QUIET_MS 2500LL                             /* после показа окна новое не показываем столько мс */
+#define TPLG_QUIET_MS 6000LL                             /* после показа окна новый сдвиг метки — это УТОЧНЕНИЕ той же метки (клиент пишет точку тапа, через 2–3 с сервер присылает свою, на 4–18 м в стороне — по логам), второй раз не спрашиваем */
 #define TPLG_DLG_ID "hm-tpl-dlg"
 static int g_tplg_init, g_tplg_was, g_tplg_jsErr;        /* init — прошлое состояние уже прочитано; was — метка была активна; jsErr — сколько раз писали про ошибку JS */
 static float g_tplg_prev[3];
@@ -1946,13 +1946,13 @@ static const char g_tplg_hook_js[] =
     "if(!w.__hmTplSce&&typeof w.sendClientEvent==='function'){w.__hmTplSce=1;var os=w.sendClientEvent;"
     "w.sendClientEvent=function(){var a=arguments;try{if(a[1]==='OnDialogResponse'&&a[2]===NID){var c=w.__hmTplCmd;w.__hmTplCmd=null;"
     "if(c&&a[3]==1){try{w.sendChatInput(c);}catch(x){}}return;}}catch(x){}return os.apply(this,a);};}"
-    "w.__hmTplAsk=function(d,cmd){var n=Date.now();if(w.__hmTplCmd&&isOurs()&&n-(w.__hmTplLastT||0)<2000)return;w.__hmTplLastT=n;rmHtml();"
+    "w.__hmTplAsk=function(d,cmd){var n=Date.now();if(n-(w.__hmTplLastT||0)<6000){if(w.__hmTplCmd&&isOurs())w.__hmTplCmd=cmd;return;}w.__hmTplLastT=n;rmHtml();"
     "try{var A=w.App;if(!A||typeof A.addDialogInQueue!=='function')throw 0;"
     "var idx=A.dialogIdx;w.__hmTplCmd=cmd;"
     "A.addDialogInQueue(JSON.stringify([NID,0,'Подтверждение',d>0?('До метки: около '+d+' м'):'','Да','Нет',false,false]),"
     "'Вы действительно хотите телепортироваться в данное место?',false);"
-    "w.__hmTplIdx=idx;var tk=idx;setTimeout(function(){if(w.__hmTplCmd===cmd&&w.__hmTplIdx===tk)w.__hmTplClose();},30000);"
-    "}catch(e){w.__hmTplCmd=null;try{htmlAsk(d,cmd);}catch(x){}}};}"
+    "w.__hmTplIdx=idx;try{w.sendChatInput('/jlog tpldlg native');}catch(x){}var tk=idx;setTimeout(function(){if(w.__hmTplCmd===cmd&&w.__hmTplIdx===tk)w.__hmTplClose();},30000);"
+    "}catch(e){w.__hmTplCmd=null;try{w.sendChatInput('/jlog tpldlg html-fallback '+String(e));}catch(x){}try{htmlAsk(d,cmd);}catch(x){}}};}"
     "if(w.__hmTplHook||typeof w.getRoute!=='function')return;w.__hmTplHook=1;"
     "var og=w.getRoute,lx=1e9,ly=1e9,lt=0;"
     "w.getRoute=function(a,b,c,x,y,z){"
@@ -1999,7 +1999,10 @@ static void tplg_tick(void) {
         if (!g_tplg_was) jump = 1;                                   /* была выключена, появилась */
         else if (tplw_dxz(np, g_tplg_prev) > TPLG_JUMP) jump = 1;    /* переставили */
     }
-    if (jump && now - g_tplg_shownT < TPLG_QUIET_MS) return;         /* рано: состояние не обновляем — следующий тик увидит её снова */
+    if (jump && now - g_tplg_shownT < TPLG_QUIET_MS) {               /* уточнение уже показанной метки: запоминаем новую точку молча, окно не повторяем */
+        g_tplg_was = active; g_tplg_prev[0] = np[0]; g_tplg_prev[1] = np[1]; g_tplg_prev[2] = np[2];
+        return;
+    }
     g_tplg_was = active; g_tplg_prev[0] = np[0]; g_tplg_prev[1] = np[1]; g_tplg_prev[2] = np[2];
     if (!jump) return;
     g_tplg_shownT = now;
