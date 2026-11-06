@@ -1990,7 +1990,9 @@ static void tplg_tick(void) {
     mm = tpl_minimap();
     if (!mm || !tpl_nav_point(mm, np, &act)) return;
     nz = (np[0] != 0.0f || np[1] != 0.0f || np[2] != 0.0f);
-    active = nz && act != 0;                                         /* поля m_IsNavigationActive нет (act = -1) — считаем по координатам */
+    /* НЕ смотрим на m_IsNavigationActive: по логам (konstt_prev.log) при метке, поставленной тапом по карте, точка уже записана (822.8 0.0 1453.7),
+       а флаг активности = 0 — раньше из-за него окно не показывалось никогда. Новая метка = точка появилась или сдвинулась больше чем на TPLG_JUMP. */
+    active = nz;
     if (!g_tplg_init) {                                              /* первое чтение: что уже стоит, то не «новая» метка */
         g_tplg_init = 1; g_tplg_was = active; g_tplg_prev[0] = np[0]; g_tplg_prev[1] = np[1]; g_tplg_prev[2] = np[2];
         dlog(active ? "tpl: gps: окно включено, метка уже стоит — ждём новую" : "tpl: gps: окно включено, метки нет — ждём");
@@ -2008,7 +2010,7 @@ static void tplg_tick(void) {
     {
         int dist = haveMe ? (int)(tplw_dxz(np, me) + 0.5f) : 0;
         char lg[160]; Buf x; b_init(&x, lg, sizeof lg);
-        b_s(&x, "tpl: gps: новая метка "); tpl_b_xyz(&x, np); b_s(&x, ", до неё м "); b_int(&x, dist); b_s(&x, ", окно ");
+        b_s(&x, "tpl: gps: новая метка "); tpl_b_xyz(&x, np); b_s(&x, ", до неё м "); b_int(&x, dist); b_s(&x, ", флаг активности "); b_int(&x, act); b_s(&x, ", окно ");
         if (tplg_dialog(dist)) b_s(&x, "показано");
         else {                                                       /* JS не прошёл — хотя бы подсказка в чат */
             b_s(&x, "НЕ показано (JS)");
