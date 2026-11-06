@@ -1910,52 +1910,25 @@ static int tpl_js_run(const char* js) {
     if (exc) { exc_text(exc, et, sizeof et); if (g_tplg_jsErr < 4) { g_tplg_jsErr++; dlog2("tpl: gps: ExecuteJavaScript бросил исключение: ", et); } return 0; }
     return 1;
 }
-/* окно: dist — метров до метки по горизонтали (0 — не знаем, строку не показываем). Только одинарные кавычки — чтобы не экранировать их в C.
-   Повторный вызов сносит старое окно (новая метка заменяет вопрос про прежнюю). */
-static int tplg_dialog(int dist) {
-    char js[3600]; Buf b;
-    b_init(&b, js, sizeof js);
-    b_s(&b,
-        "(function(d){try{var w=window,doc=document,id='" TPLG_DLG_ID "',old=doc.getElementById(id);"
-        "if(old&&old.parentNode)old.parentNode.removeChild(old);"
-        "if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}"
-        "function el(t,css,txt){var e=doc.createElement(t);if(css)e.style.cssText=css;if(txt)e.textContent=txt;return e;}"
-        "var root=el('div','position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:2147483000;display:flex;align-items:center;justify-content:center;"
-        "background:rgba(1,1,6,.6);pointer-events:auto;font-family:Open Sans,sans-serif');root.id=id;"
-        "var box=el('div','min-width:46vh;max-width:80vw;background:rgba(20,20,25,.95);border:.19vh solid rgba(255,255,255,.08);border-radius:.74vh;"
-        "padding:2.4vh 2.6vh;box-sizing:border-box;color:#fff;text-align:center');"
-        "box.appendChild(el('div','font-weight:700;font-size:2.3vh;color:#ffcd00;margin-bottom:1.4vh','Подтверждение'));"
-        "box.appendChild(el('div','font-weight:600;font-size:1.9vh;line-height:1.35;margin-bottom:1vh','Вы действительно хотите телепортироваться в данное место?'));"
-        "if(d>0)box.appendChild(el('div','font-size:1.55vh;color:#b8b8c0;margin-bottom:1vh','До метки: около '+d+' м'));"
-        "var row=el('div','display:flex;justify-content:center;margin-top:1.2vh');"
-        "var bs='min-width:15vh;padding:1.2vh 2vh;border-radius:.74vh;font-weight:700;font-size:1.9vh;color:#fff;cursor:pointer;margin:0 .8vh;';"
-        "var yes=el('div',bs+'background:#0a9947','Да'),no=el('div',bs+'background:rgba(255,255,255,.14)','Нет');"
-        "function close(){if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}if(root.parentNode)root.parentNode.removeChild(root);}"
-        "yes.addEventListener('click',function(e){e.stopPropagation();close();try{w.sendChatInput('/tpl gps go');}catch(x){}});"
-        "no.addEventListener('click',function(e){e.stopPropagation();close();});"
-        "row.appendChild(yes);row.appendChild(no);box.appendChild(row);root.appendChild(box);"
-        "(doc.body||doc.documentElement).appendChild(root);w.__hmTplDlgT=setTimeout(close,30000);}catch(x){}})(");
-    b_int(&b, dist > 0 ? dist : 0);
-    b_s(&b, ");");
-    return tpl_js_run(js);
-}
-static void tplg_dialog_close(void) {                    /* убрать окно (режим выключили) */
-    tpl_js_run("(function(){try{var e=document.getElementById('" TPLG_DLG_ID "');if(e&&e.parentNode)e.parentNode.removeChild(e);"
-               "if(window.__hmTplDlgT){clearTimeout(window.__hmTplDlgT);window.__hmTplDlgT=0;}}catch(x){}})();");
-}
-/* ───── запасной путь окна: перехват window.getRoute ─────
-   Сервер на тап по карте / «выбрать в GPS» присылает JS «window.getRoute(x0,y0,z0, x1,y1,z1, тип, радар)» (gps.pwn: GPS:BuildRouteForPlayer), а тот зовёт
-   startNavigationInterval → getNavigationPath → MiniMap.GetNavigationPath. Этот перехват не зависит от чтения m_NavigationPoint через IL2CPP: окно
-   показывается прямо из JS, в момент прихода getRoute. «Да» шлёт «/tpl to X Y» (координаты метки в системе сервера, высота — по земле).
-   Ставится/переставляется идемпотентно из тика (WebView может перезагрузиться), работает только пока включён режим (window.__hmTplOn). */
+/* ───── окно «Подтверждение»: родной диалог игры (как серверный ShowDialog) + запасной путь через window.getRoute ─────
+   Как это делает сервер: ShowDialog → JS «window.addDialogInQueue('[id,стиль,заголовок,подзаголовок,кнопка1,кнопка2,влево,вправо]', 'текст', приоритет)» →
+   App.addDialogInQueue → компонент Window (стиль 0 = «text», красная рамка Modal). Мы зовём тот же метод, поэтому окно выглядит как серверное.
+   Ответ кнопок игра шлёт как sendClientEvent(0,'OnDialogResponse', id, да(1)/нет(0), …). У нашего окна id TPLG_DLG_NID (серверу такой диалог неизвестен),
+   поэтому sendClientEvent оборачивается: ответ с нашим id серверу НЕ уходит, «Да» выполняет команду (sendChatInput), «Нет»/Esc — закрывает.
+   Если App.addDialogInQueue недоступен или бросил исключение — рисуем прежнее окно из HTML (запасной вариант).
+   Скрипт ставится идемпотентно (WebView может перезагрузиться): window.__hmTplAsk(dist, cmd) — показать окно; __hmTplClose() — убрать. Дополнительно перехватывается
+   window.getRoute: сервер на тап по карте / «выбрать в GPS» присылает «window.getRoute(x0,y0,z0, x1,y1,z1, тип, радар)» (gps.pwn: GPS:BuildRouteForPlayer),
+   и окно показывается прямо из JS, не завися от чтения m_NavigationPoint через IL2CPP; «Да» шлёт «/tpl to X Y» (высота по земле). */
+#define TPLG_DLG_NID "9977"
 static long long g_tplg_hookT = -1000000LL;
 static const char g_tplg_hook_js[] =
-    "(function(){try{var w=window,doc=document,id='" TPLG_DLG_ID "';w.__hmTplOn=1;"
-    "if(w.__hmTplHook||typeof w.getRoute!=='function')return;w.__hmTplHook=1;"
-    "var og=w.getRoute,lx=1e9,ly=1e9,lt=0;"
-    "function el(t,css,txt){var e=doc.createElement(t);if(css)e.style.cssText=css;if(txt)e.textContent=txt;return e;}"
-    "function ask(d,cmd){var old=doc.getElementById(id);if(old&&old.parentNode)old.parentNode.removeChild(old);"
-    "if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}"
+    "(function(){try{var w=window,doc=document,id='" TPLG_DLG_ID "',NID=" TPLG_DLG_NID ";w.__hmTplOn=1;"
+    "if(!w.__hmTplAsk){"
+    "var el=function(t,css,txt){var e=doc.createElement(t);if(css)e.style.cssText=css;if(txt)e.textContent=txt;return e;};"
+    "var rmHtml=function(){var o=doc.getElementById(id);if(o&&o.parentNode)o.parentNode.removeChild(o);if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}};"
+    "var isOurs=function(){var q=w.App&&w.App.dialogsQueue;return w.__hmTplIdx!==undefined&&q&&q.length&&q[0][0]===w.__hmTplIdx;};"
+    "w.__hmTplClose=function(){rmHtml();if(w.__hmTplCmd){if(isOurs()){try{w.closeLastDialog();}catch(e){}}w.__hmTplCmd=null;}};"
+    "var htmlAsk=function(d,cmd){rmHtml();"
     "var root=el('div','position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:2147483000;display:flex;align-items:center;justify-content:center;"
     "background:rgba(1,1,6,.6);pointer-events:auto;font-family:Open Sans,sans-serif');root.id=id;"
     "var box=el('div','min-width:46vh;max-width:80vw;background:rgba(20,20,25,.95);border:.19vh solid rgba(255,255,255,.08);border-radius:.74vh;"
@@ -1966,22 +1939,46 @@ static const char g_tplg_hook_js[] =
     "var row=el('div','display:flex;justify-content:center;margin-top:1.2vh');"
     "var bs='min-width:15vh;padding:1.2vh 2vh;border-radius:.74vh;font-weight:700;font-size:1.9vh;color:#fff;cursor:pointer;margin:0 .8vh;';"
     "var yes=el('div',bs+'background:#0a9947','Да'),no=el('div',bs+'background:rgba(255,255,255,.14)','Нет');"
-    "function close(){if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}if(root.parentNode)root.parentNode.removeChild(root);}"
-    "yes.addEventListener('click',function(e){e.stopPropagation();close();try{w.sendChatInput(cmd);}catch(x){}});"
-    "no.addEventListener('click',function(e){e.stopPropagation();close();});"
+    "yes.addEventListener('click',function(e){e.stopPropagation();rmHtml();try{w.sendChatInput(cmd);}catch(x){}});"
+    "no.addEventListener('click',function(e){e.stopPropagation();rmHtml();});"
     "row.appendChild(yes);row.appendChild(no);box.appendChild(row);root.appendChild(box);"
-    "(doc.body||doc.documentElement).appendChild(root);w.__hmTplDlgT=setTimeout(close,30000);}"
+    "(doc.body||doc.documentElement).appendChild(root);w.__hmTplDlgT=setTimeout(rmHtml,30000);};"
+    "if(!w.__hmTplSce&&typeof w.sendClientEvent==='function'){w.__hmTplSce=1;var os=w.sendClientEvent;"
+    "w.sendClientEvent=function(){var a=arguments;try{if(a[1]==='OnDialogResponse'&&a[2]===NID){var c=w.__hmTplCmd;w.__hmTplCmd=null;"
+    "if(c&&a[3]==1){try{w.sendChatInput(c);}catch(x){}}return;}}catch(x){}return os.apply(this,a);};}"
+    "w.__hmTplAsk=function(d,cmd){var n=Date.now();if(w.__hmTplCmd&&isOurs()&&n-(w.__hmTplLastT||0)<2000)return;w.__hmTplLastT=n;rmHtml();"
+    "try{var A=w.App;if(!A||typeof A.addDialogInQueue!=='function')throw 0;"
+    "var idx=A.dialogIdx;w.__hmTplCmd=cmd;"
+    "A.addDialogInQueue(JSON.stringify([NID,0,'Подтверждение',d>0?('До метки: около '+d+' м'):'','Да','Нет',false,false]),"
+    "'Вы действительно хотите телепортироваться в данное место?',false);"
+    "w.__hmTplIdx=idx;var tk=idx;setTimeout(function(){if(w.__hmTplCmd===cmd&&w.__hmTplIdx===tk)w.__hmTplClose();},30000);"
+    "}catch(e){w.__hmTplCmd=null;try{htmlAsk(d,cmd);}catch(x){}}};}"
+    "if(w.__hmTplHook||typeof w.getRoute!=='function')return;w.__hmTplHook=1;"
+    "var og=w.getRoute,lx=1e9,ly=1e9,lt=0;"
     "w.getRoute=function(a,b,c,x,y,z){"
     "try{if(w.__hmTplOn){var t=Date.now();x=+x;y=+y;"
     "if(isFinite(x)&&isFinite(y)&&(Math.abs(x-lx)+Math.abs(y-ly)>3||t-lt>30000)){lx=x;ly=y;lt=t;"
     "var d=Math.round(Math.sqrt((x-a)*(x-a)+(y-b)*(y-b)));if(!isFinite(d))d=0;"
-    "ask(d,'/tpl to '+x.toFixed(1)+' '+y.toFixed(1));}}}catch(e){}"
+    "w.__hmTplAsk(d,'/tpl to '+x.toFixed(1)+' '+y.toFixed(1));}}}catch(e){}"
     "return og.apply(this,arguments);};"
     "}catch(e){}})();";
 static void tplg_hook_ensure(long long now) {            /* главный поток; не чаще раза в 2 с */
     if (now - g_tplg_hookT < 2000LL) return;
     g_tplg_hookT = now;
     tpl_js_run(g_tplg_hook_js);
+}
+/* окно: dist — метров до метки по горизонтали (0 — не знаем, строку не показываем). «Да» — «/tpl gps go». Повторный вызов сносит старое окно. */
+static int tplg_dialog(int dist) {
+    char js[160]; Buf b;
+    g_tplg_hookT = -1000000LL; tplg_hook_ensure(gh_now_ms());         /* скрипт (и __hmTplAsk) точно на месте */
+    b_init(&b, js, sizeof js);
+    b_s(&b, "(function(d){try{window.__hmTplAsk(d,'/tpl gps go');}catch(x){}})(");
+    b_int(&b, dist > 0 ? dist : 0);
+    b_s(&b, ");");
+    return tpl_js_run(js);
+}
+static void tplg_dialog_close(void) {                    /* убрать окно (режим выключили) */
+    tpl_js_run("(function(){try{if(window.__hmTplClose)window.__hmTplClose();}catch(x){}})();");
 }
 /* Главный поток, по тику (только когда режим включён) */
 static void tplg_tick(void) {
