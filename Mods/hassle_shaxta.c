@@ -21,6 +21,8 @@
  *   /shaxta gold|silver|iron|coal|ground   показать/скрыть один вид (по-русски: золото серебро железо уголь земля);
  *                        несколько слов подряд («/shaxta gold silver») — показывать ТОЛЬКО их;  /shaxta all — показывать все виды
  *   /shaxta menu         МЕНЮ на экране (кнопка-ромб + панель): переключатели видов руды, радиус, счётчики. Работает на мобилке
+ *   /shaxta fz [on|off]  ЗАМОРОЗКА персонажа (штатная заморозка игры, см. «Заморозка» ниже): без аргумента — переключить; «on» — заморозить где стоите, «off» — отпустить
+ *                        (персонаж сам встанет на землю под точкой). Синонимы: freeze, фриз, заморозка
  *   /shaxta status       состояние;  /shaxta help — подсказка
  *
  * Кнопка «ТП» в меню (золото / серебро / железо / уголь): телепорт к руде через обычный «/tpl to X Y Z» (hassle_tpl.c должен быть в бандле; сам мод от него
@@ -34,6 +36,16 @@
  *   сервера, а если маркера нет (после перфоратора сервер его не ставит) — «ТП» к руде того вида, который вы нажимали последним. Маркер ведёт сам: стойка после
  *   каждого этапа (перфоратор → кирка → тележка → лопата), потом месторождение, потом вагонетка/склад — отдельно проверять, какой инструмент в руках, не нужно:
  *   стойка выдаёт нужный сама, а сервер показывает пункт «взять инструмент» только когда рук свободны (Interactions:IsAccess, MINER_TOOLS_INTERACT).
+ *
+ * Заморозка в АВТОЦИКЛЕ (только в нём; ручные кнопки «ТП» не трогаем): раньше после «/tpl to» к руде персонаж иногда проваливался под пол, и проверять шахту было нельзя. Причина — точка ТП:
+ *   Transform ставится на SHX_TP_DY (1 м) НИЖЕ точки объекта, чтобы сервер видел игрока ровно в точке руды (в пакет уходит Transform.y + 1), а точка руды лежит на уровне пола;
+ *   капсула оказывается в полу, физика её выталкивает / роняет, и сервер (miner.pwn: IsPlayerInRangeOfPoint(MINER_RADIUS_SPOT * 2.0), область взаимодействия 1.5 м — оба в 3D)
+ *   уже не видит игрока у руды. Теперь перед каждым ТП автоцикла мод замораживает персонажа штатным Entity.ToggleFreeze("shaxta", true, accumulated=false) — тем же механизмом, которым игра
+ *   замораживает персонажей (Actor.ToggleFreeze → CharacterMovement.IsFreezed; пока заморожен, Character.Move только обнуляет скорость и физику/гравитацию не считает).
+ *   Позиция остаётся ровно там, куда поставил SetPosition, и уходит на сервер как обычная. Серверная заморозка (TogglePlayerControllable на этапах работы) — отдельный тип в
+ *   списке Entity.m_FreezeTypes, они не мешают друг другу. Отпускает заморозку: остановка автоцикла (выключатель или ручное управление — джойстик / кнопка / клавиша),
+ *   «/shaxta fz off». Перед отпусканием мод ставит персонажа на землю под точкой (Player.SetPosition(pos + SHX_TP_DY, findHeight=true), как «/air land»),
+ *   иначе после разморозки он бы всё равно провалился. Не проверено на устройстве: если «/shaxta fz» пишет «ToggleFreeze не найден» — смотрите konstt.log.
  *
  * Автоцикл сам выключается, если вы взяли управление: тронули джойстик, нажали любую экранную кнопку (кроме вращения камеры) или клавишу — тогда выключается и автонажатие, если его включил цикл (хук window.onScreenControlTouchStart/Move в JS меню, C не участвует).
  * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): опрос раз в 0.1 с: первый клик — сразу как кружок появился, дальше раз в 0.76 с, шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
@@ -115,6 +127,7 @@ static int g_shx_uiOk, g_shx_uiTick;     /* JS меню внедрён / счё�
 static char g_shx_lastJs[2000];           /* последнее отправленное в меню состояние — одинаковое повторно не шлём */
 static int g_shx_layoutOk, g_shx_oID, g_shx_oCol, g_shx_oPos, g_shx_oDist, g_shx_oLos, g_shx_oPl, g_shx_oVeh, g_shx_oTxt, g_shx_ssize;
 
+extern int clock_gettime(int, void*);        /* как в mem/route/tpl/air: struct timespec = два long */
 static long long shx_now_ms(void) { long ts[2]; ts[0] = 0; ts[1] = 0; clock_gettime(1, ts); return (long long)ts[0] * 1000LL + ts[1] / 1000000LL; }
 static int shx_finite(const float* v) {
     return v[0] == v[0] && v[1] == v[1] && v[2] == v[2] && v[0] < 1e7f && v[0] > -1e7f && v[1] < 1e7f && v[1] > -1e7f && v[2] < 1e7f && v[2] > -1e7f;
@@ -158,10 +171,12 @@ static const char g_shx_menu_js[] =
 "{k:'iron',n:'Железо',c:'#FF8030'},\n"
 "{k:'coal',n:'Уголь',c:'#9A9A9A'},\n"
 "{k:'ground',n:'Руда на земле',c:'#66FF66'}];\n"
-"var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0,k:0,rk:[],t:[[],[],[],[]]},ix=[0,0,0,0],cycTgt=0;\n"
-"var open=false,dragged=false,syncT=null;\n"
+"var S={o:0,r:300,m:31,c:[0,0,0,0,0],s:[0,0,0,0,0],p:0,k:0,z:0,rk:[],t:[[],[],[],[]]},ix=[0,0,0,0],cycTgt=0;\n"
+"var open=false,dragged=false,syncT=null,fzHeld=false;\n"
 "function cmd(x){try{window.sendChatInput('/shaxta q '+x);}catch(e){}}\n"
-"function goPt(i){var a=S.t[i];if(!a||!a.length)return 0;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}return 1;}\n"
+"function frz(v){fzHeld=!!v;cmd('fz '+(v?1:0));}\n"
+"function tp(c){if(cyc)frz(1);try{window.sendChatInput(c);}catch(e){}}\n"
+"function goPt(i){var a=S.t[i];if(!a||!a.length)return 0;var k=ix[i]%a.length;ix[i]=k+1;var q=a[k];tp('/tpl to '+q[0]+' '+q[1]+' '+q[2]);return 1;}\n"
 "function go(i){cycTgt=i;goPt(i);}\n"
 "function pickTgt(){var o=[cycTgt,0,1,2,3];for(var j=0;j<o.length;j++){var a=S.t[o[j]];if(a&&a.length)return o[j];}return -1;}\n"
 "function el(tag,id,cls,txt){var e=document.createElement(tag);if(id)e.id=id;if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e;}\n"
@@ -253,21 +268,21 @@ static const char g_shx_menu_js[] =
 "var UI_CD=1050,IDLE_MS=500,SETTLE_MS=450,SYNC_MS=250,CYC_MS=120;\n"
 "function toRack(){var a=S.rk;if(!a||!a.length){csub.textContent='стоек не видно (подойдите к шахте)';return;}\n"
 "if(rkWait)rix++;rkWait=true;var q=a[rix%a.length];csub.textContent='к стойке '+(rix%a.length+1)+'/'+a.length;\n"
-"try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}}\n"
+"tp('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}\n"
 "function cycTick(){try{var now=Date.now();if(now-syncLast>=SYNC_MS){cmd('sync');syncLast=now;}\n"
 "if(bars()){hadBar=1;cycLast=now;clk=0;fails=0;phase='ore';csub.textContent='кружок идёт';return;}\n"
 "if(hadBar){hadBar=0;cmd('sync');syncLast=now;cycLast=now;}\n"
 "var L=intr();\n"
 "if(L){if(clk<2){if(now-clkLast<UI_CD)return;var tt=L[0].title;ev('OnInteractionsClick',L[0].type);clk++;clkLast=now;cycLast=now;rkWait=false;csub.textContent='взаимодействие: '+String(tt).replace(/<[^>]*>/g,' ');return;}}else clk=0;\n"
 "if(now-cycLast<IDLE_MS)return;cycLast=now+SETTLE_MS;clk=0;\n"
-"if(S.k){window.sendChatInput('/tpl gps');csub.textContent='к маркеру сервера';return;}\n"
+"if(S.k){tp('/tpl gps');csub.textContent='к маркеру сервера';return;}\n"
 "if(phase==='ore'&&fails<2){var ti=pickTgt();if(ti<0){csub.textContent='руды рядом нет: подойдите к месторождениям';return;}\n"
 "fails++;goPt(ti);csub.textContent='к руде: '+T[ti].n+(ti===cycTgt?'':' (запасная)')+' ('+fails+')';}\n"
 "else{phase='ore';fails=0;toRack();}}catch(e){csub.textContent='ошибка: '+e;}}\n"
 "function cycSet(v,why){if(v===cyc)return;cyc=v;csw.className='shx-sw'+(cyc?' on':'');\n"
 "if(cycT){clearInterval(cycT);cycT=null;}\n"
 "if(cyc){autoByCyc=!auto;setAuto(true);clk=0;cycLast=0;clkLast=0;syncLast=0;hadBar=0;phase='rack';fails=0;rkWait=false;csub.textContent='вкл';cycT=setInterval(cycTick,CYC_MS);}\n"
-"else{if(why&&autoByCyc)setAuto(false);autoByCyc=false;csub.textContent=why||'выкл · цель — последняя нажатая руда';}}\n"
+"else{if(fzHeld)frz(0);if(why&&autoByCyc)setAuto(false);autoByCyc=false;csub.textContent=why||'выкл · цель — последняя нажатая руда';}}\n"
 "cr.addEventListener('click',function(){cycSet(!cyc);});\n"
 "function manual(src){if(cyc)cycSet(false,'стоп: ручное управление ('+src+')');}\n"
 "function hookCtl(n,onlyStick){var f=window[n];if(typeof f!=='function'||f.__shx)return;var w=function(p){try{if(cyc&&typeof p==='string'&&p.indexOf('<Mouse>/')!==0&&(!onlyStick||p==='<Gamepad>/leftStick'))manual(p==='<Gamepad>/leftStick'?'джойстик':'кнопка');}catch(e){}return f.apply(this,arguments);};w.__shx=1;window[n]=w;}\n"
@@ -299,6 +314,54 @@ static int shx_js_run(const char* js) {                             /* WebViewSy
 static void shx_ui_inject(void) {                                   /* идемпотентно: если меню уже есть на странице, JS сразу выходит */
     if (shx_js_run(g_shx_menu_js)) { g_shx_uiOk = 1; g_shx_lastJs[0] = 0; }
 }
+/* ───────────── заморозка персонажа (см. шапку) ───────────── */
+#define SHX_FZ_TYPE "shaxta"             /* имя типа заморозки в Entity.m_FreezeTypes (серверная заморозка — свои типы, не пересекаются) */
+#define SHX_FZ_LAND 1                    /* 1 — перед отпусканием поставить персонажа на землю под точкой (иначе после разморозки он провалится) */
+static int g_shx_fz;                     /* 1 — мы держим заморозку */
+static int g_shx_fzErr;
+static int shx_is_frozen(void) {         /* Entity.IsFreezed (список типов не пуст: наш, серверный TogglePlayerControllable и т.д.); 0 — нет / не прочиталось */
+    void *me, *m, *exc = NULL, *r;
+    if (!g_safe || !il2cpp_light()) return 0;
+    ensure_attached();
+    me = local_player();
+    if (!me || !hm_obj_ok(me)) return 0;
+    m = find_method(A.object_get_class(me), "get_IsFreezed", 0);
+    if (!m) return 0;
+    r = A.runtime_invoke(m, me, NULL, &exc);
+    if (exc || !r || !hm_readable((char*)r + HDR, 1)) return 0;
+    return *((u8*)r + HDR) ? 1 : 0;
+}
+static int shx_set_pos(void* me, const float* pos, u8 findH) {      /* Player.SetPosition(Vector3, findHeight) — как в /tpl и /air land */
+    void *m, *exc = NULL, *args[2]; float v[3]; char et[200];
+    v[0] = pos[0]; v[1] = pos[1]; v[2] = pos[2];
+    m = find_method(A.object_get_class(me), "SetPosition", 2);
+    if (!m) return 0;
+    args[0] = v; args[1] = &findH;
+    A.runtime_invoke(m, me, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); if (g_shx_fzErr < 6) { g_shx_fzErr++; dlog2("shaxta: SetPosition бросил исключение: ", et); } return 0; }
+    return 1;
+}
+/* on=1 — заморозить (идемпотентно: accumulated=false не даёт добавить тип дважды); on=0 — отпустить (сначала на землю под точкой). 1 — вызов прошёл */
+static int shx_freeze(int on) {
+    void *me, *m, *exc = NULL, *args[3]; u8 st = on ? 1 : 0, acc = 0; char et[200];
+    if (!g_safe || !il2cpp_light()) return 0;
+    ensure_attached();
+    me = local_player();
+    if (!me || !hm_obj_ok(me)) { g_shx_fz = 0; return 0; }          /* не в игре / персонаж пересоздан — заморозки уже нет */
+    m = find_method(A.object_get_class(me), "ToggleFreeze", 3);     /* Actor.ToggleFreeze(string type, bool status, bool accumulated) */
+    if (!m) { if (g_shx_fzErr < 6) { g_shx_fzErr++; dlog("shaxta: нет Entity.ToggleFreeze(string,bool,bool)"); } return 0; }
+    if (!on && g_shx_fz && SHX_FZ_LAND) {
+        float p[3];
+        if (shx_myref(p)) { p[1] += SHX_TP_DY; shx_set_pos(me, p, 1); }   /* от точки объекта ищем пол вниз; SetPosition асинхронный, наш тип снимаем сразу — он держит свою заморозку сам */
+    }
+    args[0] = A.string_new(SHX_FZ_TYPE); args[1] = &st; args[2] = &acc;
+    if (!args[0]) return 0;
+    A.runtime_invoke(m, me, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); if (g_shx_fzErr < 6) { g_shx_fzErr++; dlog2("shaxta: ToggleFreeze бросил исключение: ", et); } return 0; }
+    g_shx_fz = on ? 1 : 0;
+    return 1;
+}
+
 static void shx_ui_push(int force) {                                /* состояние -> меню: window.__shx.u({...}) */
     char js[2000]; Buf b; int i, k, n;
     if (!g_shx_uiOk) return;
@@ -311,7 +374,7 @@ static void shx_ui_push(int force) {                                /* сост�
     for (i = 0; i < SHX_NT; i++) { if (i) b_ch(&b, ','); b_int(&b, g_shx_total[i]); }
     b_s(&b, "],s:[");
     for (i = 0; i < SHX_NT; i++) { if (i) b_ch(&b, ','); b_int(&b, g_shx_spawn[i]); }
-    b_s(&b, "],k:"); b_int(&b, g_shx_mark); b_s(&b, ",t:[");
+    b_s(&b, "],k:"); b_int(&b, g_shx_mark); b_s(&b, ",z:"); b_int(&b, shx_is_frozen()); b_s(&b, ",t:[");
     for (i = 0; i < 4; i++) {                                       /* куда ставить игрока: точка руды, Transform на SHX_TP_DY ниже, чуть в вашу сторону */
         if (i) b_ch(&b, ',');
         b_ch(&b, '[');
@@ -711,6 +774,7 @@ static int shx_tokens(void* arr, char tok[][32], int maxn) {
 }
 static void shx_usage(void) {
     chat_usage("/shaxta — ТЕСТОВЫЙ инструмент настройки шахты (тестовые NPC): подписи над рудой (вкл/выкл).  /shaxta r 400 — радиус, м;  /shaxta list — сводка по видам и счётчик появлений;  /shaxta reset — обнулить счётчик");
+    chat_usage("/shaxta fz [on|off] — заморозка персонажа вручную (автоцикл замораживает сам и отпускает при остановке)");
     chat_usage("/shaxta test — тест цветов;  /shaxta fmt 0|1|2|3 — формат цвета (если цвета неверные);  /shaxta off — убрать подписи;  /shaxta status — состояние");
 }
 static void shx_b_fmtname(Buf* b) {
@@ -724,6 +788,7 @@ static void shx_status(void) {
     b_s(&b, " м, подписей сейчас "); b_int(&b, n); b_s(&b, ", формат цвета "); shx_b_fmtname(&b);
     chat_say(m);
     b_init(&b, m, sizeof m);
+    b_s(&b, "  заморозка: "); b_s(&b, g_shx_fz ? "наша ВКЛ" : "наша выкл"); b_s(&b, ", игра считает замороженным: "); b_s(&b, shx_is_frozen() ? "да" : "нет"); b_s(&b, ";");
     b_s(&b, "  объектов в пуле: "); b_int(&b, g_shx_poolN); b_s(&b, " (-1 — пул не прочитался), отслеживаемых точек: "); b_int(&b, g_shx_np);
     chat_say(m);
 }
@@ -825,6 +890,16 @@ static void shx_cmd_run(char tok[][32], int nt) {
         shx_ui_inject(); shx_sync();
         shx_js_run("window.__shx&&window.__shx.o(1)");
         if (!g_shx_uiOk) chat_say("/shaxta: меню не внедрилось — подробности в konstt.log");
+        return;
+    }
+    if (seq(tok[0], "fz") || seq(tok[0], "freeze") || seq(tok[0], "фриз") || seq(tok[0], "заморозка")) {
+        int want = nt >= 2 ? (seq(tok[1], "on") || seq(tok[1], "вкл") || seq(tok[1], "1")) ? 1 : (seq(tok[1], "off") || seq(tok[1], "выкл") || seq(tok[1], "0")) ? 0 : -1 : !g_shx_fz;
+        char m[160]; Buf b;
+        if (want < 0) { chat_usage("/shaxta fz [on|off] — заморозить / отпустить персонажа (без аргумента — переключить)"); return; }
+        if (!shx_freeze(want)) { chat_say("/shaxta fz: не вышло (вы не в игре или ToggleFreeze не найден) — подробности в konstt.log"); return; }
+        b_init(&b, m, sizeof m); b_s(&b, "/shaxta: заморозка "); b_s(&b, want ? "ВКЛ" : "выкл");
+        b_s(&b, "; игра считает персонажа замороженным: "); b_s(&b, shx_is_frozen() ? "да" : "нет");
+        shx_say(m);
         return;
     }
     if (seq(tok[0], "sync") || seq(tok[0], "обновить")) { shx_sync(); return; }
