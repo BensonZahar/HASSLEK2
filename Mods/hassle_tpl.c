@@ -1943,9 +1943,50 @@ static void tplg_dialog_close(void) {                    /* убрать окн�
     tpl_js_run("(function(){try{var e=document.getElementById('" TPLG_DLG_ID "');if(e&&e.parentNode)e.parentNode.removeChild(e);"
                "if(window.__hmTplDlgT){clearTimeout(window.__hmTplDlgT);window.__hmTplDlgT=0;}}catch(x){}})();");
 }
+/* ───── запасной путь окна: перехват window.getRoute ─────
+   Сервер на тап по карте / «выбрать в GPS» присылает JS «window.getRoute(x0,y0,z0, x1,y1,z1, тип, радар)» (gps.pwn: GPS:BuildRouteForPlayer), а тот зовёт
+   startNavigationInterval → getNavigationPath → MiniMap.GetNavigationPath. Этот перехват не зависит от чтения m_NavigationPoint через IL2CPP: окно
+   показывается прямо из JS, в момент прихода getRoute. «Да» шлёт «/tpl to X Y» (координаты метки в системе сервера, высота — по земле).
+   Ставится/переставляется идемпотентно из тика (WebView может перезагрузиться), работает только пока включён режим (window.__hmTplOn). */
+static long long g_tplg_hookT = -1000000LL;
+static const char g_tplg_hook_js[] =
+    "(function(){try{var w=window,doc=document,id='" TPLG_DLG_ID "';w.__hmTplOn=1;"
+    "if(w.__hmTplHook||typeof w.getRoute!=='function')return;w.__hmTplHook=1;"
+    "var og=w.getRoute,lx=1e9,ly=1e9,lt=0;"
+    "function el(t,css,txt){var e=doc.createElement(t);if(css)e.style.cssText=css;if(txt)e.textContent=txt;return e;}"
+    "function ask(d,cmd){var old=doc.getElementById(id);if(old&&old.parentNode)old.parentNode.removeChild(old);"
+    "if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}"
+    "var root=el('div','position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:2147483000;display:flex;align-items:center;justify-content:center;"
+    "background:rgba(1,1,6,.6);pointer-events:auto;font-family:Open Sans,sans-serif');root.id=id;"
+    "var box=el('div','min-width:46vh;max-width:80vw;background:rgba(20,20,25,.95);border:.19vh solid rgba(255,255,255,.08);border-radius:.74vh;"
+    "padding:2.4vh 2.6vh;box-sizing:border-box;color:#fff;text-align:center');"
+    "box.appendChild(el('div','font-weight:700;font-size:2.3vh;color:#ffcd00;margin-bottom:1.4vh','Подтверждение'));"
+    "box.appendChild(el('div','font-weight:600;font-size:1.9vh;line-height:1.35;margin-bottom:1vh','Вы действительно хотите телепортироваться в данное место?'));"
+    "if(d>0)box.appendChild(el('div','font-size:1.55vh;color:#b8b8c0;margin-bottom:1vh','До метки: около '+d+' м'));"
+    "var row=el('div','display:flex;justify-content:center;margin-top:1.2vh');"
+    "var bs='min-width:15vh;padding:1.2vh 2vh;border-radius:.74vh;font-weight:700;font-size:1.9vh;color:#fff;cursor:pointer;margin:0 .8vh;';"
+    "var yes=el('div',bs+'background:#0a9947','Да'),no=el('div',bs+'background:rgba(255,255,255,.14)','Нет');"
+    "function close(){if(w.__hmTplDlgT){clearTimeout(w.__hmTplDlgT);w.__hmTplDlgT=0;}if(root.parentNode)root.parentNode.removeChild(root);}"
+    "yes.addEventListener('click',function(e){e.stopPropagation();close();try{w.sendChatInput(cmd);}catch(x){}});"
+    "no.addEventListener('click',function(e){e.stopPropagation();close();});"
+    "row.appendChild(yes);row.appendChild(no);box.appendChild(row);root.appendChild(box);"
+    "(doc.body||doc.documentElement).appendChild(root);w.__hmTplDlgT=setTimeout(close,30000);}"
+    "w.getRoute=function(a,b,c,x,y,z){"
+    "try{if(w.__hmTplOn){var t=Date.now();x=+x;y=+y;"
+    "if(isFinite(x)&&isFinite(y)&&(Math.abs(x-lx)+Math.abs(y-ly)>3||t-lt>30000)){lx=x;ly=y;lt=t;"
+    "var d=Math.round(Math.sqrt((x-a)*(x-a)+(y-b)*(y-b)));if(!isFinite(d))d=0;"
+    "ask(d,'/tpl to '+x.toFixed(1)+' '+y.toFixed(1));}}}catch(e){}"
+    "return og.apply(this,arguments);};"
+    "}catch(e){}})();";
+static void tplg_hook_ensure(long long now) {            /* главный поток; не чаще раза в 2 с */
+    if (now - g_tplg_hookT < 2000LL) return;
+    g_tplg_hookT = now;
+    tpl_js_run(g_tplg_hook_js);
+}
 /* Главный поток, по тику (только когда режим включён) */
 static void tplg_tick(void) {
     void* mm; float np[3], me[3]; int act = -1, nz, active, jump = 0, haveMe = 0; long long now = gh_now_ms(); TplCtx c;
+    tplg_hook_ensure(now);                                           /* запасной путь: окно из JS по window.getRoute */
     mm = tpl_minimap();
     if (!mm || !tpl_nav_point(mm, np, &act)) return;
     nz = (np[0] != 0.0f || np[1] != 0.0f || np[2] != 0.0f);
@@ -1996,7 +2037,8 @@ static void tpl_cmd_gps_mode(int sub, int status) {
         g_tplg_init = 0;                                             /* метка, что стоит сейчас, окна не вызовет — только новая */
     }
     __atomic_store_n(&g_tpl_gpsAsk, want, __ATOMIC_RELEASE);
-    if (!want) tplg_dialog_close();
+    if (want) { g_tplg_hookT = -1000000LL; tplg_hook_ensure(gh_now_ms()); }
+    else { tpl_js_run("window.__hmTplOn=0;"); tplg_dialog_close(); }
     saved = tpl_gps_save();
     dlog2("tpl: gps: режим окна ", want ? "ВКЛ" : "ВЫКЛ");
     tpl_gps_say(saved);
