@@ -28,14 +28,15 @@
  *   (по порядку ID, в пределах зоны стрима ~300 м); на кнопке видно «ТП 2/5». Встаёте у руды на SHX_TP_BACK м в вашу сторону, Transform на SHX_TP_DY ниже точки
  *   объекта (так сервер видит игрока ровно в точке руды). Если оказались в стене — поправьте SHX_TP_BACK или вернитесь «/tpl pos».
  *
- * Переключатель «Автоцикл шахты» (JS меню; C только сообщает, показан ли маркер сервера — поле k в состоянии): раз в 1.2 с (шаг больше 1 с — серверный интервал
- *   между кликами по меню взаимодействий, interactions.pwn OnInteractionsClick). Порядок: идёт кружок — ждём (автонажатие включается вместе с циклом); есть меню
- *   взаимодействий — кликаем первую строку (не больше 2 раз подряд, чтобы не застрять у места, где делать нечего); иначе через 1.8 с покоя — «/tpl gps» к маркеру
+ * Переключатель «Автоцикл шахты» (JS меню; C только сообщает, показан ли маркер сервера — поле k в состоянии): шаг проверки 120 мс; клик по меню взаимодействий —
+ *   сразу как оно появилось, но не чаще раза в 1.05 с (серверный интервал, interactions.pwn OnInteractionsClick, считает в целых секундах gettime). Порядок: идёт кружок — ждём (автонажатие включается вместе с циклом); есть меню
+ *   взаимодействий — кликаем первую строку (не больше 2 раз подряд, чтобы не застрять у места, где делать нечего); иначе через 0.5 с покоя (после ТП ещё +0.45 с, пока сервер засчитает вход в зону; сразу после кружка — принудительный sync, чтобы маркер был свежим) — «/tpl gps» к маркеру
  *   сервера, а если маркера нет (после перфоратора сервер его не ставит) — «ТП» к руде того вида, который вы нажимали последним. Маркер ведёт сам: стойка после
  *   каждого этапа (перфоратор → кирка → тележка → лопата), потом месторождение, потом вагонетка/склад — отдельно проверять, какой инструмент в руках, не нужно:
  *   стойка выдаёт нужный сама, а сервер показывает пункт «взять инструмент» только когда рук свободны (Interactions:IsAccess, MINER_TOOLS_INTERACT).
  *
- * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): раз в 0.8 с шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
+ * Автоцикл сам выключается, если вы взяли управление: тронули джойстик, нажали любую экранную кнопку (кроме вращения камеры) или клавишу — тогда выключается и автонажатие, если его включил цикл (хук window.onScreenControlTouchStart/Move в JS меню, C не участвует).
+ * Переключатель «Автонажатие кружка» (только JS меню, C не участвует): опрос раз в 0.1 с: первый клик — сразу как кружок появился, дальше раз в 0.76 с, шлёт серверу OnProgressBarClick (то же событие, что тап по кружку на телефоне)
  *   для кружков с подписью «Нажимайте Y …» — это этап кирки. Бурение и лопата сервер заполняет сам по таймеру, их нажимать не нужно. Быстрее 0.7 с нельзя:
  *   сервер (progress_bar.pwn, OnKeyPress) считает нажатие чаще 700 мс ошибкой — шкала откатывается, а после 5 ошибок этап срывается.
  *
@@ -240,30 +241,38 @@ static const char g_shx_menu_js[] =
 "bm.addEventListener('click',function(){cmd('r '+Math.max(50,S.r-50));});\n"
 "bp.addEventListener('click',function(){cmd('r '+Math.min(1000,S.r+50));});\n"
 "rs.addEventListener('click',function(){cmd('reset');});\n"
-"var auto=false,autoT=null,autoN=0;\n"
+"var auto=false,autoT=null,autoN=0,keyLast=0,KEY_MS=760;\n"
 "function ev(n,a){try{window.sendClientEventHandle(0,n,a);return 1;}catch(e){}try{window.sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,{ignoreChat:true},n,a);return 1;}catch(e){}return 0;}\n"
 "function bars(){try{var n=document.querySelectorAll('.preloader-list').length;if(n)return n;if(window.getInterfaceStatus('ProgressBar')){var v=window.interface('ProgressBar');if(v&&v.list)return v.list.length;}}catch(e){}return 0;}\n"
 "function intr(){try{var d=document.querySelectorAll('.interactions-list').length;if(!d&&!window.getInterfaceStatus('Interactions'))return null;var v=window.interface('Interactions');if(v&&v.list&&v.list.length)return v.list;}catch(e){}return null;}\n"
-"function autoTick(){try{var n=bars();for(var i=0;i<n;i++){ev('OnProgressBarClick',i);autoN++;}if(n)asub.textContent='вкл · нажатий '+autoN;}catch(e){}}\n"
+"function autoTick(){try{var n=bars();if(!n)return;var now=Date.now();if(now-keyLast<KEY_MS)return;keyLast=now;for(var i=0;i<n;i++){ev('OnProgressBarClick',i);autoN++;}asub.textContent='вкл · нажатий '+autoN;}catch(e){}}\n"
 "function setAuto(v){if(v===auto)return;auto=v;asw.className='shx-sw'+(auto?' on':'');\n"
-"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';autoT=setInterval(autoTick,800);}else asub.textContent='выкл';}\n"
+"if(autoT){clearInterval(autoT);autoT=null;}if(auto){autoN=0;asub.textContent='вкл · нажатий 0';keyLast=0;autoT=setInterval(autoTick,100);}else asub.textContent='выкл';}\n"
 "ar.addEventListener('click',function(){setAuto(!auto);});\n"
-"var cyc=false,cycT=null,cycLast=0,clk=0,phase='rack',fails=0,rix=0,rkWait=false;\n"
+"var cyc=false,cycT=null,cycLast=0,clk=0,phase='rack',fails=0,rix=0,rkWait=false,clkLast=0,syncLast=0,hadBar=0,autoByCyc=false;\n"
+"var UI_CD=1050,IDLE_MS=500,SETTLE_MS=450,SYNC_MS=250,CYC_MS=120;\n"
 "function toRack(){var a=S.rk;if(!a||!a.length){csub.textContent='стоек не видно (подойдите к шахте)';return;}\n"
 "if(rkWait)rix++;rkWait=true;var q=a[rix%a.length];csub.textContent='к стойке '+(rix%a.length+1)+'/'+a.length;\n"
 "try{window.sendChatInput('/tpl to '+q[0]+' '+q[1]+' '+q[2]);}catch(e){}}\n"
-"function cycTick(){try{cmd('sync');var now=Date.now();\n"
-"if(bars()){cycLast=now;clk=0;fails=0;phase='ore';csub.textContent='кружок идёт';return;}\n"
+"function cycTick(){try{var now=Date.now();if(now-syncLast>=SYNC_MS){cmd('sync');syncLast=now;}\n"
+"if(bars()){hadBar=1;cycLast=now;clk=0;fails=0;phase='ore';csub.textContent='кружок идёт';return;}\n"
+"if(hadBar){hadBar=0;cmd('sync');syncLast=now;cycLast=now;}\n"
 "var L=intr();\n"
-"if(L){if(clk<2){var tt=L[0].title;ev('OnInteractionsClick',L[0].type);clk++;cycLast=now;rkWait=false;csub.textContent='взаимодействие: '+String(tt).replace(/<[^>]*>/g,' ');return;}}else clk=0;\n"
-"if(now-cycLast<1800)return;cycLast=now;clk=0;\n"
+"if(L){if(clk<2){if(now-clkLast<UI_CD)return;var tt=L[0].title;ev('OnInteractionsClick',L[0].type);clk++;clkLast=now;cycLast=now;rkWait=false;csub.textContent='взаимодействие: '+String(tt).replace(/<[^>]*>/g,' ');return;}}else clk=0;\n"
+"if(now-cycLast<IDLE_MS)return;cycLast=now+SETTLE_MS;clk=0;\n"
 "if(S.k){window.sendChatInput('/tpl gps');csub.textContent='к маркеру сервера';return;}\n"
 "if(phase==='ore'&&fails<2){var ti=pickTgt();if(ti<0){csub.textContent='руды рядом нет: подойдите к месторождениям';return;}\n"
 "fails++;goPt(ti);csub.textContent='к руде: '+T[ti].n+(ti===cycTgt?'':' (запасная)')+' ('+fails+')';}\n"
 "else{phase='ore';fails=0;toRack();}}catch(e){csub.textContent='ошибка: '+e;}}\n"
-"cr.addEventListener('click',function(){cyc=!cyc;csw.className='shx-sw'+(cyc?' on':'');\n"
+"function cycSet(v,why){if(v===cyc)return;cyc=v;csw.className='shx-sw'+(cyc?' on':'');\n"
 "if(cycT){clearInterval(cycT);cycT=null;}\n"
-"if(cyc){setAuto(true);clk=0;cycLast=0;phase='rack';fails=0;rkWait=false;csub.textContent='вкл';cycT=setInterval(cycTick,1200);}else csub.textContent='выкл · цель — последняя нажатая руда';});\n"
+"if(cyc){autoByCyc=!auto;setAuto(true);clk=0;cycLast=0;clkLast=0;syncLast=0;hadBar=0;phase='rack';fails=0;rkWait=false;csub.textContent='вкл';cycT=setInterval(cycTick,CYC_MS);}\n"
+"else{if(why&&autoByCyc)setAuto(false);autoByCyc=false;csub.textContent=why||'выкл · цель — последняя нажатая руда';}}\n"
+"cr.addEventListener('click',function(){cycSet(!cyc);});\n"
+"function manual(src){if(cyc)cycSet(false,'стоп: ручное управление ('+src+')');}\n"
+"function hookCtl(n,onlyStick){var f=window[n];if(typeof f!=='function'||f.__shx)return;var w=function(p){try{if(cyc&&typeof p==='string'&&p.indexOf('<Mouse>/')!==0&&(!onlyStick||p==='<Gamepad>/leftStick'))manual(p==='<Gamepad>/leftStick'?'джойстик':'кнопка');}catch(e){}return f.apply(this,arguments);};w.__shx=1;window[n]=w;}\n"
+"hookCtl('onScreenControlTouchStart',false);hookCtl('onScreenControlTouchMove',true);\n"
+"window.addEventListener('keydown',function(e){try{if(!cyc)return;var t=e.target,tg=t&&t.tagName;if(tg==='INPUT'||tg==='TEXTAREA'||(t&&t.isContentEditable))return;manual('клавиша');}catch(x){}},true);\n"
 "var dx=0,dy=0,sx=0,sy=0,tch=false;\n"
 "fab.addEventListener('touchstart',function(e){var t=e.touches[0];sx=t.clientX;sy=t.clientY;var b=fab.getBoundingClientRect();dx=t.clientX-b.left;dy=t.clientY-b.top;tch=true;dragged=false;});\n"
 "fab.addEventListener('touchmove',function(e){if(!tch)return;var t=e.touches[0];if(Math.abs(t.clientX-sx)+Math.abs(t.clientY-sy)<12&&!dragged)return;dragged=true;\n"
