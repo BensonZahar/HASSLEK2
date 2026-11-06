@@ -794,7 +794,7 @@ static void air_cmd_npc_list(void) {
 #define AIR_EX_REARM_R 45.0f                      /* дальше этого от знака он снова «не пройден» */
 #define AIR_EX_HOLD_MS 2200                       /* стоим у знака (сервер смотрит скорость каждые 500 мс) */
 #define AIR_EX_SPEED 14.0f                        /* скорость по экзамену, м/с */
-#define AIR_EX_MAXSPEED 30.0f
+#define AIR_EX_MAXSPEED 300.0f                    /* потолок /air exam speed; радиус торможения у знака растёт со скоростью (см. air_ex_drive), иначе быстрая машина проскочит зону торможения за кадр */
 #define AIR_EX_VAPP_K 0.35f                       /* скорость подъезда к знаку = K × расстояние до него, но не меньше VAPP_MIN */
 #define AIR_EX_VAPP_MIN 1.2f
 #define AIR_EX_GATE_COS 0.5f                      /* cos 60°: допуск курса у знака (сервер — ±65°) */
@@ -1125,7 +1125,7 @@ static void air_ex_watch(int kind, const float* np, const float* me, long long n
 /* Один шаг «вождения по экзамену». hold — где машина сейчас (Unity), d — вектор до цели. Возвращает 0, если на этом тике двигаться не надо (стоим у знака или
    разворачиваемся на месте), иначе 1 и в *spd — скорость, м/с */
 static int air_ex_drive(void* veh, const float* hold, const float* d, long long nowMs, float dt, float* spd) {
-    float hl = (float)__builtin_sqrt((double)d[0] * d[0] + (double)d[2] * d[2]), tx, tz, ac, bestD = 1e9f; int i, best = -1;
+    float hl = (float)__builtin_sqrt((double)d[0] * d[0] + (double)d[2] * d[2]), tx, tz, ac, bestD = 1e9f, slowR, rearmR; int i, best = -1;
     *spd = g_air_exSpeed;
     if (hl > 0.5f) { tx = d[0] / hl; tz = d[2] / hl; } else { tx = g_air_hx; tz = g_air_hz; }   /* почти над точкой — курс не меняем */
     if (!g_air_hOk) {                                              /* первый шаг: курс — как машина стоит сейчас */
@@ -1169,11 +1169,13 @@ static int air_ex_drive(void* veh, const float* hold, const float* d, long long 
         g_air_exSign = -1;
     }
     if (ac < AIR_EX_ALIGN_COS) { *spd = 0.0f; return 0; }          /* курс ещё не тот — крутимся на месте */
+    slowR = AIR_EX_SLOW_R; if (g_air_exSpeed * 0.6f > slowR) slowR = g_air_exSpeed * 0.6f;   /* быстрее — раньше начинаем тормозить (0,6 с хода) */
+    rearmR = slowR + (AIR_EX_REARM_R - AIR_EX_SLOW_R);
     for (i = 0; i < AIR_EX_NSIGN; i++) {
         float sx = g_air_exSigns[i][0] - hold[0], sz = g_air_exSigns[i][1] - hold[2], dn = (float)__builtin_sqrt((double)sx * sx + (double)sz * sz);
-        if (dn > AIR_EX_REARM_R) { g_air_exDone &= ~(1u << i); g_air_exGateLog &= ~(1u << i); continue; }
+        if (dn > rearmR) { g_air_exDone &= ~(1u << i); g_air_exGateLog &= ~(1u << i); continue; }
         if ((g_air_exDone >> i) & 1u) continue;                    /* на этом проходе уже стояли */
-        if (dn > AIR_EX_SLOW_R) continue;
+        if (dn > slowR) continue;
         if (g_air_hx * g_air_exSigns[i][2] + g_air_hz * g_air_exSigns[i][3] < AIR_EX_GATE_COS) {            /* курс не тот: сервер этот знак не засчитает (и не накажет) */
             if (!((g_air_exGateLog >> i) & 1u)) {
                 char lg[200]; Buf x; g_air_exGateLog |= 1u << i;
@@ -1546,7 +1548,7 @@ static void air_usage(void) {
     chat_usage("Вышли из машины в полёте — она встанет на землю, вы продолжите лететь пешком");
     chat_usage("/air mark — автолёт к красной метке (маркер сервера или метка карты); появилась/сменилась — летит к новой. /air mark gps|cp — только карта|только маркер, /air mark off — выключить");
     chat_usage("/air exam go [chat] — СЕЙЧАС ЕХАТЬ ЭКЗАМЕН: за рулём, одной командой (полёт + маркер сервера + режим экзамена + остановки у знаков STOP; chat — ещё и перехват чата). /air exam stop — остановить и отпустить машину");
-    chat_usage("/air exam [on|off|auto] — режим автошколы для /air mark cp: курс машины по дороге и остановки у знаков STOP (авто — включается на старте экзамена);  /air exam speed N — скорость экзамена, м/с (3…30, по умолчанию 14)");
+    chat_usage("/air exam [on|off|auto] — режим автошколы для /air mark cp: курс машины по дороге и остановки у знаков STOP (авто — включается на старте экзамена);  /air exam speed N — скорость экзамена, м/с (3…300, по умолчанию 14)");
     chat_usage("/air face [on|off] — в машине нос по направлению полёта (по умолчанию ВКЛ; выкл — машина летит боком с прежним курсом)");
     chat_usage("/air stand — вкл/выкл анимацию «как на ровном» (без левитации);  /air npc — ближайшие NPC с ID;  /air to ID — к NPC (3 м над ним);  /air watch — писать ID ближайшего NPC;  /air status;  /air input");
 }
@@ -1719,7 +1721,7 @@ static void native_air_cmd(void* self, void* args, void* mi) {
                 b_s(&b, ", строк инструктора "); b_int(&b, g_airc_seen); b_s(&b, ", остановок по чату "); b_int(&b, g_air_chStops); b_s(&b, ". /air exam chat on|off"); chat_say(m);
             }
         } else if (nt >= 2 && (seq(tok[1], "speed") || seq(tok[1], "скорость"))) {
-            if (nt < 3 || !air_num(tok[2], &v)) { b_init(&b, m, sizeof m); b_s(&b, "/air exam: скорость сейчас "); b_fix(&b, g_air_exSpeed, 1); b_s(&b, " м/с. Задать: /air exam speed 14 (3…30)"); chat_say(m); return; }
+            if (nt < 3 || !air_num(tok[2], &v)) { b_init(&b, m, sizeof m); b_s(&b, "/air exam: скорость сейчас "); b_fix(&b, g_air_exSpeed, 1); b_s(&b, " м/с. Задать: /air exam speed 14 (3…300)"); chat_say(m); return; }
             if (v < 3.0f) v = 3.0f;
             if (v > AIR_EX_MAXSPEED) v = AIR_EX_MAXSPEED;
             g_air_exSpeed = v;
