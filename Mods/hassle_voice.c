@@ -60,6 +60,12 @@ extern long pwrite(int, const void*, unsigned long, long);
 #endif
 extern int clock_gettime(int, void*);
 extern int unlink(const char*);
+extern void* malloc(unsigned long);
+extern void* realloc(void*, unsigned long);
+extern void free(void*);
+extern void* opendir(const char*);
+extern void* readdir(void*);
+extern int closedir(void*);
 
 typedef unsigned long long vc_u64;
 
@@ -322,6 +328,7 @@ typedef struct {
     u16 pid; u8 use3d, attach, effect; int bass;
     float dist;                                   /* 3D-расстояние до говорящего в начале реплики, м; < 0 — нет данных */
     char path[360], nick[48];
+    u8* mem; long memLen, memCap; int memOver;     /* реплика целиком в памяти (её и шлём в Telegram) */
 } VcSess;
 static VcSess g_vc_sess[VC_SESS];
 static u32 g_vc_serialSeed;
@@ -362,11 +369,17 @@ static const char* vc_kind(const VcPkt* p) {
 #define VC_TG_MIN_MS   400                   /* короче — щелчки и обрывки, не шлём */
 #define VC_UP_HEAD     4096                  /* место под заголовки multipart перед файлом (подпись + кнопки reply_markup) */
 #define VC_UP_MAX      (3 * 1024 * 1024)     /* файл больше (>10 мин речи) не шлём; в .bss — память занимается только по факту записи */
-typedef struct { char path[360]; char nick[48]; const char* kind; int pid, durMs; float dist; } VcTgJob;   /* pid < 0 — не игрок; dist < 0 — расстояние неизвестно */
+/* Реплика целиком (Ogg/Opus) лежит в куче, на диск не пишется (VC_KEEP_FILES 0). data принадлежит заданию: стирает его воркер после отправки;
+   исключение — буфер последней реплики (g_vc_last), он живёт, пока не придёт следующая, для «/voice tg test». */
+#ifndef VC_KEEP_FILES
+#define VC_KEEP_FILES 0                      /* 1 — дополнительно складывать каждую реплику файлом .opus в папку voice (как раньше) */
+#endif
+typedef struct { u8* data; long len; char nick[48]; const char* kind; int pid, durMs; float dist; } VcTgJob;   /* pid < 0 — не игрок; dist < 0 — расстояние неизвестно */
 static VcTgJob g_vc_tgq[VC_TG_Q];
 static volatile unsigned g_vc_tgHead, g_vc_tgTail;
 static VcTgJob g_vc_last;                    /* последняя закрытая реплика — для /voice tg test */
 static volatile int g_vc_haveLast;
+static volatile int g_vc_lastDone;           /* 1 — с последней репликой закончили (отправлена/не нужна): буфер можно освободить, когда придёт новая */
 static volatile int g_vc_tg;                 /* 1 — слать в Telegram */
 static volatile int g_vc_tgCfg;              /* 1 — токен и чат заданы */
 static char g_vc_tgTok[160], g_vc_tgChat[48], g_vc_tgWho[48];
@@ -404,22 +417,40 @@ static void vc_tg_caption(const VcTgJob* j, const char* who, char* out, unsigned
     b_s(&b, " · "); b_int(&b, j->durMs / 1000); b_ch(&b, '.'); b_int(&b, (j->durMs % 1000) / 100); b_s(&b, " с");
 }
 
+/* буфер задания больше не нужен (отправили, не смогли, выбросили из очереди); буфер последней реплики не трогаем */
+static void vc_tmp_drop(u8* d) {
+    if (!d) return;
+    if (g_vc_haveLast && d == g_vc_last.data) return;
+    free(d);
+}
 static void vc_tg_push(const VcTgJob* src) {
     unsigned h = g_vc_tgHead;
-    if (h - __atomic_load_n(&g_vc_tgTail, __ATOMIC_ACQUIRE) >= VC_TG_Q) { __atomic_fetch_add(&g_vc_tgDrop, 1, __ATOMIC_RELAXED); return; }
+    if (h - __atomic_load_n(&g_vc_tgTail, __ATOMIC_ACQUIRE) >= VC_TG_Q) { __atomic_fetch_add(&g_vc_tgDrop, 1, __ATOMIC_RELAXED); vc_tmp_drop(src->data); return; }
     g_vc_tgq[h & (VC_TG_Q - 1)] = *src;
     __atomic_store_n(&g_vc_tgHead, h + 1, __ATOMIC_RELEASE);
 }
 /* Зовётся из писателя при закрытии файла (единственный поставщик очереди; из заявки /voice tg test — тоже он). */
-static void vc_tg_enqueue(const char* path, const char* nick, const char* kind, int pid, int durMs, float dist) {
+static void vc_tg_enqueue(u8* data, long len, const char* nick, const char* kind, int pid, int durMs, float dist) {
     VcTgJob j; unsigned i;
-    for (i = 0; path[i] && i < sizeof j.path - 1; i++) j.path[i] = path[i];
-    j.path[i] = 0;
+    j.data = data; j.len = len;                  /* буфер переходит во владение заданию */
     for (i = 0; nick[i] && i < sizeof j.nick - 1; i++) j.nick[i] = nick[i];
     j.nick[i] = 0;
     j.kind = kind; j.pid = pid; j.durMs = durMs; j.dist = dist;
-    g_vc_last = j; g_vc_haveLast = 1;
-    if (!g_vc_tg || !g_vc_tgCfg || durMs < VC_TG_MIN_MS) return;
+    {   u8* old = g_vc_last.data; int oldDone = g_vc_lastDone, had = g_vc_haveLast;
+        g_vc_lastDone = 0; g_vc_last = j; g_vc_haveLast = 1;
+        if (had && oldDone && old && old != data) free(old);      /* прежняя «последняя» уже отправлена — больше не нужна */
+    }
+    if (!data || !g_vc_tg || !g_vc_tgCfg || durMs < VC_TG_MIN_MS) { g_vc_lastDone = 1; return; }   /* слать не будем — буфер нужен только как «последний» */
+    vc_tg_push(&j);
+}
+/* «/voice tg test»: копия последней реплики в очередь (зовётся только из писателя — там же, где enqueue, чтобы буфер не освободили из-под рук) */
+static void vc_tg_push_last(void) {
+    VcTgJob j;
+    if (!g_vc_haveLast || !g_vc_last.data || g_vc_last.len < 64) return;
+    j = g_vc_last;
+    j.data = (u8*)malloc((unsigned long)j.len);
+    if (!j.data) return;
+    memcpy(j.data, g_vc_last.data, (unsigned long)j.len);
     vc_tg_push(&j);
 }
 
@@ -473,9 +504,8 @@ static void vc_mp_field(Buf* b, const char* boundary, const char* name) {
 }
 /* Собирает multipart в g_vc_upBuf: sendVoice (chat_id, caption, parse_mode, duration, voice) или sendDocument. Возвращает длину тела или 0. */
 static unsigned long vc_tg_build(const char* boundary, const char* chat, const VcTgJob* j, const char* cap, const char* kb, int asDoc) {
-    Buf b; int fd, tooBig = 0; long off, got = 0;
-    fd = open(j->path, 0);
-    if (fd < 0) { vc_tg_msg("не открыть файл реплики"); return 0; }
+    Buf b; long off;
+    if (!j->data || j->len < 64) { vc_tg_msg("запись реплики пустая"); return 0; }
     b_init(&b, (char*)g_vc_upBuf, VC_UP_HEAD);
     vc_mp_field(&b, boundary, "chat_id"); b_s(&b, chat); b_s(&b, "\r\n");
     vc_mp_field(&b, boundary, "caption"); b_s(&b, cap); b_s(&b, "\r\n");
@@ -484,18 +514,10 @@ static unsigned long vc_tg_build(const char* boundary, const char* chat, const V
     if (!asDoc) { vc_mp_field(&b, boundary, "duration"); b_int(&b, (j->durMs + 500) / 1000); b_s(&b, "\r\n"); }
     b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\""); b_s(&b, asDoc ? "document" : "voice");
     b_s(&b, "\"; filename=\"voice.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
-    if (b.n + 8 >= VC_UP_HEAD) { close(fd); vc_tg_msg("подпись слишком длинная"); return 0; }
+    if (b.n + 8 >= VC_UP_HEAD) { vc_tg_msg("подпись слишком длинная"); return 0; }
     off = (long)b.n;
-    for (;;) {
-        long room = (long)sizeof g_vc_upBuf - 256 - off, n;
-        if (room <= 0) { char t; if (read(fd, &t, 1) > 0) tooBig = 1; break; }
-        n = read(fd, g_vc_upBuf + off, (unsigned long)room);
-        if (n <= 0) break;
-        off += n; got += n;
-    }
-    close(fd);
-    if (tooBig) { vc_tg_msg("реплика слишком длинная для отправки"); return 0; }
-    if (got < 64) { vc_tg_msg("файл реплики пустой"); return 0; }
+    if (off + j->len > (long)sizeof g_vc_upBuf - 256) { vc_tg_msg("реплика слишком длинная для отправки"); return 0; }
+    memcpy(g_vc_upBuf + off, j->data, (unsigned long)j->len); off += j->len;
     b_init(&b, (char*)g_vc_upBuf + off, 256);
     b_s(&b, "\r\n--"); b_s(&b, boundary); b_s(&b, "--\r\n");
     return (unsigned long)off + b.n;
@@ -654,32 +676,75 @@ static void* vc_tg_main(void* arg) {
             static VcTgJob j;
             j = g_vc_tgq[t & (VC_TG_Q - 1)];
             __atomic_store_n(&g_vc_tgTail, t + 1, __ATOMIC_RELEASE);
-            if (g_vc_tg && g_vc_tgCfg) { vc_tg_send(&j); usleep(1000000); }     /* пауза: у Telegram лимит ~20 сообщений в минуту на чат */
+            if (g_vc_tg && g_vc_tgCfg) vc_tg_send(&j);
+            if (g_vc_haveLast && j.data == g_vc_last.data) g_vc_lastDone = 1;      /* это и есть последняя реплика — буфер остаётся до следующей */
+            else vc_tmp_drop(j.data);                                               /* отправили (или не смогли) — больше не нужна */
+            if (g_vc_tg && g_vc_tgCfg) usleep(1000000);                             /* пауза: у Telegram лимит ~20 сообщений в минуту на чат */
         }
     }
     return NULL;
 }
 
+/* страница Ogg → буфер в памяти (всегда) и файл (только при VC_KEEP_FILES); 0 — ошибка записи файла */
+static int vc_sink(VcSess* s, const u8* p, int n) {
+    if (!s->memOver) {
+        if (s->memLen + n > VC_UP_MAX) { free(s->mem); s->mem = NULL; s->memLen = s->memCap = 0; s->memOver = 1; }   /* длиннее лимита Telegram — не копим */
+        else {
+            if (s->memLen + n > s->memCap) {
+                long cap = s->memCap ? s->memCap * 2 : 16384; u8* m;
+                while (cap < s->memLen + n) cap *= 2;
+                m = (u8*)realloc(s->mem, (unsigned long)cap);
+                if (!m) { free(s->mem); s->mem = NULL; s->memLen = s->memCap = 0; s->memOver = 1; return s->fd < 0 ? 1 : vc_write_all(s->fd, p, n); }
+                s->mem = m; s->memCap = cap;
+            }
+            memcpy(s->mem + s->memLen, p, (unsigned long)n); s->memLen += n;
+        }
+    }
+    return s->fd >= 0 ? vc_write_all(s->fd, p, n) : 1;
+}
+/* при старте стираем *.opus, оставшиеся от прошлых версий мода (tg.txt и флаги не трогаем) */
+static void vc_clean_old(void) {
+    void* d; char pp[420]; int n = 0;
+    if (!g_vc_dir[0]) return;
+    d = opendir(g_vc_dir);
+    if (!d) return;
+    for (;;) {
+        char* e = (char*)readdir(d); const char* nm; unsigned l = 0, i, k = 0;
+        if (!e) break;
+        nm = e + 19;                                            /* bionic: dirent.d_name — со смещения 19 (d_ino 8 + d_off 8 + d_reclen 2 + d_type 1) */
+        while (nm[l] && l < 200) l++;
+        if (l < 6 || !(nm[l-5] == '.' && nm[l-4] == 'o' && nm[l-3] == 'p' && nm[l-2] == 'u' && nm[l-1] == 's')) continue;
+        for (i = 0; g_vc_dir[i] && k < sizeof pp - 2; i++) pp[k++] = g_vc_dir[i];
+        pp[k++] = '/';
+        for (i = 0; nm[i] && k < sizeof pp - 1; i++) pp[k++] = nm[i];
+        pp[k] = 0;
+        if (unlink(pp) == 0) n++;
+    }
+    closedir(d);
+    if (n) dlog_i("voice: стёр старых файлов реплик, штук ", n);
+}
 static void vc_sess_close(VcSess* s) {
     if (!s->active) return;
     if (s->heldLen > 0) {                          /* последний пакет — со флагом конца потока */
         u8 pg[VC_PAGE_MAX]; int n;
         s->gp += (vc_u64)s->heldSamples;
         n = vc_ogg_page(pg, 4, s->gp, s->serial, s->seq++, s->held, s->heldLen);
-        if (vc_write_all(s->fd, pg, n)) __atomic_fetch_add(&g_vc_kb, (unsigned)((n + 512) / 1024), __ATOMIC_RELAXED);
+        if (vc_sink(s, pg, n)) __atomic_fetch_add(&g_vc_kb, (unsigned)((n + 512) / 1024), __ATOMIC_RELAXED);
         s->heldLen = 0;
     }
-    close(s->fd);
+    if (s->fd >= 0) close(s->fd);
     s->fd = -1; s->active = 0;
-    if (s->pkts > 0) {                             /* файл закрыт и целый — отдаём на отправку в Telegram (если включено) */
+    if (s->pkts > 0 && s->mem) {                   /* реплика целая — отдаём на отправку в Telegram (если включено) */
         VcPkt kp; kp.effect = s->effect; kp.use3d = s->use3d;
         if (s->dist < 0 && s->use3d && s->attach == 2 && s->effect == 0) s->dist = vc_dist(s->pid);   /* в начале данных не было — пробуем ещё раз */
-        vc_tg_enqueue(s->path, s->nick, vc_kind(&kp), (s->use3d && s->attach == 2) ? (int)s->pid : -1, (int)(((s->gp > VC_PRESKIP ? s->gp - VC_PRESKIP : 0) * 1000) / 48000), s->dist);
-    }
+        vc_tg_enqueue(s->mem, s->memLen, s->nick, vc_kind(&kp), (s->use3d && s->attach == 2) ? (int)s->pid : -1, (int)(((s->gp > VC_PRESKIP ? s->gp - VC_PRESKIP : 0) * 1000) / 48000), s->dist);
+        s->mem = NULL;                             /* буфер ушёл заданию */
+    } else { free(s->mem); s->mem = NULL; }
+    s->memLen = s->memCap = 0;
 }
 
 static int vc_sess_open(VcSess* s, const VcPkt* p) {
-    char stamp[40], nick[48] = "", clean[32] = "", name[64], path[360], idp[24]; Buf b;
+    char stamp[40], nick[48] = "", clean[32] = "", name[64], path[360] = "", idp[24]; Buf b;
     u8 pg[VC_PAGE_MAX], tg[512]; int n, k, fd = -1;
     if (!vc_prepare_dir()) return 0;
     if (p->use3d && p->attach == 2 && p->effect == 0) vc_nick(p->pid, nick, sizeof nick);   /* ник известен только у позиционного голоса игрока */
@@ -687,6 +752,7 @@ static int vc_sess_open(VcSess* s, const VcPkt* p) {
     vc_stamp(time(NULL), stamp);
     b_init(&b, idp, sizeof idp);
     if (p->use3d && p->attach == 2) { b_ch(&b, 'p'); b_int(&b, p->pid); } else { b_ch(&b, 's'); b_int(&b, p->bass); }
+#if VC_KEEP_FILES
     for (k = 0; k < 20; k++) {                     /* имя занято (тот же говорящий в ту же секунду) — добавляем счётчик */
         b_init(&b, name, sizeof name);
         b_s(&b, stamp); b_ch(&b, '_'); b_s(&b, vc_kind(p)); b_ch(&b, '_'); b_s(&b, idp);
@@ -701,7 +767,11 @@ static int vc_sess_open(VcSess* s, const VcPkt* p) {
         if (!(__atomic_fetch_add(&g_vc_errs, 1, __ATOMIC_RELAXED) % 50)) dlog2("voice: не открыть файл: ", path);
         return 0;
     }
+#else
+    (void)name; (void)k;                           /* на диск не пишем: реплика целиком в памяти */
+#endif
     s->fd = fd; s->active = 1; s->st = p->st;
+    s->mem = NULL; s->memLen = s->memCap = 0; s->memOver = 0;
     s->lastMs = s->startMs = p->ms;
     s->gp = VC_PRESKIP; s->seq = 0; s->pkts = 0; s->heldLen = 0; s->heldSamples = 0;
     s->pid = p->pid; s->use3d = p->use3d; s->attach = p->attach; s->effect = p->effect; s->bass = p->bass;
@@ -719,14 +789,16 @@ static int vc_sess_open(VcSess* s, const VcPkt* p) {
         b_init(&t, artist, sizeof artist); b_s(&t, nick);
         b_init(&t, com, sizeof com); b_s(&t, vc_kind(p));
         n = vc_ogg_page(pg, 2, 0, s->serial, s->seq++, tg, vc_opus_head(tg));
-        if (!vc_write_all(fd, pg, n)) goto bad;
+        if (!vc_sink(s, pg, n)) goto bad;
         n = vc_ogg_page(pg, 0, 0, s->serial, s->seq++, tg, vc_opus_tags(tg, (int)sizeof tg, title, artist, com));
-        if (!vc_write_all(fd, pg, n)) goto bad;
+        if (!vc_sink(s, pg, n)) goto bad;
     }
     __atomic_fetch_add(&g_vc_files, 1, __ATOMIC_RELAXED);
     return 1;
 bad:
-    close(fd); s->active = 0; s->fd = -1;
+    if (fd >= 0) close(fd);
+    free(s->mem); s->mem = NULL; s->memLen = s->memCap = 0;
+    s->active = 0; s->fd = -1;
     __atomic_fetch_add(&g_vc_errs, 1, __ATOMIC_RELAXED);
     return 0;
 }
@@ -753,7 +825,7 @@ static void vc_on_packet(const VcPkt* p) {
         u8 pg[VC_PAGE_MAX]; int n;
         s->gp += (vc_u64)s->heldSamples;
         n = vc_ogg_page(pg, 0, s->gp, s->serial, s->seq++, s->held, s->heldLen);
-        if (!vc_write_all(s->fd, pg, n)) { __atomic_fetch_add(&g_vc_errs, 1, __ATOMIC_RELAXED); vc_sess_close(s); return; }
+        if (!vc_sink(s, pg, n)) { __atomic_fetch_add(&g_vc_errs, 1, __ATOMIC_RELAXED); vc_sess_close(s); return; }
         __atomic_fetch_add(&g_vc_kb, (unsigned)((n + 512) / 1024), __ATOMIC_RELAXED);
     }
     memcpy(s->held, p->data, (unsigned long)p->len);
@@ -1065,7 +1137,7 @@ static void native_voice_cmd(void* self, void* args, void* mi) {
             if (!g_vc_tgCfg) vc_cfg_load();
             if (!g_vc_tgCfg) { chat_say("Voice: Telegram не настроен (нет tg.txt)"); return; }
             if (!g_vc_haveLast) { chat_say("Voice: ещё не было ни одной реплики — отправлять нечего"); return; }
-            { VcTgJob j = g_vc_last; vc_tg_push(&j); }
+            __atomic_store_n(&g_vc_reqTest, 1, __ATOMIC_RELEASE);          /* копию в очередь ставит писатель */
             chat_say("Voice: последняя реплика поставлена в очередь, итог — в /voice tg");
             return;
         }
@@ -1138,7 +1210,7 @@ static void vc_requests(void) {
     else if (r == 2) { vc_stop(); vc_marker_set(0); }
     r = __atomic_exchange_n(&g_vc_reqTgFlag, 0, __ATOMIC_ACQ_REL);
     if (r == 1) vc_flag_set("tg_on", 1); else if (r == 2) vc_flag_set("tg_on", 0);
-    if (__atomic_exchange_n(&g_vc_reqTest, 0, __ATOMIC_ACQ_REL) && g_vc_haveLast) { VcTgJob j = g_vc_last; vc_tg_push(&j); }
+    if (__atomic_exchange_n(&g_vc_reqTest, 0, __ATOMIC_ACQ_REL) && g_vc_haveLast) vc_tg_push_last();
 }
 
 /* ───────────── HTTP для скрипта (127.0.0.1:17791..17800) ─────────────
@@ -1298,6 +1370,9 @@ static void* vc_main(void* arg) {
     ensure_attached();                                                /* ник игрока читаем через IL2CPP из этого потока */
     hm_mod_ready(g_vc_modId);
     dlog("voice: мод загружен, команда /voice");
+#if !VC_KEEP_FILES
+    if (vc_prepare_dir()) vc_clean_old();                             /* остатки прошлых версий: реплики теперь живут только в памяти */
+#endif
     if (vc_marker_get()) {                                            /* раньше включали /voice on — продолжаем */
         if (vc_start()) dlog("voice: запись включена автоматически (флаг auto_on)");
         else dlog2("voice: автозапуск не вышел: ", g_vc_err);

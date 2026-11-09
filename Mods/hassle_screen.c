@@ -50,6 +50,12 @@
 #define SCR_LIVE_W 854
 #define SCR_LIVE_H 480
 
+/* Снимки на диск не пишутся: последний PNG лежит в памяти (g_scr_png) и отдаётся оттуда — и в WebView (/screen/last), и в Telegram (/screen/tg).
+ * Каждый новый снимок заменяет предыдущий. SCR_KEEP_FILES 1 — вернуть файлы: remote.png (запрос из скрипта) и screen_ГГГГММДД_ЧЧММСС_N.png (команда /screen). */
+#ifndef SCR_KEEP_FILES
+#define SCR_KEEP_FILES 0
+#endif
+
 #define SCR_DEF_DELAY_S 3
 #define SCR_MAX_DELAY_S 30
 #define SCR_MAX_PNG (64 * 1024 * 1024)
@@ -64,7 +70,29 @@ static char g_scr_dir[320], g_scr_lastPath[400];
 static volatile int g_scr_remote;            /* 1 — заявка пришла по HTTP: пишем в shots/remote.png и не шумим в чат игры */
 static volatile int g_scr_fails;             /* сколько снимков не вышло */
 static volatile int g_scr_doneSeq;           /* номер последнего удачного снимка (0 — ещё не было) */
-static volatile long g_scr_lastLen;          /* длина PNG последнего удачного снимка */
+static volatile long g_scr_lastLen;
+extern void* malloc(unsigned long);
+extern void free(void*);
+static u8* g_scr_png; static long g_scr_pngLen; static volatile int g_scr_pngLock;   /* последний PNG в памяти; под спинлоком: меняет главный поток, читают HTTP-потоки */
+static u8* g_scr_tgData; static long g_scr_tgLen;                                     /* копия PNG для текущей отправки в Telegram */
+static int scr_png_store(const u8* d, long n) {
+    u8* nb = (u8*)malloc((unsigned long)n); u8* old;
+    if (!nb) return 0;
+    memcpy(nb, d, (unsigned long)n);
+    while (__sync_lock_test_and_set(&g_scr_pngLock, 1)) usleep(200);
+    old = g_scr_png; g_scr_png = nb; g_scr_pngLen = n;
+    __sync_lock_release(&g_scr_pngLock);
+    free(old);                                                    /* читатели копируют под тем же замком, так что старый буфер уже никому не нужен */
+    return 1;
+}
+/* копия последнего PNG (освобождает вызывающий); NULL — снимка нет */
+static u8* scr_png_snapshot(long* n) {
+    u8* c = NULL;
+    while (__sync_lock_test_and_set(&g_scr_pngLock, 1)) usleep(200);
+    if (g_scr_png && g_scr_pngLen > 0) { c = (u8*)malloc((unsigned long)g_scr_pngLen); if (c) { memcpy(c, g_scr_png, (unsigned long)g_scr_pngLen); *n = g_scr_pngLen; } }
+    __sync_lock_release(&g_scr_pngLock);
+    return c;
+}          /* длина PNG последнего удачного снимка */
 static int g_scr_httpPort;
 static char g_scr_id[40];                    /* метка процесса: скрипт этого окна присылает её командой «/screen kt…» (см. scr_take_id), чтобы найти СВОЙ порт среди чужих */
 static volatile int g_scr_frames;            /* сколько раз пришло событие конца кадра — по нему скрипт видит, что окно игры не рисуется (свёрнуто/на паузе) */
@@ -109,6 +137,36 @@ static int scr_get_int(void* m) {
     return *(int*)((char*)r + HDR);                      /* значение в боксе лежит сразу за заголовком объекта */
 }
 
+#if !SCR_KEEP_FILES
+extern int unlink(const char*);
+extern void* opendir(const char*);
+extern void* readdir(void*);
+extern int closedir(void*);
+/* стирает файлы снимков прошлых версий: screen_*.png, remote.png (+.tmp) */
+static void scr_clean_old(void) {
+    static int done; void* d; char p[460]; int n = 0;
+    if (done || !g_scr_dir[0]) return;
+    done = 1;
+    d = opendir(g_scr_dir);
+    if (!d) return;
+    for (;;) {
+        char* e = (char*)readdir(d); const char* nm; unsigned l = 0, i, k = 0; int mine;
+        if (!e) break;
+        nm = e + 19;                                    /* bionic: dirent.d_name — со смещения 19 */
+        while (nm[l] && l < 200) l++;
+        mine = (l >= 11 && sprefix(nm, "screen_") && nm[l-4] == '.' && nm[l-3] == 'p' && nm[l-2] == 'n' && nm[l-1] == 'g') || seq(nm, "remote.png") || seq(nm, "remote.png.tmp");
+        if (!mine) continue;
+        for (i = 0; g_scr_dir[i] && k < sizeof p - 2; i++) p[k++] = g_scr_dir[i];
+        p[k++] = '/';
+        for (i = 0; nm[i] && k < sizeof p - 1; i++) p[k++] = nm[i];
+        p[k] = 0;
+        if (unlink(p) == 0) n++;
+    }
+    closedir(d);
+    if (n) dlog_i("скрин: стёр старых файлов снимков, штук ", n);
+}
+#endif
+
 /* папка снимков = <папка журнала>/shots; возвращает 1, если папка готова */
 static int scr_prepare_dir(void) {
     unsigned i, last = 0;
@@ -123,6 +181,9 @@ static int scr_prepare_dir(void) {
         g_scr_dir[last + k] = 0;
         mkdir(g_scr_dir, 0777);
     }
+#if !SCR_KEEP_FILES
+    scr_clean_old();                                    /* один раз за запуск */
+#endif
     return 1;
 }
 
@@ -233,6 +294,8 @@ static void scr_capture(void) {
     data = (const char*)png + 4 * sizeof(void*);
     scr_stamp(time(NULL), st);
     seq = ++g_scr_seq;
+    if (!scr_png_store((const u8*)data, len)) { dlog("скрин: нет памяти под снимок"); scr_fail("Скрин: не вышло (нет памяти)"); goto done; }
+#if SCR_KEEP_FILES
     b_init(&b, path, sizeof path); b_s(&b, g_scr_dir);
     if (remote) b_s(&b, "/remote.png");
     else { b_s(&b, "/screen_"); b_s(&b, st); b_ch(&b, '_'); b_int(&b, seq); b_s(&b, ".png"); }
@@ -243,6 +306,9 @@ static void scr_capture(void) {
     close(fd);
     if (off < len) { dlog2("скрин: файл записан не целиком: ", path); scr_fail("Скрин: файл записан не целиком"); goto done; }
     if (rename(tmpath, path) != 0) { dlog2("скрин: не переименовать во временного в итоговый: ", path); scr_fail("Скрин: не вышло (переименование файла)"); goto done; }
+#else
+    b_init(&b, path, sizeof path); b_s(&b, "в памяти, на диск не пишется");
+#endif
     g_scr_lastW = w; g_scr_lastH = h;
     { int k; for (k = 0; k < (int)sizeof g_scr_lastPath - 1 && path[k]; k++) g_scr_lastPath[k] = path[k]; g_scr_lastPath[k] = 0; }
     g_scr_lastLen = len; g_scr_lastOk = 1;
@@ -418,9 +484,8 @@ static void scr_mp_field(Buf* b, const char* boundary, const char* name) {
    Обычная отправка: sendPhoto/sendDocument (chat_id, caption, reply_markup, файл).
    Правка (g_scr_tgEditId > 0): editMessageMedia (chat_id, message_id, media = {"type":"photo","media":"attach://scr",...}, reply_markup, файл «scr»). */
 static unsigned long scr_tg_build(const char* boundary, int asDoc) {
-    Buf b; int fd; long off, got = 0; int edit = g_scr_tgEditId > 0;
-    fd = open(g_scr_tgPath, 0);
-    if (fd < 0) { scr_tg_msg("не открыть файл снимка"); return 0; }
+    Buf b; long off, got; int edit = g_scr_tgEditId > 0;
+    if (!g_scr_tgData || g_scr_tgLen < 8) { scr_tg_msg("снимка нет в памяти"); return 0; }
     b_init(&b, (char*)g_scr_upBuf, SCR_UP_HEAD);
     scr_mp_field(&b, boundary, "chat_id"); b_s(&b, g_scr_tgChat); b_s(&b, "\r\n");
     if (edit) {
@@ -436,18 +501,10 @@ static unsigned long scr_tg_build(const char* boundary, int asDoc) {
     if (g_scr_tgKb[0]) { scr_mp_field(&b, boundary, "reply_markup"); b_s(&b, g_scr_tgKb); b_s(&b, "\r\n"); }
     b_s(&b, "--"); b_s(&b, boundary); b_s(&b, "\r\nContent-Disposition: form-data; name=\"");
     b_s(&b, edit ? "scr" : (asDoc ? "document" : "photo")); b_s(&b, "\"; filename=\"screen.png\"\r\nContent-Type: image/png\r\n\r\n");
-    if (b.n + 8 >= SCR_UP_HEAD) { close(fd); scr_tg_msg("подпись или кнопки слишком длинные"); return 0; }
-    off = (long)b.n;
-    for (;;) {
-        long room = (long)sizeof g_scr_upBuf - 256 - off, n;
-        if (room <= 0) break;
-        n = read(fd, g_scr_upBuf + off, (unsigned long)room);
-        if (n <= 0) break;
-        off += n; got += n;
-    }
-    close(fd);
-    if (got < 8) { scr_tg_msg("файл снимка пустой"); return 0; }
+    if (b.n + 8 >= SCR_UP_HEAD) { scr_tg_msg("подпись или кнопки слишком длинные"); return 0; }
+    off = (long)b.n; got = g_scr_tgLen;
     if (got > SCR_UP_MAX) { scr_tg_msg("снимок слишком большой для отправки"); return 0; }
+    memcpy(g_scr_upBuf + off, g_scr_tgData, (unsigned long)got); off += got;
     b_init(&b, (char*)g_scr_upBuf + off, 256);
     b_s(&b, "\r\n--"); b_s(&b, boundary); b_s(&b, "--\r\n");
     return (unsigned long)off + b.n;
@@ -543,7 +600,7 @@ out:
 #undef SCJ_FAIL
 }
 
-static void* scr_tg_thread(void* arg) {
+static void* scr_tg_thread_body(void* arg) {
     char boundary[64]; Buf b; unsigned long total; int code, asDoc;
     (void)arg;
     g_scr_tgMsg[0] = 0; g_scr_tgCode = 0; g_scr_tgMid = g_scr_tgEditId > 0 ? g_scr_tgEditId : 0;
@@ -676,22 +733,23 @@ static void scr_http_shot(int c, const char* rq) {
 
 /* /screen/last — PNG последнего удачного снимка. Путь и длину берём копией: следующий снимок может их перезаписать. */
 static void scr_http_last(int c) {
-    static char buf[65536];
-    char path[400]; long len, sent = 0; int fd, k;
+    long len = 0, sent = 0; u8* snap;
     if (__atomic_load_n(&g_scr_doneSeq, __ATOMIC_ACQUIRE) <= 0) { scr_respond(c, "404 Not Found", "text/plain", "none", 4); return; }
-    for (k = 0; k < (int)sizeof path - 1 && g_scr_lastPath[k]; k++) path[k] = g_scr_lastPath[k];
-    path[k] = 0; len = g_scr_lastLen;
-    if (len <= 0 || len > SCR_MAX_PNG) { scr_respond(c, "404 Not Found", "text/plain", "none", 4); return; }
-    fd = open(path, 0);                                   /* O_RDONLY */
-    if (fd < 0) { scr_respond(c, "404 Not Found", "text/plain", "nofile", 6); return; }
-    if (!scr_send_head(c, "200 OK", "image/png", (unsigned long)len)) { close(fd); return; }
+    snap = scr_png_snapshot(&len);                        /* копия: пока шлём, главный поток может уже заменить снимок */
+    if (!snap || len <= 0 || len > SCR_MAX_PNG) { free(snap); scr_respond(c, "404 Not Found", "text/plain", "none", 4); return; }
+    if (!scr_send_head(c, "200 OK", "image/png", (unsigned long)len)) { free(snap); return; }
     while (sent < len) {
-        long want = len - sent < (long)sizeof buf ? len - sent : (long)sizeof buf, n = read(fd, buf, (unsigned long)want);
-        if (n <= 0) break;                                /* файл короче заявленного — рвём соединение: XHR получит ошибку, а не битую картинку */
-        if (!scr_send_all(c, buf, (unsigned long)n)) break;
-        sent += n;
+        long want = len - sent < 65536 ? len - sent : 65536;
+        if (!scr_send_all(c, (const char*)(snap + sent), (unsigned long)want)) break;
+        sent += want;
     }
-    close(fd);
+    free(snap);
+}
+
+static void* scr_tg_thread(void* arg) {
+    void* r = scr_tg_thread_body(arg);
+    free(g_scr_tgData); g_scr_tgData = NULL; g_scr_tgLen = 0;       /* копия снимка своё отслужила */
+    return r;
 }
 
 /* /screen/tg?k=ТОКЕН&c=ЧАТ&doc=0|1&cap=ПОДПИСЬ(urlencoded) — запуск отправки последнего снимка в Telegram: {"ok":true,"id":N}; результат — /screen/tgstatus */
@@ -711,8 +769,8 @@ static void scr_http_tg(int c, const char* rq) {
         g_scr_tgEditId = mv;
     }
     scr_qparam(rq, "doc", doc, sizeof doc); g_scr_tgDoc = doc[0] == '1';
-    for (k = 0; k < (int)sizeof g_scr_tgPath - 1 && g_scr_lastPath[k]; k++) g_scr_tgPath[k] = g_scr_lastPath[k];
-    g_scr_tgPath[k] = 0;
+    free(g_scr_tgData); g_scr_tgData = scr_png_snapshot(&g_scr_tgLen); (void)k;
+    if (!g_scr_tgData) { scr_respond(c, "200 OK", "application/json", nosnap, sizeof nosnap - 1); return; }
     g_scr_tgMsg[0] = 0; g_scr_tgCode = 0; g_scr_tgId++;
     __atomic_store_n(&g_scr_tgState, 1, __ATOMIC_RELEASE);
     dlog("скрин: заявка на отправку в Telegram");
