@@ -12,9 +12,9 @@
  *   размером с зону. ЗЕЛЁНАЯ — вы в зоне (стойте здесь), КРАСНАЯ — вы слишком близко к пикапу или вышли за зону.
  *   Берём гоночную метку Checkpoint.Race: SetRace(центр, размер) / HideRace(). Размер подгоняем по границам её рендереров, цвет — через материалы метки.
  *   Если игра или сервер сам переставил гоночную метку — мод выключается и её не трогает. Если метку нельзя найти или покрасить — запасной режим flat:
- *   своя плоская полоса (LineRenderer, alignment = TransformZ, объект повёрнут на −90° вокруг X; по дизассемблированию EditObjectAxis..ctor RVA 0x123F2B4 игра рисует линии так же).
- *   Материал плоской зоны: «Sprites/Default» (глубину проверяет — зона на полу), запасной «GUI/Text Shader» (рисуется поверх всего); /ring see переключает.
- *   Пол для плоской зоны: Transform.y ваших ног, когда вы стоите на земле у раздевалки (пока не встали — пикап − 1 м); лишний метр между точкой пикапа и полом
+ *   своё тонкое кольцо на полу (LineRenderer в мировых координатах; в этой сборке игры у LineRenderer вырезаны alignment и loop, поэтому широкую полосу не сделать).
+ *   Материал кольца: «Sprites/Default» (глубину проверяет — кольцо на полу), запасной «GUI/Text Shader» (рисуется поверх всего); /ring see переключает.
+ *   Пол для кольца: Transform.y ваших ног, когда вы стоите на земле у раздевалки (пока не встали — пикап − 1 м); лишний метр между точкой пикапа и полом
  *   учитывается в радиусе: радиус на полу = sqrt(R² − dz²), dz = высота пикапа − (пол + 1).
  *
  * Команды:
@@ -77,9 +77,8 @@ static float g_rg_drawGy = 1e9f;                /* пол, при котором
 /* ресурсы Unity */
 static struct {
     int state;                          /* 0 — не искали, 1 — всё есть, -1 — чего-то нет */
-    void *kGo, *kMat, *kShader, *kLr, *kObj, *kTr;
+    void *kGo, *kMat, *kShader, *kLr, *kObj;
     void *mGoCtor, *mAdd, *mFind, *mMatCtor, *mSetQ, *mSetMat, *mWidth, *mWorld, *mCount, *mPos, *mCol0, *mCol1, *mEnable, *mDestroy;
-    void *mAlign, *mLoop, *mGetTr, *mTrPos, *mTrRot;
     void* typeLr;
 } RG;
 static unsigned g_rg_hMat;
@@ -168,7 +167,11 @@ static int rg_num(const char* s, float* out) {                 /* «1.7», «1,7
 }
 
 /* ───────────── ресурсы Unity: классы и методы ───────────── */
-static int rg_resolve(void) {
+/* база: нужны только функции IL2CPP API (для родной метки больше ничего не нужно) */
+static int rg_resolve(void) { return rg_api(); }
+
+/* ресурсы плоского режима (LineRenderer): тонкое кольцо на полу. alignment/loop в этой сборке игры вырезаны, поэтому только мировые координаты и ширина */
+static int rg_flat_resolve(void) {
     void* img;
     if (RG.state) return RG.state > 0;
     if (!rg_api()) { RG.state = -1; return 0; }
@@ -179,11 +182,9 @@ static int rg_resolve(void) {
     RG.kShader = A.class_from_name(img, "UnityEngine", "Shader");
     RG.kLr     = A.class_from_name(img, "UnityEngine", "LineRenderer");
     RG.kObj    = A.class_from_name(img, "UnityEngine", "Object");
-    RG.kTr     = A.class_from_name(img, "UnityEngine", "Transform");
-    if (!RG.kGo || !RG.kMat || !RG.kShader || !RG.kLr || !RG.kObj || !RG.kTr) { dlog("ring: не нашлись классы UnityEngine (GameObject/Material/Shader/LineRenderer/Object/Transform)"); RG.state = -1; return 0; }
+    if (!RG.kGo || !RG.kMat || !RG.kShader || !RG.kLr || !RG.kObj) { dlog("ring: не нашлись классы UnityEngine (GameObject/Material/Shader/LineRenderer/Object)"); RG.state = -1; return 0; }
     RG.mGoCtor  = rg_find_m1(RG.kGo, ".ctor", "System.String");
     RG.mAdd     = rg_find_m1(RG.kGo, "AddComponent", "System.Type");
-    RG.mGetTr   = find_method(RG.kGo, "get_transform", 0);
     RG.mFind    = find_method(RG.kShader, "Find", 1);
     RG.mMatCtor = rg_find_m1(RG.kMat, ".ctor", "UnityEngine.Shader");
     RG.mSetQ    = find_method(RG.kMat, "set_renderQueue", 1);
@@ -195,23 +196,18 @@ static int rg_resolve(void) {
     RG.mCol0    = find_method(RG.kLr, "set_startColor", 1);
     RG.mCol1    = find_method(RG.kLr, "set_endColor", 1);
     RG.mEnable  = find_method(RG.kLr, "set_enabled", 1);
-    RG.mAlign   = find_method(RG.kLr, "set_alignment", 1);
-    RG.mLoop    = find_method(RG.kLr, "set_loop", 1);            /* необязательный: без него замыкаем сами повтором первой точки */
-    RG.mTrPos   = find_method(RG.kTr, "set_position", 1);
-    RG.mTrRot   = find_method(RG.kTr, "set_rotation", 1);
     RG.mDestroy = find_method(RG.kObj, "Destroy", 1);
     RG.typeLr   = RGA.type_object(RGA.cls_type(RG.kLr));
     {
-        const char* miss = !RG.mGoCtor ? "GameObject..ctor(string)" : !RG.mAdd ? "GameObject.AddComponent(Type)" : !RG.mGetTr ? "GameObject.get_transform" :
+        const char* miss = !RG.mGoCtor ? "GameObject..ctor(string)" : !RG.mAdd ? "GameObject.AddComponent(Type)" :
             !RG.mFind ? "Shader.Find" : !RG.mMatCtor ? "Material..ctor(Shader)" : !RG.mSetQ ? "Material.set_renderQueue" : !RG.mSetMat ? "Renderer.set_material" :
             !RG.mWidth ? "LineRenderer.set_widthMultiplier" : !RG.mWorld ? "LineRenderer.set_useWorldSpace" : !RG.mCount ? "LineRenderer.set_positionCount" :
             !RG.mPos ? "LineRenderer.SetPosition" : !RG.mCol0 ? "LineRenderer.set_startColor" : !RG.mCol1 ? "LineRenderer.set_endColor" :
-            !RG.mEnable ? "Renderer.set_enabled" : !RG.mAlign ? "LineRenderer.set_alignment" : !RG.mTrPos ? "Transform.set_position" :
-            !RG.mTrRot ? "Transform.set_rotation" : !RG.mDestroy ? "Object.Destroy" : !RG.typeLr ? "typeof(LineRenderer)" : NULL;
+            !RG.mEnable ? "Renderer.set_enabled" : !RG.mDestroy ? "Object.Destroy" : !RG.typeLr ? "typeof(LineRenderer)" : NULL;
         if (miss) { dlog2("ring: нет метода ", miss); RG.state = -1; return 0; }
     }
     RG.state = 1;
-    dlog(RG.mLoop ? "ring: методы Unity найдены (с set_loop)" : "ring: методы Unity найдены (без set_loop)");
+    dlog("ring: методы плоского режима найдены");
     return 1;
 }
 
@@ -275,10 +271,9 @@ static void rg_destroy_all(void) {
     g_rg_dirty = 1;
 }
 
-/* создать объект зоны: GameObject + LineRenderer, плашмя (alignment = TransformZ, поворот −90° вокруг X), локальные координаты. 1 — получилось */
+/* создать объект кольца: GameObject + LineRenderer в мировых координатах (alignment у LineRenderer в этой сборке вырезан — тонкая линия смотрит в камеру, для кольца на полу это нормально). 1 — получилось */
 static int rg_make(void) {
-    void *mat, *go, *lr = NULL, *tr = NULL, *args[2], *name; u8 world = 0; int align = 1; char nm[16];
-    float rot[4];
+    void *mat, *go, *lr = NULL, *args[2], *name; u8 world = 1; int cnt = RG_SEG + 1; float w = 0.16f; char nm[16];
     nm[0] = 'k'; nm[1] = 'o'; nm[2] = 'n'; nm[3] = 's'; nm[4] = 't'; nm[5] = '_'; nm[6] = 'z'; nm[7] = 'o'; nm[8] = 'n'; nm[9] = 'e'; nm[10] = 0;
     mat = rg_material();
     if (!mat) return 0;
@@ -293,11 +288,8 @@ static int rg_make(void) {
     g_rg_hLr = RGA.gc_new(lr, 0);
     args[0] = mat;     rg_call("Renderer.set_material", RG.mSetMat, lr, args, NULL);
     args[0] = &world;  rg_call("LineRenderer.set_useWorldSpace", RG.mWorld, lr, args, NULL);
-    args[0] = &align;  rg_call("LineRenderer.set_alignment", RG.mAlign, lr, args, NULL);
-    if (RG.mLoop) { u8 lp = 1; args[0] = &lp; rg_call("LineRenderer.set_loop", RG.mLoop, lr, args, NULL); }
-    if (!rg_call("GameObject.get_transform", RG.mGetTr, go, NULL, &tr) || !tr || !hm_obj_ok(tr)) return 0;
-    rot[0] = -0.70710678f; rot[1] = 0.0f; rot[2] = 0.0f; rot[3] = 0.70710678f;          /* Quaternion: −90° вокруг X (локальный Z смотрит вверх) */
-    args[0] = rot;     if (!rg_call("Transform.set_rotation", RG.mTrRot, tr, args, NULL)) return 0;
+    args[0] = &w;      rg_call("LineRenderer.set_widthMultiplier", RG.mWidth, lr, args, NULL);
+    args[0] = &cnt;    rg_call("LineRenderer.set_positionCount", RG.mCount, lr, args, NULL);
     rg_set_color(g_rg_colOk);
     return 1;
 }
@@ -312,33 +304,20 @@ static float rg_flat_r(float R) {
     return v > 0.04 ? (float)__builtin_sqrt(v) : 0.2f;
 }
 
-/* поставить объект на пол над центром */
-static int rg_place(void) {
-    void *go, *tr = NULL, *args[1]; float p[3];
-    go = g_rg_hGo ? RGA.gc_target(g_rg_hGo) : NULL;
-    if (!go || !hm_obj_ok(go)) return 0;
-    if (!rg_call("GameObject.get_transform", RG.mGetTr, go, NULL, &tr) || !tr || !hm_obj_ok(tr)) return 0;
-    p[0] = g_rg_c[0]; p[1] = rg_floor_y() + RG_LIFT + g_rg_lift; p[2] = g_rg_c[2];
-    args[0] = p;
-    return rg_call("Transform.set_position", RG.mTrPos, tr, args, NULL);
-}
-
-/* окружность по середине полосы: ширина линии = ширина зоны */
-static int rg_points(float rIn, float rOut) {
-    void *lr, *args[2]; int k, idx, ok = 1, cnt = RG.mLoop ? RG_SEG : RG_SEG + 1; float p[3], w = rOut - rIn, R = (rIn + rOut) * 0.5f;
-    double c, s, a = 6.283185307179586 / RG_SEG, x, y, nx;
+/* окружность радиуса R вокруг центра на высоте пола (мировые координаты) */
+static int rg_points(float R) {
+    void *lr, *args[2]; int k, idx, ok = 1; float p[3], y = rg_floor_y() + RG_LIFT + g_rg_lift;
+    double c, s, a = 6.283185307179586 / RG_SEG, x, z, nx;
     lr = rg_lr();
     if (!lr) return 0;
-    args[0] = &w;   if (!rg_call("LineRenderer.set_widthMultiplier", RG.mWidth, lr, args, NULL)) return 0;
-    args[0] = &cnt; if (!rg_call("LineRenderer.set_positionCount", RG.mCount, lr, args, NULL)) return 0;
     c = 1.0 - a * a / 2 + a * a * a * a / 24 - a * a * a * a * a * a / 720;              /* cos и sin шага — без libm */
     s = a - a * a * a / 6 + a * a * a * a * a / 120 - a * a * a * a * a * a * a / 5040;
-    x = R; y = 0;                                                                         /* поворачиваем вектор радиуса шаг за шагом */
-    for (k = 0; k < cnt && ok; k++) {
-        p[0] = (float)x; p[1] = (float)y; p[2] = 0.0f;                                    /* локальная плоскость XY; поворот объекта кладёт её на пол */
+    x = R; z = 0;                                                                         /* поворачиваем вектор радиуса шаг за шагом */
+    for (k = 0; k <= RG_SEG && ok; k++) {
+        p[0] = g_rg_c[0] + (float)x; p[1] = y; p[2] = g_rg_c[2] + (float)z;
         idx = k; args[0] = &idx; args[1] = p;
         ok = rg_call("LineRenderer.SetPosition", RG.mPos, lr, args, NULL);
-        nx = x * c - y * s; y = x * s + y * c; x = nx;
+        nx = x * c - z * s; z = x * s + z * c; x = nx;
     }
     return ok;
 }
@@ -357,7 +336,7 @@ static int rg_alive(void) {
    Если метку покрасить не получилось (нет свойства цвета у шейдера) или метки нет — рисуем свою плоскую полосу (режим flat). */
 static struct {
     int state;                          /* 0 — не искали, 1 — есть, -1 — нет */
-    void *kCp, *kRend, *kComp, *mSet, *mHide, *mGetMat, *mGetBounds, *mGetComp, *mHas, *mSetCol, *mGetCol;
+    void *kCp, *kRend, *kComp, *kMat, *mSet, *mHide, *mGetMat, *mGetBounds, *mGetComp, *mHas, *mSetCol, *mGetCol;
     void* typeRend;
 } GM;
 static int g_rg_flat;                   /* 1 — рисуем свою плоскую полосу вместо родной метки */
@@ -382,21 +361,22 @@ static void* rg_find_t(void* k, const char* name, int argc, const char* tn0) {
 static int rg_gm_resolve(void) {
     void* img;
     if (GM.state) return GM.state > 0;
-    if (!g_safe || !g_img || RG.state <= 0) return 0;                       /* игра ещё не готова — не кэшируем отказ */
+    if (!g_safe || !g_img || !rg_api()) return 0;                       /* игра ещё не готова — не кэшируем отказ */
     GM.state = -1;
     img = find_image_pre("UnityEngine.CoreModule");
     GM.kCp = A.class_from_name(g_img, "Hassle.Entities", "Checkpoint");
     GM.kRend = img ? A.class_from_name(img, "UnityEngine", "Renderer") : NULL;
     GM.kComp = img ? A.class_from_name(img, "UnityEngine", "Component") : NULL;
-    if (!GM.kCp || !GM.kRend || !GM.kComp) { dlog("ring: нет класса Hassle.Entities.Checkpoint или UnityEngine.Renderer/Component"); return 0; }
+    GM.kMat = img ? A.class_from_name(img, "UnityEngine", "Material") : NULL;
+    if (!GM.kCp || !GM.kRend || !GM.kComp || !GM.kMat) { dlog("ring: нет класса Hassle.Entities.Checkpoint или UnityEngine.Renderer/Component"); return 0; }
     GM.mSet       = find_method(GM.kCp, "SetRace", 2);
     GM.mHide      = find_method(GM.kCp, "HideRace", 0);
     GM.mGetMat    = find_method(GM.kRend, "get_material", 0);
     GM.mGetBounds = find_method(GM.kRend, "get_bounds", 0);
     GM.mGetComp   = rg_find_t(GM.kComp, "GetComponent", 1, "System.Type");      /* GetComponentsInChildren(Type,bool) в этой сборке вырезан — обходим детей сами */
-    GM.mHas       = rg_find_t(RG.kMat, "HasProperty", 1, "System.String");
-    GM.mSetCol    = rg_find_t(RG.kMat, "SetColor", 2, "System.String");
-    GM.mGetCol    = rg_find_t(RG.kMat, "GetColor", 1, "System.String");
+    GM.mHas       = rg_find_t(GM.kMat, "HasProperty", 1, "System.String");
+    GM.mSetCol    = rg_find_t(GM.kMat, "SetColor", 2, "System.String");
+    GM.mGetCol    = rg_find_t(GM.kMat, "GetColor", 1, "System.String");
     GM.typeRend   = RGA.type_object(RGA.cls_type(GM.kRend));
     {
         const char* miss = !GM.mSet ? "Checkpoint.SetRace" : !GM.mHide ? "Checkpoint.HideRace" : !GM.mGetMat ? "Renderer.get_material" : !GM.mGetBounds ? "Renderer.get_bounds" :
@@ -518,7 +498,7 @@ static void rg_use_flat(const char* why) {
     rg_gm_hide();
     g_rg_flat = 1; g_rg_dirty = 1; g_rg_zone = -1; g_rg_fails = 0;
     dlog2("ring: режим flat: ", why);
-    chat_say("Зона: родная метка игры не подошла — рисую свою плоскую зону на полу");
+    chat_say("Зона: родная метка игры не подошла — рисую своё кольцо на полу");
 }
 
 /* выставить родную метку в центре, размер — под зону */
@@ -570,11 +550,12 @@ static int rg_draw(void) {
         if (!ok && !g_rg_flat && ++g_rg_fails >= 3) rg_use_flat("SetRace не сработал 3 раза подряд");
         return ok;
     }
+    if (!rg_flat_resolve()) { g_rg_on = 0; chat_say("Зона: не нашлись методы Unity для плоской зоны, подробности в HLOG/konstt.log"); return 0; }
     if (!rg_alive()) {
         rg_destroy_all();
         ok = rg_make();
     }
-    if (ok) ok = rg_points(rg_flat_r(g_rg_rIn), rg_flat_r(g_rg_rOut)) && rg_place();
+    if (ok) ok = rg_points(rg_flat_r(g_rg_rOut));
     if (ok) { rg_enable(1); g_rg_dirty = 0; g_rg_fails = 0; g_rg_drawGy = rg_floor_y(); }
     else { g_rg_fails++; rg_destroy_all(); }
     return ok;
@@ -814,7 +795,7 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
     if (seq(tok[0], "any")) { g_rg_any = 1; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Зона: центр — ближайший пикап любой модели"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "cloth")) { g_rg_any = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Зона: центр — только раздевалка (модель «cloth»)"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "game")) { rg_destroy_all(); g_rg_flat = 0; g_rg_dirty = 1; g_rg_zone = -1; g_rg_gmTries = 0; chat_say("Зона: родная метка игры"); if (g_rg_on) rg_tick(); return; }
-    if (seq(tok[0], "flat")) { rg_gm_hide(); g_rg_flat = 1; g_rg_dirty = 1; g_rg_zone = -1; chat_say("Зона: своя плоская зона на полу"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "flat")) { rg_gm_hide(); g_rg_flat = 1; g_rg_dirty = 1; g_rg_zone = -1; chat_say("Зона: своё кольцо на полу"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "see")) {
         rg_gm_hide(); g_rg_flat = 1; g_rg_dirty = 1;
         g_rg_see = !g_rg_see;
