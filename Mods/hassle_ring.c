@@ -8,22 +8,23 @@
  *   Значит стоять надо в «бублике»: от 1,5 до 4,0 м от точки пикапа (расстояние трёхмерное: позиция игрока в пакете синхронизации = Transform.y + 1).
  *   Зона нарисована с небольшим запасом: 1,6 … 3,8 м.
  *
- * Как выглядит: одна полупрозрачная кольцевая полоса на полу. ЗЕЛЁНАЯ — вы внутри зоны (стойте здесь), КРАСНАЯ — вы слишком близко к пикапу или вышли за зону.
- *
- * Как рисуем (по дизассемблированию EditObjectAxis..ctor, RVA 0x123F2B4: игра сама делает линии через LineRenderer): GameObject + LineRenderer, одна окружность
- *   с шириной = ширине зоны и alignment = TransformZ, а сам объект повёрнут на −90° вокруг X — полоса лежит плашмя, как пятно на полу.
- *   Материал: по умолчанию «Sprites/Default» (встроенный, глубину проверяет — зона на полу, персонажи и стены её перекрывают), запасной — «GUI/Text Shader»
- *   (как у линий игры; рисуется поверх всего, видно и сквозь стены). /ring see переключает между ними.
- *   Высота: Transform.y ваших ног, когда вы стоите на земле у раздевалки (пока не встали — пикап − 1 м). Лишний метр между точкой пикапа и полом
- *   (если пикап висит выше) учитывается в радиусе: радиус на полу = sqrt(R² − dz²), dz = высота пикапа − (пол + 1).
+ * Как выглядит: родная метка игры (Hassle.Entities.Checkpoint, префаб Checkpoint.prefab — те же метки, что сервер ставит через SetPlayerCheckpoint), прижатая к земле,
+ *   размером с зону. ЗЕЛЁНАЯ — вы в зоне (стойте здесь), КРАСНАЯ — вы слишком близко к пикапу или вышли за зону.
+ *   Берём гоночную метку Checkpoint.Race: SetRace(центр, размер) / HideRace(). Размер подгоняем по границам её рендереров, цвет — через материалы метки.
+ *   Если игра или сервер сам переставил гоночную метку — мод выключается и её не трогает. Если метку нельзя найти или покрасить — запасной режим flat:
+ *   своя плоская полоса (LineRenderer, alignment = TransformZ, объект повёрнут на −90° вокруг X; по дизассемблированию EditObjectAxis..ctor RVA 0x123F2B4 игра рисует линии так же).
+ *   Материал плоской зоны: «Sprites/Default» (глубину проверяет — зона на полу), запасной «GUI/Text Shader» (рисуется поверх всего); /ring see переключает.
+ *   Пол для плоской зоны: Transform.y ваших ног, когда вы стоите на земле у раздевалки (пока не встали — пикап − 1 м); лишний метр между точкой пикапа и полом
+ *   учитывается в радиусе: радиус на полу = sqrt(R² − dz²), dz = высота пикапа − (пол + 1).
  *
  * Команды:
  *   /ring            включить/выключить      /ring on | off
  *   /ring info       где центр, расстояние до него, зона
- *   /ring r 1.6 3.8  внутренний и внешний радиус зоны, м     /ring reset — вернуть 1.6 / 3.8, подъём 0, материал по умолчанию
+ *   /ring r 1.6 3.8  внутренний и внешний радиус зоны, м     /ring reset — вернуть 1.6 / 3.8, подъём 0, родную метку
  *   /ring any        центр — ближайший пикап любой модели (если раздевалка не находится по имени «cloth»);  /ring cloth — обратно только раздевалка
- *   /ring y 0.05     поднять/опустить зону относительно пола, м (−2…2); если зона мерцает или уходит под пол — поднять
- *   /ring see        материал: на полу (Sprites/Default) ⇄ поверх всего (GUI/Text Shader)
+ *   /ring game       родная метка игры (по умолчанию)      /ring flat — своя плоская зона на полу
+ *   /ring y 0.05     поднять/опустить плоскую зону относительно пола, м (−2…2); если она мерцает или уходит под пол — поднять
+ *   /ring see        плоская зона: на полу (Sprites/Default) ⇄ поверх всего (GUI/Text Shader)
  *   /ring scan       искать раздевалку заново сейчас
  *
  * Всё рисование — в главном потоке (Post в UnitySynchronizationContext, как в /nocol); фоновый поток раз в 0,5 с только ставит задачу.
@@ -348,10 +349,227 @@ static int rg_alive(void) {
     return go && hm_obj_ok(go) && rg_lr();
 }
 
+/* ───────────── режим «как в игре»: родная метка Checkpoint.Race ─────────────
+   У игры есть своя метка (Hassle.Entities.Checkpoint, префаб Assets/Prefabs/Checkpoint/Checkpoint.prefab; Checkpoint.Simple — «обычная», Checkpoint.Race — «гоночная»,
+   SetRace(Vector3 position, float size) / HideRace(), сама прижимается к земле: PlaceOnGround). Берём гоночную (SetPlayerRaceCheckpoint сервер почти не использует):
+   вызываем SetRace в центре пикапа, подгоняем размер под зону (размер измеряем по границам рендереров метки и один раз пересчитываем) и красим материалы метки:
+   зелёный — вы в зоне, красный — слишком близко или за зоной. Если игра/сервер сам поставил гоночную метку в другом месте — мы её не трогаем и выключаемся.
+   Если метку покрасить не получилось (нет свойства цвета у шейдера) или метки нет — рисуем свою плоскую полосу (режим flat). */
+static struct {
+    int state;                          /* 0 — не искали, 1 — есть, -1 — нет */
+    void *kCp, *kRend, *kComp, *mSet, *mHide, *mGetMat, *mGetBounds, *mGetComp, *mHas, *mSetCol, *mGetCol;
+    void* typeRend;
+} GM;
+static int g_rg_flat;                   /* 1 — рисуем свою плоскую полосу вместо родной метки */
+static int g_rg_gmSet;                  /* родную метку выставили мы */
+static float g_rg_gmPos[3], g_rg_gmSize, g_rg_cal;      /* cal — диаметр метки в метрах на единицу size (0 — ещё не измерили) */
+static int g_rg_calChecked, g_rg_gmTries, g_rg_gmLogged;
+
+/* метод name с argc параметрами, у которого первый параметр типа tn0 (у HasProperty/SetColor/GetColor есть перегрузки со строкой и с int) */
+static void* rg_find_t(void* k, const char* name, int argc, const char* tn0) {
+    for (; k; k = A.class_get_parent(k)) {
+        void* it = NULL; void* m;
+        while ((m = RGA.cls_methods(k, &it)) != NULL) {
+            const char* nm = RGA.m_name(m); const char* t;
+            if (!nm || !seq(nm, name) || RGA.m_pcount(m) != argc) continue;
+            t = A.type_get_name(RGA.m_param(m, 0));
+            if (t && seq(t, tn0)) return m;
+        }
+    }
+    return NULL;
+}
+
+static int rg_gm_resolve(void) {
+    void* img;
+    if (GM.state) return GM.state > 0;
+    if (!g_safe || !g_img || RG.state <= 0) return 0;                       /* игра ещё не готова — не кэшируем отказ */
+    GM.state = -1;
+    img = find_image_pre("UnityEngine.CoreModule");
+    GM.kCp = A.class_from_name(g_img, "Hassle.Entities", "Checkpoint");
+    GM.kRend = img ? A.class_from_name(img, "UnityEngine", "Renderer") : NULL;
+    GM.kComp = img ? A.class_from_name(img, "UnityEngine", "Component") : NULL;
+    if (!GM.kCp || !GM.kRend || !GM.kComp) { dlog("ring: нет класса Hassle.Entities.Checkpoint или UnityEngine.Renderer/Component"); return 0; }
+    GM.mSet       = find_method(GM.kCp, "SetRace", 2);
+    GM.mHide      = find_method(GM.kCp, "HideRace", 0);
+    GM.mGetMat    = find_method(GM.kRend, "get_material", 0);
+    GM.mGetBounds = find_method(GM.kRend, "get_bounds", 0);
+    GM.mGetComp   = rg_find_t(GM.kComp, "GetComponent", 1, "System.Type");      /* GetComponentsInChildren(Type,bool) в этой сборке вырезан — обходим детей сами */
+    GM.mHas       = rg_find_t(RG.kMat, "HasProperty", 1, "System.String");
+    GM.mSetCol    = rg_find_t(RG.kMat, "SetColor", 2, "System.String");
+    GM.mGetCol    = rg_find_t(RG.kMat, "GetColor", 1, "System.String");
+    GM.typeRend   = RGA.type_object(RGA.cls_type(GM.kRend));
+    {
+        const char* miss = !GM.mSet ? "Checkpoint.SetRace" : !GM.mHide ? "Checkpoint.HideRace" : !GM.mGetMat ? "Renderer.get_material" : !GM.mGetBounds ? "Renderer.get_bounds" :
+            !GM.mGetComp ? "Component.GetComponent(Type)" : !GM.mHas ? "Material.HasProperty(string)" : !GM.mSetCol ? "Material.SetColor(string,Color)" :
+            !GM.mGetCol ? "Material.GetColor(string)" : !GM.typeRend ? "typeof(Renderer)" : NULL;
+        if (miss) { dlog2("ring: для метки игры нет метода ", miss); return 0; }
+    }
+    GM.state = 1;
+    dlog("ring: родная метка Checkpoint.Race найдена");
+    return 1;
+}
+
+static void* rg_gm_cp(void) {                                              /* Checkpoint.Race (static) или NULL */
+    void *f, *obj = NULL;
+    if (GM.state <= 0) return NULL;
+    f = A.class_get_field_from_name(GM.kCp, "Race");
+    if (!f) return NULL;
+    A.field_static_get_value(f, &obj);
+    return (obj && hm_obj_ok(obj)) ? obj : NULL;
+}
+
+/* рендереры метки: обходим Transform метки и всех детей (глубина до 5, до 16 детей на узел), у каждого берём GetComponent(Renderer).
+   Префаб грузится асинхронно — сразу после SetRace детей может ещё не быть. */
+static void rg_gm_walk(void* tr, int depth, void** out, int* n, int max) {
+    void *r = NULL, *m, *args[1]; int cnt, i;
+    if (!tr || !hm_obj_ok(tr) || *n >= max) return;
+    args[0] = GM.typeRend;
+    if (rg_call("Component.GetComponent", GM.mGetComp, tr, args, &r) && r && hm_obj_ok(r)) out[(*n)++] = r;
+    if (depth >= 5) return;
+    m = find_method(A.object_get_class(tr), "get_childCount", 0);
+    r = NULL;
+    if (!m || !rg_call("get_childCount", m, tr, NULL, &r) || !r || !hm_readable((char*)r + HDR, 4)) return;
+    cnt = *(int*)((char*)r + HDR);
+    if (cnt < 1 || cnt > 16) return;
+    m = find_method(A.object_get_class(tr), "GetChild", 1);
+    if (!m) return;
+    for (i = 0; i < cnt && *n < max; i++) {
+        void* ch = NULL; int idx = i;
+        args[0] = &idx;
+        if (rg_call("GetChild", m, tr, args, &ch) && ch) rg_gm_walk(ch, depth + 1, out, n, max);
+    }
+}
+static int rg_gm_rends(void* cp, void** out, int max) {
+    int n = 0;
+    rg_gm_walk(rg_obj(cp, "get_transform"), 0, out, &n, max);
+    return n;
+}
+
+/* горизонтальный диаметр метки по границам рендереров, м; 0 — не измерилось */
+static float rg_gm_width(void) {
+    void *cp = rg_gm_cp(), *rs[16]; int n, i; float best = 0.0f;
+    if (!cp) return 0.0f;
+    n = rg_gm_rends(cp, rs, 16);
+    for (i = 0; i < n; i++) {
+        void* r = NULL; const float* b; float w;
+        if (!rg_call("Renderer.get_bounds", GM.mGetBounds, rs[i], NULL, &r) || !r || !hm_readable((char*)r + HDR, 24)) continue;
+        b = (const float*)((char*)r + HDR);                                 /* Bounds: центр xyz, половинные размеры xyz */
+        if (!rg_finite3(b + 3)) continue;
+        w = (b[3] > b[5] ? b[3] : b[5]) * 2.0f;
+        if (w > best) best = w;
+    }
+    return best;
+}
+
+/* один раз пишем в журнал шейдер и свойства материала метки — по ним видно, чем её красить */
+static void rg_gm_log_shader(void* mat) {
+    void *sh, *nm = NULL, *m, *args[1]; char tmp[96], line[220]; Buf b; int n = 0, i;
+    if (g_rg_gmLogged) return;
+    g_rg_gmLogged = 1;
+    sh = rg_obj(mat, "get_shader");
+    if (!sh) return;
+    m = find_method(A.object_get_class(sh), "get_name", 0);
+    if (m && rg_call("Shader.get_name", m, sh, NULL, &nm) && nm && hm_obj_ok(nm)) { utf16_to_utf8(A.string_chars(nm), A.string_length(nm), tmp, sizeof tmp); dlog2("ring: шейдер метки: ", tmp); }
+    m = find_method(A.object_get_class(sh), "GetPropertyCount", 0);
+    if (m) { void* r = NULL; if (rg_call("GetPropertyCount", m, sh, NULL, &r) && r && hm_readable((char*)r + HDR, 4)) n = *(int*)((char*)r + HDR); }
+    m = find_method(A.object_get_class(sh), "GetPropertyName", 1);
+    if (!m || n <= 0) return;
+    b_init(&b, line, sizeof line); b_s(&b, "ring: свойства шейдера:");
+    for (i = 0; i < n && i < 14; i++) {
+        void* r = NULL; args[0] = &i;
+        if (rg_call("GetPropertyName", m, sh, args, &r) && r && hm_obj_ok(r)) { utf16_to_utf8(A.string_chars(r), A.string_length(r), tmp, sizeof tmp); b_ch(&b, ' '); b_s(&b, tmp); }
+    }
+    dlog(line);
+}
+
+/* покрасить все материалы метки: good=1 — зелёный, 0 — красный. Меняем только rgb, прозрачность и яркость свечения оставляем как в игре. Возвращает, сколько свойств покрашено */
+static int rg_gm_tint(int good) {
+    static const char* const names[] = { "_Color", "_TintColor", "_BaseColor", "_MainColor", "_EmissionColor", "_RimColor", "_FresnelColor", NULL };
+    void *cp = rg_gm_cp(), *rs[16]; int n, i, k, cnt = 0;
+    if (!cp) return 0;
+    n = rg_gm_rends(cp, rs, 16);
+    for (i = 0; i < n; i++) {
+        void* mat = NULL;
+        if (!rg_call("Renderer.get_material", GM.mGetMat, rs[i], NULL, &mat) || !mat || !hm_obj_ok(mat)) continue;
+        rg_gm_log_shader(mat);
+        for (k = 0; names[k]; k++) {
+            void *nm = A.string_new(names[k]), *a[2], *r = NULL; float col[4], mx, mul = 1.0f; int glow = k >= 4;
+            a[0] = nm;
+            if (!rg_call("Material.HasProperty", GM.mHas, mat, a, &r) || !r || !hm_readable((char*)r + HDR, 1) || !*((u8*)r + HDR)) continue;
+            col[0] = col[1] = col[2] = col[3] = 1.0f; r = NULL; a[0] = nm;
+            if (rg_call("Material.GetColor", GM.mGetCol, mat, a, &r) && r && hm_readable((char*)r + HDR, 16)) { const float* f = (const float*)((char*)r + HDR); col[0] = f[0]; col[1] = f[1]; col[2] = f[2]; col[3] = f[3]; }
+            mx = col[0] > col[1] ? col[0] : col[1]; if (col[2] > mx) mx = col[2];
+            if (glow) { if (mx < 0.02f) continue; if (mx > 1.0f) mul = mx; }     /* у свечения чёрный = выключено, яркость сохраняем */
+            col[0] = (good ? 0.15f : 1.00f) * mul; col[1] = (good ? 0.95f : 0.12f) * mul; col[2] = (good ? 0.30f : 0.12f) * mul;
+            a[0] = nm; a[1] = col;
+            if (rg_call("Material.SetColor", GM.mSetCol, mat, a, NULL)) cnt++;
+        }
+    }
+    return cnt;
+}
+
+static void rg_gm_hide(void) {
+    if (g_rg_gmSet && GM.state > 0) rg_call("Checkpoint.HideRace", GM.mHide, NULL, NULL, NULL);
+    g_rg_gmSet = 0;
+}
+
+/* переключиться на свою плоскую полосу */
+static void rg_use_flat(const char* why) {
+    rg_gm_hide();
+    g_rg_flat = 1; g_rg_dirty = 1; g_rg_zone = -1; g_rg_fails = 0;
+    dlog2("ring: режим flat: ", why);
+    chat_say("Зона: родная метка игры не подошла — рисую свою плоскую зону на полу");
+}
+
+/* выставить родную метку в центре, размер — под зону */
+static int rg_draw_game(void) {
+    float D, size, p[3]; void* args[2];
+    if (!rg_gm_resolve()) { if (GM.state < 0) rg_use_flat("нет методов Checkpoint"); return 0; }
+    D = 2.0f * rg_flat_r(g_rg_rOut);
+    size = g_rg_cal > 0.0f ? D / g_rg_cal : D * 0.5f;                       /* пока не измерили — как в SA-MP: size — радиус */
+    p[0] = g_rg_c[0]; p[1] = g_rg_c[1]; p[2] = g_rg_c[2];
+    args[0] = p; args[1] = &size;
+    if (!rg_call("Checkpoint.SetRace", GM.mSet, NULL, args, NULL)) return 0;
+    g_rg_gmSet = 1; g_rg_gmSize = size; g_rg_gmPos[0] = p[0]; g_rg_gmPos[1] = p[1]; g_rg_gmPos[2] = p[2];
+    g_rg_zone = -1; g_rg_dirty = 0; g_rg_fails = 0; g_rg_drawGy = rg_floor_y();
+    { Buf b; char lg[120]; b_init(&b, lg, sizeof lg); b_s(&b, "ring: SetRace размер "); b_fix(&b, size, 2); b_s(&b, ", нужный диаметр "); b_fix(&b, D, 2); b_s(&b, " м"); dlog(lg); }
+    return 1;
+}
+
+/* после рисования: метка на месте? подгоняем размер; следим, чтобы её не перехватили */
+static void rg_gm_service(void) {
+    void *cp, *tr; float p[3], dx, dz;
+    if (g_rg_flat || !g_rg_gmSet) return;
+    cp = rg_gm_cp();
+    if (!cp) { if (++g_rg_gmTries > 24) rg_use_flat("метка Checkpoint.Race не появилась"); return; }
+    tr = rg_obj(cp, "get_transform");
+    if (tr && rg_vec(tr, "get_position", p)) {
+        dx = p[0] - g_rg_gmPos[0]; dz = p[2] - g_rg_gmPos[2];
+        if (dx * dx + dz * dz > 0.25f) {                                    /* гоночную метку переставил сервер — не воюем */
+            g_rg_on = 0; g_rg_gmSet = 0;
+            chat_say("Зона: гоночную метку заняла игра или сервер — зона выключена. /ring on вернёт её, /ring flat — своя зона на полу");
+            dlog("ring: Checkpoint.Race передвинули не мы — выключаюсь");
+            return;
+        }
+    }
+    if (g_rg_cal <= 0.0f) {
+        float w = rg_gm_width();
+        if (w > 0.05f && w < 500.0f && g_rg_gmSize > 0.01f) { g_rg_cal = w / g_rg_gmSize; g_rg_dirty = 1; { Buf b; char lg[100]; b_init(&b, lg, sizeof lg); b_s(&b, "ring: метка: при size "); b_fix(&b, g_rg_gmSize, 2); b_s(&b, " диаметр "); b_fix(&b, w, 2); b_s(&b, " м"); dlog(lg); } }
+    } else if (!g_rg_calChecked && !g_rg_dirty) {
+        float w = rg_gm_width();
+        if (w > 0.05f) { Buf b; char lg[100]; g_rg_calChecked = 1; b_init(&b, lg, sizeof lg); b_s(&b, "ring: метка после подгонки: диаметр "); b_fix(&b, w, 2); b_s(&b, " м"); dlog(lg); }
+    }
+}
+
 /* перерисовать зону (после смены центра/радиусов/пола). 1 — получилось. Любое исключение (например, объект уничтожен при смене локации) —
    всё убираем и в следующий тик создаём заново; 5 неудач подряд — выключаемся. */
 static int rg_draw(void) {
     int ok = 1;
+    if (!g_rg_flat) {
+        ok = rg_draw_game();
+        if (!ok && !g_rg_flat && ++g_rg_fails >= 3) rg_use_flat("SetRace не сработал 3 раза подряд");
+        return ok;
+    }
     if (!rg_alive()) {
         rg_destroy_all();
         ok = rg_make();
@@ -432,7 +650,7 @@ static void rg_scan(long now) {
     if (arr) { total = int_field(dict, "_count", "count", NULL, -1); walk_struct_array(arr, total, "value", rg_pk_cb, NULL); }
     if (!RS.found) {
         g_rg_have = 0;
-        if (had) { rg_enable(0); dlog("ring: раздевалка пропала из зоны стрима — зона скрыта"); }
+        if (had) { rg_enable(0); rg_gm_hide(); g_rg_dirty = 1; dlog("ring: раздевалка пропала из зоны стрима — зона скрыта"); }
         return;
     }
     g_rg_have = 1; g_rg_id = RS.id;
@@ -495,11 +713,21 @@ static void rg_sample(void) {
 /* цвет зоны: зелёная — вы в зоне, красная — слишком близко или за зоной */
 static void rg_zone_color(void) {
     int z;
-    if (!g_rg_have || g_rg_dist < 0.0f || !rg_alive()) return;
+    if (!g_rg_have || g_rg_dist < 0.0f) return;
     z = g_rg_dist < g_rg_rIn ? 0 : g_rg_dist > g_rg_rOut ? 2 : 1;
     if (z == g_rg_zone) return;
-    g_rg_zone = z;
-    rg_set_color(z == 1 ? g_rg_colOk : g_rg_colBad);
+    if (!g_rg_flat) {
+        if (!g_rg_gmSet) return;
+        if (rg_gm_tint(z == 1) > 0) { g_rg_zone = z; g_rg_gmTries = 0; }
+        else {
+            if (++g_rg_gmTries > 24) rg_use_flat("цвет метки не поменять: у её шейдера нет свойства цвета (см. «шейдер метки» в логе)");
+            return;
+        }
+    } else {
+        if (!rg_alive()) return;
+        g_rg_zone = z;
+        rg_set_color(z == 1 ? g_rg_colOk : g_rg_colBad);
+    }
     dlog2("ring: зона: ", z == 0 ? "слишком близко (красная)" : z == 2 ? "за зоной (красная)" : "в зоне (зелёная)");
 }
 
@@ -521,6 +749,8 @@ static void rg_tick(void) {
         if (g_rg_fails >= 5) { g_rg_on = 0; chat_say("Кольцо: не получилось нарисовать 5 раз подряд — выключено. Подробности в HLOG/konstt.log"); dlog("ring: 5 неудач подряд, выключено"); }
         return;
     }
+    rg_gm_service();
+    if (!g_rg_on) return;
     rg_zone_color();
 }
 
@@ -555,7 +785,7 @@ static void rg_info(void) {
     b_s(&b, "Зона: пикап ID "); b_int(&b, g_rg_id); b_s(&b, ", вы в "); b_fix(&b, g_rg_dist >= 0 ? g_rg_dist : 0, 1); b_s(&b, " м — ");
     b_s(&b, g_rg_zone == 0 ? "СЛИШКОМ БЛИЗКО (ближе 1,5 м вход не сработает)" : g_rg_zone == 2 ? "ЗА ЗОНОЙ (дальше 4 м диалог не примет)" : g_rg_zone == 1 ? "в зоне, всё хорошо" : "расстояние не определилось");
     b_s(&b, ". Зона "); b_fix(&b, g_rg_rIn, 1); b_s(&b, "–"); b_fix(&b, g_rg_rOut, 1); b_s(&b, " м, пол "); b_s(&b, g_rg_gyOk ? "по ногам" : "пока по пикапу"); b_s(&b, ", подъём "); b_fix(&b, g_rg_lift, 2);
-    b_s(&b, g_rg_see ? " м, поверх всего" : " м, на полу"); b_s(&b, g_rg_any ? ", центр: любой пикап" : ", центр: раздевалка");
+    b_s(&b, " м, "); b_s(&b, !g_rg_flat ? "метка игры" : g_rg_see ? "плоская, поверх всего" : "плоская, на полу"); b_s(&b, g_rg_any ? ", центр: любой пикап" : ", центр: раздевалка");
     chat_say(msg);
 }
 
@@ -568,12 +798,13 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
         if (want) {
             if (!rg_resolve()) { chat_say("Кольцо: не нашлись методы Unity, подробности в HLOG/konstt.log"); return; }
             mt_capture_ctx();                                   /* главный поток: берём SynchronizationContext для тиков */
-            g_rg_on = 1; g_rg_notFoundSaid = 0; g_rg_have = 0; g_rg_dirty = 1; g_rg_scanT = 0; g_rg_fails = 0; g_rg_gyOk = 0;
+            g_rg_on = 1; g_rg_notFoundSaid = 0; g_rg_have = 0; g_rg_dirty = 1; g_rg_scanT = 0; g_rg_fails = 0; g_rg_gyOk = 0; g_rg_gmTries = 0; g_rg_gmSet = 0;
             if (!g_mt_ctx) chat_say("Кольцо: нет главного потока для автообновления — рисую один раз, повторный /ring on обновит");
             rg_tick();
         } else {
             g_rg_on = 0;
             rg_destroy_all();
+            rg_gm_hide();
             chat_say("Зона выключена");
         }
         return;
@@ -582,7 +813,10 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
     if (seq(tok[0], "scan")) { g_rg_scanT = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; if (g_rg_on) rg_tick(); else chat_say("Зона выключена. /ring on — включить"); return; }
     if (seq(tok[0], "any")) { g_rg_any = 1; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Зона: центр — ближайший пикап любой модели"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "cloth")) { g_rg_any = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Зона: центр — только раздевалка (модель «cloth»)"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "game")) { rg_destroy_all(); g_rg_flat = 0; g_rg_dirty = 1; g_rg_zone = -1; g_rg_gmTries = 0; chat_say("Зона: родная метка игры"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "flat")) { rg_gm_hide(); g_rg_flat = 1; g_rg_dirty = 1; g_rg_zone = -1; chat_say("Зона: своя плоская зона на полу"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "see")) {
+        rg_gm_hide(); g_rg_flat = 1; g_rg_dirty = 1;
         g_rg_see = !g_rg_see;
         if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; }
         rg_destroy_all();
@@ -590,21 +824,21 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
         if (g_rg_on) rg_tick();
         return;
     }
-    if (seq(tok[0], "reset")) { g_rg_rIn = 1.6f; g_rg_rOut = 3.8f; g_rg_lift = 0.0f; if (g_rg_see) { g_rg_see = 0; if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; } rg_destroy_all(); } g_rg_dirty = 1; chat_say("Зона: 1.6–3.8 м, подъём 0, на полу"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "reset")) { g_rg_rIn = 1.6f; g_rg_rOut = 3.8f; g_rg_lift = 0.0f; if (g_rg_see) { g_rg_see = 0; if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; } rg_destroy_all(); } rg_gm_hide(); g_rg_flat = 0; g_rg_cal = 0.0f; g_rg_calChecked = 0; g_rg_dirty = 1; chat_say("Зона: 1.6–3.8 м, подъём 0, родная метка игры"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "r") && n >= 3) {
         float a, c;
         if (!rg_num(tok[1], &a) || !rg_num(tok[2], &c) || a < 0.5f || c > 8.0f || a >= c) { chat_say("Зона: /ring r 1.6 3.8 — внутренний и внешний радиус, м (от 0.5 до 8, внутренний меньше внешнего)"); return; }
-        g_rg_rIn = a; g_rg_rOut = c; g_rg_dirty = 1; g_rg_zone = -1;
+        g_rg_rIn = a; g_rg_rOut = c; g_rg_dirty = 1; g_rg_zone = -1; g_rg_calChecked = 0;
         chat_say("Зона: радиусы изменены"); if (g_rg_on) rg_tick();
         return;
     }
     if ((seq(tok[0], "y") || seq(tok[0], "dz")) && n >= 2) {
         float v;
-        if (!rg_num(tok[1], &v) || v < -2.0f || v > 2.0f) { chat_say("Зона: /ring y 0.05 — поднять зону над полом, м (от −2 до 2)"); return; }
+        if (!rg_num(tok[1], &v) || v < -2.0f || v > 2.0f) { chat_say("Зона: /ring y 0.05 — поднять плоскую зону над полом, м (от −2 до 2)"); return; }
         g_rg_lift = v; g_rg_dirty = 1; chat_say("Зона: высота изменена"); if (g_rg_on) rg_tick();
         return;
     }
-    chat_say("Зона: /ring on|off, /ring info, /ring r 1.6 3.8, /ring y 0.05, /ring see, /ring any|cloth, /ring scan, /ring reset");
+    chat_say("Зона: /ring on|off, /ring info, /ring r 1.6 3.8, /ring game|flat, /ring y 0.05, /ring see, /ring any|cloth, /ring scan, /ring reset");
 }
 
 /* ───────────── самозапуск ───────────── */
