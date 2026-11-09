@@ -25,6 +25,9 @@
  *   /ring game       родная метка игры (по умолчанию)      /ring flat — своя плоская зона на полу
  *   /ring y 0.05     поднять/опустить плоскую зону относительно пола, м (−2…2); если она мерцает или уходит под пол — поднять
  *   /ring see        плоская зона: на полу (Sprites/Default) ⇄ поверх всего (GUI/Text Shader)
+ *   /ring a 0.15     прозрачность родной метки, 0.02…1 (меньше — прозрачнее; по умолчанию 0.15)
+ *   /ring mat 1|2|0  как красить родную метку: 1 — своим полупрозрачным материалом с текстурой метки (по умолчанию), 2 — своим без текстуры (сплошная заливка),
+ *                    0 — родным материалом игры (только правка свойств цвета; у шейдера Hassle/Checkpoint это не красит)
  *   /ring scan       искать раздевалку заново сейчас
  *
  * Всё рисование — в главном потоке (Post в UnitySynchronizationContext, как в /nocol); фоновый поток раз в 0,5 с только ставит задачу.
@@ -59,6 +62,8 @@ static volatile int g_rg_pending;       /* в главный поток уже �
 static volatile long g_rg_postT;
 static int g_rg_any;                    /* 1 — центр любой пикап (/ring any), 0 — только с «cloth» в имени модели */
 static int g_rg_see;                    /* 0 — Sprites/Default (на полу), 1 — GUI/Text Shader (поверх всего) */
+static float g_rg_alpha = 0.15f;        /* прозрачность родной метки: 1 — как есть, меньше — прозрачнее (/ring a) */
+static int g_rg_skin = 1;               /* 1 — свой материал с текстурой метки, 2 — свой без текстуры, 0 — родной материал (/ring mat) */
 static float g_rg_rIn = 1.6f, g_rg_rOut = 3.8f, g_rg_lift = 0.0f;
 static const float g_rg_colOk[4]  = { 0.15f, 0.95f, 0.30f, 0.42f };     /* в зоне */
 static const float g_rg_colBad[4] = { 1.00f, 0.12f, 0.12f, 0.42f };     /* слишком близко или за зоной */
@@ -338,6 +343,9 @@ static struct {
     int state;                          /* 0 — не искали, 1 — есть, -1 — нет */
     void *kCp, *kRend, *kComp, *kMat, *mSet, *mHide, *mGetMat, *mGetBounds, *mGetComp, *mHas, *mSetCol, *mGetCol;
     void* typeRend;
+    /* для своего материала метки (необязательные: нет — красим свойства родного) */
+    void *kShader, *mFind, *mMatCtor, *mSetQ, *mGetShared, *mSetShared, *mGetTex, *mSetTex, *mGetTexNames, *mGetTexS;
+    int skinOk;
 } GM;
 static int g_rg_flat;                   /* 1 — рисуем свою плоскую полосу вместо родной метки */
 static int g_rg_gmSet;                  /* родную метку выставили мы */
@@ -384,6 +392,18 @@ static int rg_gm_resolve(void) {
             !GM.mGetCol ? "Material.GetColor(string)" : !GM.typeRend ? "typeof(Renderer)" : NULL;
         if (miss) { dlog2("ring: для метки игры нет метода ", miss); return 0; }
     }
+    GM.kShader     = img ? A.class_from_name(img, "UnityEngine", "Shader") : NULL;
+    GM.mFind       = GM.kShader ? find_method(GM.kShader, "Find", 1) : NULL;
+    GM.mMatCtor    = rg_find_m1(GM.kMat, ".ctor", "UnityEngine.Shader");
+    GM.mSetQ       = find_method(GM.kMat, "set_renderQueue", 1);
+    GM.mGetShared  = find_method(GM.kRend, "get_sharedMaterial", 0);
+    GM.mSetShared  = find_method(GM.kRend, "set_sharedMaterial", 1);
+    GM.mGetTex     = find_method(GM.kMat, "get_mainTexture", 0);
+    GM.mSetTex     = find_method(GM.kMat, "set_mainTexture", 1);
+    GM.mGetTexNames = find_method(GM.kMat, "GetTexturePropertyNames", 0);
+    GM.mGetTexS    = rg_find_t(GM.kMat, "GetTexture", 1, "System.String");
+    GM.skinOk = GM.mFind && GM.mMatCtor && GM.mSetQ && GM.mGetShared && GM.mSetShared;
+    if (!GM.skinOk) dlog("ring: для своего материала метки не хватает методов Unity — буду красить свойства родного материала");
     GM.state = 1;
     dlog("ring: родная метка Checkpoint.Race найдена");
     return 1;
@@ -462,7 +482,8 @@ static void rg_gm_log_shader(void* mat) {
     dlog(line);
 }
 
-/* покрасить все материалы метки: good=1 — зелёный, 0 — красный. Меняем только rgb, прозрачность и яркость свечения оставляем как в игре. Возвращает, сколько свойств покрашено */
+/* ЗАПАСНОЙ способ (/ring mat 0): покрасить свойства родных материалов метки: good=1 — зелёный, 0 — красный. rgb меняем, у обычных цветов альфа = /ring a, яркость свечения как в игре.
+   У шейдера Hassle/Checkpoint это на экране ничего не меняло (по журналу свойства «красились», а метка оставалась прежней), поэтому по умолчанию работает rg_gm_skin ниже. Возвращает, сколько свойств покрашено */
 static int rg_gm_tint(int good) {
     static const char* const names[] = { "_Color", "_TintColor", "_BaseColor", "_MainColor", "_EmissionColor", "_RimColor", "_FresnelColor", NULL };
     void *cp = rg_gm_cp(), *rs[16]; int n, i, k, cnt = 0;
@@ -481,11 +502,144 @@ static int rg_gm_tint(int good) {
             mx = col[0] > col[1] ? col[0] : col[1]; if (col[2] > mx) mx = col[2];
             if (glow) { if (mx < 0.02f) continue; if (mx > 1.0f) mul = mx; }     /* у свечения чёрный = выключено, яркость сохраняем */
             col[0] = (good ? 0.15f : 1.00f) * mul; col[1] = (good ? 0.95f : 0.12f) * mul; col[2] = (good ? 0.30f : 0.12f) * mul;
+            if (!glow) col[3] = g_rg_alpha;                                    /* прозрачность по /ring a (у свечения альфу не трогаем) */
             a[0] = nm; a[1] = col;
             if (rg_call("Material.SetColor", GM.mSetCol, mat, a, NULL)) cnt++;
         }
     }
     return cnt;
+}
+
+/* ───────── свой полупрозрачный материал на рендерерах метки ─────────
+   Шейдер метки (Hassle/Checkpoint) на SetColor по известным именам свойств не реагирует, а свойства шейдера в этой сборке прочитать нельзя (GetPropertyCount вырезан).
+   Поэтому надёжный путь: на каждый рендерер метки вешаем СВОЙ материал (Sprites/Default: альфа-смешивание, без записи глубины, глубину проверяет — стены метку перекрывают),
+   берём у родного материала текстуру (если есть) и красим _Color = (r, g, b, /ring a). Сама геометрия метки (меш), размер и положение остаются игровыми (SetRace/PlaceOnGround).
+   Родной материал каждого рендерера запоминаем — /ring mat 0 его возвращает. */
+#define RG_MAXR 16
+static unsigned g_rg_skinH[RG_MAXR];            /* наши материалы по номеру рендерера */
+static unsigned g_rg_origH[RG_MAXR];            /* родные материалы (чтобы вернуть) */
+static int g_rg_skinLogged, g_rg_skinSaid;
+
+/* один раз по каждому рендереру пишем в журнал: класс, какие свойства цвета есть у материала, какие текстуры — по этому видно, чем красить, если что-то не так */
+static void rg_gm_log_props(void* mat, void* rend, int idx) {
+    static const char* const names[] = { "_Color", "_TintColor", "_BaseColor", "_MainColor", "_EmissionColor", "_RimColor", "_FresnelColor", "_Tint", "_ColorA", "_ColorB",
+                                         "_InnerColor", "_OuterColor", "_GlowColor", "_EdgeColor", "_FillColor", "_Alpha", "_Opacity", "_Intensity", "_Cutoff", NULL };
+    char line[360], tmp[96]; Buf b; int k; void* arr = NULL;
+    if (idx < 0 || idx >= 8 || (g_rg_skinLogged & (1 << idx)) || !mat || !hm_obj_ok(mat)) return;
+    g_rg_skinLogged |= 1 << idx;
+    rg_gm_log_shader(mat);
+    b_init(&b, line, sizeof line);
+    b_s(&b, "ring: рендерер "); b_int(&b, idx); b_s(&b, " ("); b_s(&b, A.class_get_name(A.object_get_class(rend))); b_s(&b, "), свойства:");
+    for (k = 0; names[k]; k++) {
+        void *a[1], *r = NULL;
+        a[0] = A.string_new(names[k]);
+        if (rg_call("Material.HasProperty", GM.mHas, mat, a, &r) && r && hm_readable((char*)r + HDR, 1) && *((u8*)r + HDR)) { b_ch(&b, ' '); b_s(&b, names[k]); }
+    }
+    b_s(&b, "; текстуры:");
+    if (GM.mGetTexNames && rg_call("Material.GetTexturePropertyNames", GM.mGetTexNames, mat, NULL, &arr) && arr && hm_obj_ok(arr)) {
+        long len = *(long*)((char*)arr + 3 * sizeof(void*)); long i;
+        if (len > 0 && len <= 8) {
+            for (i = 0; i < len; i++) {
+                void* s = *(void**)((char*)arr + 4 * sizeof(void*) + (uptr)i * sizeof(void*)); int l2;
+                if (!s) continue;
+                l2 = A.string_length(s);
+                if (l2 <= 0 || l2 > 60) continue;
+                utf16_to_utf8(A.string_chars(s), l2, tmp, sizeof tmp);
+                b_ch(&b, ' '); b_s(&b, tmp);
+            }
+        } else b_s(&b, " нет");
+    } else b_s(&b, " нет");
+    dlog(line);
+}
+
+/* текстура родного материала: сначала _MainTex, иначе первая непустая из GetTexturePropertyNames */
+static void* rg_gm_find_tex(void* src) {
+    void *r = NULL, *arr = NULL; long len, i;
+    if (!src || !hm_obj_ok(src)) return NULL;
+    if (GM.mGetTex && rg_call("Material.get_mainTexture", GM.mGetTex, src, NULL, &r) && r && hm_obj_ok(r)) return r;
+    if (!GM.mGetTexNames || !GM.mGetTexS) return NULL;
+    if (!rg_call("Material.GetTexturePropertyNames", GM.mGetTexNames, src, NULL, &arr) || !arr || !hm_obj_ok(arr)) return NULL;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 1 || len > 8) return NULL;
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)((char*)arr + 4 * sizeof(void*) + (uptr)i * sizeof(void*)); void *a[1], *t = NULL;
+        if (!s) continue;
+        a[0] = s;
+        if (rg_call("Material.GetTexture", GM.mGetTexS, src, a, &t) && t && hm_obj_ok(t)) return t;
+    }
+    return NULL;
+}
+
+/* новый материал: Sprites/Default (запасные UI/Default и GUI/Text Shader), очередь отрисовки 3005, текстура — у родного материала src (режим /ring mat 1) */
+static void* rg_skin_make(void* src) {
+    static const char* const names[] = { "Sprites/Default", "UI/Default", "GUI/Text Shader", NULL };
+    void *shader = NULL, *mat, *a[1], *r; int i, q = 3005;
+    for (i = 0; names[i] && !shader; i++) {
+        a[0] = A.string_new(names[i]); r = NULL;
+        if (rg_call("Shader.Find", GM.mFind, NULL, a, &r) && r && hm_obj_ok(r)) {
+            shader = r;
+            if (!g_rg_skinSaid) { g_rg_skinSaid = 1; dlog2("ring: свой материал метки, шейдер ", names[i]); }
+        }
+    }
+    if (!shader) { if (!g_rg_skinSaid) { g_rg_skinSaid = 1; dlog("ring: ни один шейдер для своего материала метки не нашёлся (Shader.Find вернул null)"); } return NULL; }
+    mat = A.object_new(GM.kMat);
+    if (!mat) return NULL;
+    a[0] = shader;
+    if (!rg_call("Material..ctor", GM.mMatCtor, mat, a, NULL)) return NULL;
+    a[0] = &q; rg_call("Material.set_renderQueue", GM.mSetQ, mat, a, NULL);
+    if (g_rg_skin == 1 && GM.mSetTex) {
+        void* tex = rg_gm_find_tex(src);
+        if (tex) { a[0] = tex; rg_call("Material.set_mainTexture", GM.mSetTex, mat, a, NULL); }
+    }
+    return mat;
+}
+
+/* повесить свой материал на все рендереры метки и покрасить: good=1 — зелёный, 0 — красный, прозрачность g_rg_alpha. Возвращает, сколько рендереров покрашено */
+static int rg_gm_skin(int good) {
+    void *cp = rg_gm_cp(), *rs[RG_MAXR]; int n, i, cnt = 0; float col[4];
+    if (!cp || !GM.skinOk) return 0;
+    n = rg_gm_rends(cp, rs, RG_MAXR);
+    col[0] = good ? 0.15f : 1.00f; col[1] = good ? 0.95f : 0.12f; col[2] = good ? 0.30f : 0.12f; col[3] = g_rg_alpha;
+    for (i = 0; i < n; i++) {
+        void *cur = NULL, *mine = g_rg_skinH[i] ? RGA.gc_target(g_rg_skinH[i]) : NULL, *a[2], *nm;
+        if (!rg_call("Renderer.get_sharedMaterial", GM.mGetShared, rs[i], NULL, &cur)) continue;
+        if (cur && !hm_obj_ok(cur)) cur = NULL;
+        if (!(mine && hm_obj_ok(mine) && cur == mine)) {                    /* на рендерере ещё не наш материал (или игра подменила) */
+            void* orig = g_rg_origH[i] ? RGA.gc_target(g_rg_origH[i]) : NULL;
+            if (cur && !(mine && cur == mine)) {                            /* запомнить родной, если это не наш прежний */
+                if (g_rg_origH[i]) RGA.gc_free(g_rg_origH[i]);
+                g_rg_origH[i] = RGA.gc_new(cur, 0); orig = cur;
+            }
+            rg_gm_log_props(orig ? orig : cur, rs[i], i);
+            if (g_rg_skinH[i]) { RGA.gc_free(g_rg_skinH[i]); g_rg_skinH[i] = 0; }
+            mine = rg_skin_make(orig ? orig : cur);
+            if (!mine) continue;
+            g_rg_skinH[i] = RGA.gc_new(mine, 0);
+            a[0] = mine;
+            if (!rg_call("Renderer.set_sharedMaterial", GM.mSetShared, rs[i], a, NULL)) continue;
+        }
+        nm = A.string_new("_Color");
+        a[0] = nm; a[1] = col;
+        if (rg_call("Material.SetColor", GM.mSetCol, mine, a, NULL)) cnt++;
+    }
+    return cnt;
+}
+
+/* вернуть родные материалы и забыть свои (/ring mat 0 и смена 1 ↔ 2) */
+static void rg_gm_unskin(int restore) {
+    int i;
+    if (restore && GM.state > 0 && GM.skinOk) {
+        void *cp = rg_gm_cp(), *rs[RG_MAXR];
+        if (cp) {
+            int n = rg_gm_rends(cp, rs, RG_MAXR);
+            for (i = 0; i < n; i++) {
+                void *orig = g_rg_origH[i] ? RGA.gc_target(g_rg_origH[i]) : NULL, *a[1];
+                if (!orig || !hm_obj_ok(orig)) continue;
+                a[0] = orig; rg_call("Renderer.set_sharedMaterial", GM.mSetShared, rs[i], a, NULL);
+            }
+        }
+    }
+    for (i = 0; i < RG_MAXR; i++) if (g_rg_skinH[i]) { RGA.gc_free(g_rg_skinH[i]); g_rg_skinH[i] = 0; }
 }
 
 static void rg_gm_hide(void) {
@@ -698,8 +852,11 @@ static void rg_zone_color(void) {
     z = g_rg_dist < g_rg_rIn ? 0 : g_rg_dist > g_rg_rOut ? 2 : 1;
     if (z == g_rg_zone) return;
     if (!g_rg_flat) {
+        int painted = 0;
         if (!g_rg_gmSet) return;
-        if (rg_gm_tint(z == 1) > 0) { g_rg_zone = z; g_rg_gmTries = 0; }
+        if (g_rg_skin) painted = rg_gm_skin(z == 1) > 0;                    /* своя полупрозрачная заливка */
+        if (!painted) painted = rg_gm_tint(z == 1) > 0;                     /* запасной путь: свойства родного материала */
+        if (painted) { g_rg_zone = z; g_rg_gmTries = 0; }
         else {
             if (++g_rg_gmTries > 24) rg_use_flat("цвет метки не поменять: у её шейдера нет свойства цвета (см. «шейдер метки» в логе)");
             return;
@@ -759,7 +916,7 @@ static int rg_tokens(void* arr, char tok[][24], int maxn) {
 
 
 static void rg_info(void) {
-    Buf b; char msg[300];
+    Buf b; char msg[360];
     b_init(&b, msg, sizeof msg);
     if (!g_rg_on) { chat_say("Зона выключена. /ring on — включить"); return; }
     if (!g_rg_have) { chat_say("Зона: центр не найден (раздевалка не в зоне стрима). /ring scan — искать заново, /ring any — любой пикап"); return; }
@@ -767,6 +924,7 @@ static void rg_info(void) {
     b_s(&b, g_rg_zone == 0 ? "СЛИШКОМ БЛИЗКО (ближе 1,5 м вход не сработает)" : g_rg_zone == 2 ? "ЗА ЗОНОЙ (дальше 4 м диалог не примет)" : g_rg_zone == 1 ? "в зоне, всё хорошо" : "расстояние не определилось");
     b_s(&b, ". Зона "); b_fix(&b, g_rg_rIn, 1); b_s(&b, "–"); b_fix(&b, g_rg_rOut, 1); b_s(&b, " м, пол "); b_s(&b, g_rg_gyOk ? "по ногам" : "пока по пикапу"); b_s(&b, ", подъём "); b_fix(&b, g_rg_lift, 2);
     b_s(&b, " м, "); b_s(&b, !g_rg_flat ? "метка игры" : g_rg_see ? "плоская, поверх всего" : "плоская, на полу"); b_s(&b, g_rg_any ? ", центр: любой пикап" : ", центр: раздевалка");
+    if (!g_rg_flat) { b_s(&b, ", прозрачность "); b_fix(&b, g_rg_alpha, 2); b_s(&b, g_rg_skin == 1 ? ", свой материал с текстурой" : g_rg_skin == 2 ? ", свой материал без текстуры" : ", родной материал"); }
     chat_say(msg);
 }
 
@@ -805,12 +963,27 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
         if (g_rg_on) rg_tick();
         return;
     }
-    if (seq(tok[0], "reset")) { g_rg_rIn = 1.6f; g_rg_rOut = 3.8f; g_rg_lift = 0.0f; if (g_rg_see) { g_rg_see = 0; if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; } rg_destroy_all(); } rg_gm_hide(); g_rg_flat = 0; g_rg_cal = 0.0f; g_rg_calChecked = 0; g_rg_dirty = 1; chat_say("Зона: 1.6–3.8 м, подъём 0, родная метка игры"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "reset")) { g_rg_rIn = 1.6f; g_rg_rOut = 3.8f; g_rg_lift = 0.0f; if (g_rg_skin != 1) { rg_gm_unskin(1); g_rg_skin = 1; } g_rg_alpha = 0.15f; g_rg_zone = -1; if (g_rg_see) { g_rg_see = 0; if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; } rg_destroy_all(); } rg_gm_hide(); g_rg_flat = 0; g_rg_cal = 0.0f; g_rg_calChecked = 0; g_rg_dirty = 1; chat_say("Зона: 1.6–3.8 м, подъём 0, прозрачность 0.15, родная метка игры"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "r") && n >= 3) {
         float a, c;
         if (!rg_num(tok[1], &a) || !rg_num(tok[2], &c) || a < 0.5f || c > 8.0f || a >= c) { chat_say("Зона: /ring r 1.6 3.8 — внутренний и внешний радиус, м (от 0.5 до 8, внутренний меньше внешнего)"); return; }
         g_rg_rIn = a; g_rg_rOut = c; g_rg_dirty = 1; g_rg_zone = -1; g_rg_calChecked = 0;
         chat_say("Зона: радиусы изменены"); if (g_rg_on) rg_tick();
+        return;
+    }
+    if (seq(tok[0], "a") && n >= 2) {
+        float v;
+        if (!rg_num(tok[1], &v) || v < 0.02f || v > 1.0f) { chat_say("Зона: /ring a 0.15 — прозрачность родной метки, от 0.02 (почти невидимая) до 1 (непрозрачная)"); return; }
+        g_rg_alpha = v; g_rg_zone = -1;
+        chat_say("Зона: прозрачность изменена"); if (g_rg_on) rg_tick();
+        return;
+    }
+    if (seq(tok[0], "mat") && n >= 2) {
+        int m = seq(tok[1], "0") ? 0 : seq(tok[1], "1") ? 1 : seq(tok[1], "2") ? 2 : -1;
+        if (m < 0) { chat_say("Зона: /ring mat 1 — свой материал с текстурой метки (по умолчанию), 2 — свой без текстуры (сплошная заливка), 0 — родной материал игры"); return; }
+        if (m != g_rg_skin) { rg_gm_unskin(1); g_rg_skin = m; g_rg_zone = -1; g_rg_gmTries = 0; }
+        chat_say(m == 1 ? "Зона: свой полупрозрачный материал с текстурой метки" : m == 2 ? "Зона: свой полупрозрачный материал без текстуры (сплошная заливка)" : "Зона: родной материал метки (только правка свойств цвета)");
+        if (g_rg_on) rg_tick();
         return;
     }
     if ((seq(tok[0], "y") || seq(tok[0], "dz")) && n >= 2) {
@@ -819,7 +992,7 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
         g_rg_lift = v; g_rg_dirty = 1; chat_say("Зона: высота изменена"); if (g_rg_on) rg_tick();
         return;
     }
-    chat_say("Зона: /ring on|off, /ring info, /ring r 1.6 3.8, /ring game|flat, /ring y 0.05, /ring see, /ring any|cloth, /ring scan, /ring reset");
+    chat_say("Зона: /ring on|off, /ring info, /ring a 0.15 (прозрачность), /ring mat 1|2|0, /ring r 1.6 3.8, /ring game|flat, /ring y 0.05, /ring see, /ring any|cloth, /ring scan, /ring reset");
 }
 
 /* ───────────── самозапуск ───────────── */
