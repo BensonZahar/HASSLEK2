@@ -1,24 +1,29 @@
 /*
- * hassle_ring.c — /ring: рисует в игре кольцо вокруг раздевалки (пикап «clothesp»), чтобы было видно, где стоять для /dressu и «Переодевание ночь».
+ * hassle_ring.c — /ring: рисует на полу вокруг раздевалки (пикап «clothesp») ОДНУ зону, где надо стоять для /dressu и «Переодевание ночь».
  *
- * Почему кольцо, а не круг (по серверу, new.pwn и include/core/pickup.pwn):
+ * Что значит зона (по серверу, new.pwn и include/core/pickup.pwn):
  *   • вход в пикап сервер принимает, если игрок не дальше 5 м (IsPlayerInPickup(…, 5.0, …)), НО только когда флаг «уже стою на пикапе» (P_IN_PICKUP) сброшен;
- *   • флаг сбрасывается таймером в 250 мс, как только игрок дальше 1,5 м от пикапа, — пока вы ближе 1,5 м, повторный вход молча игнорируется (отсюда «вплотную /dressu не работает»);
+ *   • флаг сбрасывается таймером в 250 мс, как только игрок дальше 1,5 м от пикапа, — пока вы ближе 1,5 м, повторный вход молча игнорируется;
  *   • ответы на диалоги раздевалки (DIALOG_TEAM_SKIN …) сервер принимает только до 4,0 м (IsPlayerInPickupEx(…, 4.0, …)).
- *   Значит стоять надо в кольце: от 1,5 до 4,0 м от точки пикапа (расстояние трёхмерное, от позиции игрока в пакете синхронизации = Transform.y + 1).
- *   Рисуем три окружности: КРАСНАЯ 1,7 м (ближе — вход не сработает), ЗЕЛЁНАЯ посередине (стойте на ней), ЖЁЛТАЯ 3,8 м (дальше диалог не примет).
- *   Средняя окружность меняет цвет по вашему реальному расстоянию: зелёная — вы в рабочей зоне, красная — слишком близко, жёлтая — слишком далеко.
+ *   Значит стоять надо в «бублике»: от 1,5 до 4,0 м от точки пикапа (расстояние трёхмерное: позиция игрока в пакете синхронизации = Transform.y + 1).
+ *   Зона нарисована с небольшим запасом: 1,6 … 3,8 м.
  *
- * Как рисуем (по дизассемблированию EditObjectAxis..ctor, RVA 0x123F2B4): игра сама делает линии так — LineRenderer на новом GameObject, материал
- *   new Material(Shader.Find("GUI/Text Shader")) (встроенный шейдер, он точно есть в билде), renderQueue = 3010, цвет — startColor/endColor.
- *   Мы делаем так же, только useWorldSpace = true и 73 точки по кругу. Шейдер рисует поверх всего (ZTest Always) — кольцо видно и сквозь стены.
+ * Как выглядит: одна полупрозрачная кольцевая полоса на полу. ЗЕЛЁНАЯ — вы внутри зоны (стойте здесь), КРАСНАЯ — вы слишком близко к пикапу или вышли за зону.
+ *
+ * Как рисуем (по дизассемблированию EditObjectAxis..ctor, RVA 0x123F2B4: игра сама делает линии через LineRenderer): GameObject + LineRenderer, одна окружность
+ *   с шириной = ширине зоны и alignment = TransformZ, а сам объект повёрнут на −90° вокруг X — полоса лежит плашмя, как пятно на полу.
+ *   Материал: по умолчанию «Sprites/Default» (встроенный, глубину проверяет — зона на полу, персонажи и стены её перекрывают), запасной — «GUI/Text Shader»
+ *   (как у линий игры; рисуется поверх всего, видно и сквозь стены). /ring see переключает между ними.
+ *   Высота: Transform.y ваших ног, когда вы стоите на земле у раздевалки (пока не встали — пикап − 1 м). Лишний метр между точкой пикапа и полом
+ *   (если пикап висит выше) учитывается в радиусе: радиус на полу = sqrt(R² − dz²), dz = высота пикапа − (пол + 1).
  *
  * Команды:
  *   /ring            включить/выключить      /ring on | off
- *   /ring info       где центр, расстояние до него, зона (ок / слишком близко / слишком далеко)
- *   /ring r 1.7 3.8  радиусы красного и жёлтого кольца (зелёное — посередине)     /ring reset — вернуть 1.7 / 3.8
+ *   /ring info       где центр, расстояние до него, зона
+ *   /ring r 1.6 3.8  внутренний и внешний радиус зоны, м     /ring reset — вернуть 1.6 / 3.8, подъём 0, материал по умолчанию
  *   /ring any        центр — ближайший пикап любой модели (если раздевалка не находится по имени «cloth»);  /ring cloth — обратно только раздевалка
- *   /ring dz 0.5     вертикальная поправка, м: на сколько точка пикапа выше центра игрока (по умолчанию 0; радиусы кольца на земле — sqrt(R² − dz²))
+ *   /ring y 0.05     поднять/опустить зону относительно пола, м (−2…2); если зона мерцает или уходит под пол — поднять
+ *   /ring see        материал: на полу (Sprites/Default) ⇄ поверх всего (GUI/Text Shader)
  *   /ring scan       искать раздевалку заново сейчас
  *
  * Всё рисование — в главном потоке (Post в UnitySynchronizationContext, как в /nocol); фоновый поток раз в 0,5 с только ставит задачу.
@@ -26,13 +31,12 @@
 #pragma once
 #include "hassle_core.c"
 
-#define RG_SEG 72                       /* сегментов окружности (точек SEG+1: последняя замыкает) */
-#define RG_N 3                          /* красная, средняя, жёлтая */
+#define RG_SEG 72                       /* сегментов окружности */
 #define RG_SCAN_M 60.0f                 /* раздевалку ищем не дальше этого от игрока, м */
 #define RG_RESCAN_S 3                   /* как часто перечитывать пикапы, с */
-#define RG_SRV_IN 1.5f                  /* ближе — флаг «стою на пикапе» не сбрасывается */
-#define RG_SRV_OUT 4.0f                 /* дальше — ответы диалогов раздевалки не принимаются */
 #define RG_QUEUE 3010                   /* renderQueue, как у линий игры */
+#define RG_LIFT 0.04f                   /* зона чуть выше пола, м (чтобы не мерцала с полом) */
+#define RG_GROUND_R 8.0f                /* высоту земли берём по игроку, только если он не дальше этого от центра по горизонтали, м */
 
 typedef struct {
     void* (*cls_methods)(void*, void**);
@@ -49,32 +53,36 @@ static RgApi RGA;
 static int g_rg_apiState;               /* 0 — не искали, 1 — есть, -1 — нет */
 
 static int g_ring_modId = -1;
-static volatile int g_rg_on;            /* кольца включены */
+static volatile int g_rg_on;            /* зона включена */
 static volatile int g_rg_pending;       /* в главный поток уже поставлен тик */
 static volatile long g_rg_postT;
 static int g_rg_any;                    /* 1 — центр любой пикап (/ring any), 0 — только с «cloth» в имени модели */
-static float g_rg_rIn = 1.7f, g_rg_rOut = 3.8f, g_rg_dz = 0.0f;
-static const float g_rg_width[RG_N] = { 0.10f, 0.06f, 0.10f };
-static const float g_rg_col[RG_N][4] = { { 1.0f, 0.15f, 0.15f, 1.0f }, { 0.2f, 1.0f, 0.3f, 1.0f }, { 1.0f, 0.85f, 0.1f, 1.0f } };
+static int g_rg_see;                    /* 0 — Sprites/Default (на полу), 1 — GUI/Text Shader (поверх всего) */
+static float g_rg_rIn = 1.6f, g_rg_rOut = 3.8f, g_rg_lift = 0.0f;
+static const float g_rg_colOk[4]  = { 0.15f, 0.95f, 0.30f, 0.42f };     /* в зоне */
+static const float g_rg_colBad[4] = { 1.00f, 0.12f, 0.12f, 0.42f };     /* слишком близко или за зоной */
 
 /* найденный центр (пикап раздевалки) */
 static int g_rg_have, g_rg_id;
 static float g_rg_c[3];
 static long g_rg_scanT;
-static int g_rg_dirty;                  /* центр или радиусы изменились — перерисовать точки */
-static int g_rg_zone = -1;              /* 0 — слишком близко, 1 — ок, 2 — слишком далеко; -1 — неизвестно */
+static int g_rg_dirty;                  /* центр, пол или радиусы изменились — перерисовать */
+static int g_rg_zone = -1;              /* 0 — слишком близко, 1 — ок, 2 — слишком далеко; -1 — неизвестно (цвет ещё не выставлен) */
 static float g_rg_dist = -1.0f;
 static int g_rg_notFoundSaid;
+static float g_rg_gy; static int g_rg_gyOk;     /* высота пола у раздевалки (Transform.y ног игрока на земле) */
+static float g_rg_drawGy = 1e9f;                /* пол, при котором нарисовано */
 
 /* ресурсы Unity */
 static struct {
     int state;                          /* 0 — не искали, 1 — всё есть, -1 — чего-то нет */
-    void *kGo, *kMat, *kShader, *kLr, *kObj;
+    void *kGo, *kMat, *kShader, *kLr, *kObj, *kTr;
     void *mGoCtor, *mAdd, *mFind, *mMatCtor, *mSetQ, *mSetMat, *mWidth, *mWorld, *mCount, *mPos, *mCol0, *mCol1, *mEnable, *mDestroy;
+    void *mAlign, *mLoop, *mGetTr, *mTrPos, *mTrRot;
     void* typeLr;
 } RG;
 static unsigned g_rg_hMat;
-static unsigned g_rg_hGo[RG_N], g_rg_hLr[RG_N];
+static unsigned g_rg_hGo, g_rg_hLr;
 static int g_rg_fails;
 
 /* ───────────── мелочи ───────────── */
@@ -170,9 +178,11 @@ static int rg_resolve(void) {
     RG.kShader = A.class_from_name(img, "UnityEngine", "Shader");
     RG.kLr     = A.class_from_name(img, "UnityEngine", "LineRenderer");
     RG.kObj    = A.class_from_name(img, "UnityEngine", "Object");
-    if (!RG.kGo || !RG.kMat || !RG.kShader || !RG.kLr || !RG.kObj) { dlog("ring: не нашлись классы UnityEngine (GameObject/Material/Shader/LineRenderer/Object)"); RG.state = -1; return 0; }
+    RG.kTr     = A.class_from_name(img, "UnityEngine", "Transform");
+    if (!RG.kGo || !RG.kMat || !RG.kShader || !RG.kLr || !RG.kObj || !RG.kTr) { dlog("ring: не нашлись классы UnityEngine (GameObject/Material/Shader/LineRenderer/Object/Transform)"); RG.state = -1; return 0; }
     RG.mGoCtor  = rg_find_m1(RG.kGo, ".ctor", "System.String");
     RG.mAdd     = rg_find_m1(RG.kGo, "AddComponent", "System.Type");
+    RG.mGetTr   = find_method(RG.kGo, "get_transform", 0);
     RG.mFind    = find_method(RG.kShader, "Find", 1);
     RG.mMatCtor = rg_find_m1(RG.kMat, ".ctor", "UnityEngine.Shader");
     RG.mSetQ    = find_method(RG.kMat, "set_renderQueue", 1);
@@ -184,27 +194,34 @@ static int rg_resolve(void) {
     RG.mCol0    = find_method(RG.kLr, "set_startColor", 1);
     RG.mCol1    = find_method(RG.kLr, "set_endColor", 1);
     RG.mEnable  = find_method(RG.kLr, "set_enabled", 1);
+    RG.mAlign   = find_method(RG.kLr, "set_alignment", 1);
+    RG.mLoop    = find_method(RG.kLr, "set_loop", 1);            /* необязательный: без него замыкаем сами повтором первой точки */
+    RG.mTrPos   = find_method(RG.kTr, "set_position", 1);
+    RG.mTrRot   = find_method(RG.kTr, "set_rotation", 1);
     RG.mDestroy = find_method(RG.kObj, "Destroy", 1);
     RG.typeLr   = RGA.type_object(RGA.cls_type(RG.kLr));
     {
-        const char* miss = !RG.mGoCtor ? "GameObject..ctor(string)" : !RG.mAdd ? "GameObject.AddComponent(Type)" : !RG.mFind ? "Shader.Find" :
-            !RG.mMatCtor ? "Material..ctor(Shader)" : !RG.mSetQ ? "Material.set_renderQueue" : !RG.mSetMat ? "Renderer.set_material" :
+        const char* miss = !RG.mGoCtor ? "GameObject..ctor(string)" : !RG.mAdd ? "GameObject.AddComponent(Type)" : !RG.mGetTr ? "GameObject.get_transform" :
+            !RG.mFind ? "Shader.Find" : !RG.mMatCtor ? "Material..ctor(Shader)" : !RG.mSetQ ? "Material.set_renderQueue" : !RG.mSetMat ? "Renderer.set_material" :
             !RG.mWidth ? "LineRenderer.set_widthMultiplier" : !RG.mWorld ? "LineRenderer.set_useWorldSpace" : !RG.mCount ? "LineRenderer.set_positionCount" :
             !RG.mPos ? "LineRenderer.SetPosition" : !RG.mCol0 ? "LineRenderer.set_startColor" : !RG.mCol1 ? "LineRenderer.set_endColor" :
-            !RG.mEnable ? "Renderer.set_enabled" : !RG.mDestroy ? "Object.Destroy" : !RG.typeLr ? "typeof(LineRenderer)" : NULL;
+            !RG.mEnable ? "Renderer.set_enabled" : !RG.mAlign ? "LineRenderer.set_alignment" : !RG.mTrPos ? "Transform.set_position" :
+            !RG.mTrRot ? "Transform.set_rotation" : !RG.mDestroy ? "Object.Destroy" : !RG.typeLr ? "typeof(LineRenderer)" : NULL;
         if (miss) { dlog2("ring: нет метода ", miss); RG.state = -1; return 0; }
     }
     RG.state = 1;
-    dlog("ring: методы Unity найдены");
+    dlog(RG.mLoop ? "ring: методы Unity найдены (с set_loop)" : "ring: методы Unity найдены (без set_loop)");
     return 1;
 }
 
-/* общий материал (создаётся один раз) */
+/* общий материал (создаётся один раз, пересоздаётся при смене /ring see) */
 static void* rg_material(void) {
     void *mat, *shader = NULL, *args[1], *r = NULL;
-    static const char* const names[] = { "GUI/Text Shader", "Sprites/Default", "Hidden/Internal-Colored", NULL };
+    static const char* const namesFloor[] = { "Sprites/Default", "GUI/Text Shader", "Hidden/Internal-Colored", NULL };
+    static const char* const namesTop[]   = { "GUI/Text Shader", "Sprites/Default", "Hidden/Internal-Colored", NULL };
+    const char* const* names = g_rg_see ? namesTop : namesFloor;
     int i, q = RG_QUEUE;
-    if (g_rg_hMat) { mat = RGA.gc_target(g_rg_hMat); if (mat && hm_obj_ok(mat)) return mat; g_rg_hMat = 0; }
+    if (g_rg_hMat) { mat = RGA.gc_target(g_rg_hMat); if (mat && hm_obj_ok(mat)) return mat; RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; }
     for (i = 0; names[i] && !shader; i++) {
         args[0] = A.string_new(names[i]); r = NULL;
         if (rg_call("Shader.Find", RG.mFind, NULL, args, &r) && r && hm_obj_ok(r)) { shader = r; dlog2("ring: шейдер ", names[i]); }
@@ -220,9 +237,14 @@ static void* rg_material(void) {
     return mat;
 }
 
-static void rg_set_color(int i, const float* c) {
+static void* rg_lr(void) {
+    void* lr = g_rg_hLr ? RGA.gc_target(g_rg_hLr) : NULL;
+    return (lr && hm_obj_ok(lr)) ? lr : NULL;
+}
+
+static void rg_set_color(const float* c) {
     void *lr, *args[1]; float col[4];
-    lr = g_rg_hLr[i] ? RGA.gc_target(g_rg_hLr[i]) : NULL;
+    lr = rg_lr();
     if (!lr) return;
     col[0] = c[0]; col[1] = c[1]; col[2] = c[2]; col[3] = c[3];
     args[0] = col;
@@ -231,38 +253,32 @@ static void rg_set_color(int i, const float* c) {
 }
 
 static void rg_enable(int on) {
-    int i;
-    for (i = 0; i < RG_N; i++) {
-        void *lr, *args[1]; u8 v = on ? 1 : 0;
-        lr = g_rg_hLr[i] ? RGA.gc_target(g_rg_hLr[i]) : NULL;
-        if (!lr) continue;
-        args[0] = &v;
-        rg_call("set_enabled", RG.mEnable, lr, args, NULL);
-    }
+    void *lr, *args[1]; u8 v = on ? 1 : 0;
+    lr = rg_lr();
+    if (!lr) return;
+    args[0] = &v;
+    rg_call("set_enabled", RG.mEnable, lr, args, NULL);
 }
 
-/* убрать все объекты колец */
+/* убрать объект зоны */
 static void rg_destroy_all(void) {
-    int i;
-    if (RG.state > 0) {
-        for (i = 0; i < RG_N; i++) {
-            void* go = g_rg_hGo[i] ? RGA.gc_target(g_rg_hGo[i]) : NULL; void* args[1];
-            if (go && hm_obj_ok(go)) { args[0] = go; rg_call("Object.Destroy", RG.mDestroy, NULL, args, NULL); }
-        }
+    if (RG.state > 0 && g_rg_hGo) {
+        void* go = RGA.gc_target(g_rg_hGo); void* args[1];
+        if (go && hm_obj_ok(go)) { args[0] = go; rg_call("Object.Destroy", RG.mDestroy, NULL, args, NULL); }
     }
-    for (i = 0; i < RG_N; i++) {
-        if (g_rg_hGo[i]) RGA.gc_free(g_rg_hGo[i]);
-        if (g_rg_hLr[i]) RGA.gc_free(g_rg_hLr[i]);
-        g_rg_hGo[i] = g_rg_hLr[i] = 0;
-    }
+    if (g_rg_hGo) RGA.gc_free(g_rg_hGo);
+    if (g_rg_hLr) RGA.gc_free(g_rg_hLr);
+    g_rg_hGo = g_rg_hLr = 0;
     g_rg_zone = -1;
+    g_rg_drawGy = 1e9f;
     g_rg_dirty = 1;
 }
 
-/* создать i-е кольцо (GameObject + LineRenderer). 1 — получилось */
-static int rg_make(int i) {
-    void *mat, *go, *lr = NULL, *args[2], *name; float w = g_rg_width[i]; int cnt = RG_SEG + 1; u8 world = 1; char nm[24];
-    nm[0] = 'k'; nm[1] = 'o'; nm[2] = 'n'; nm[3] = 's'; nm[4] = 't'; nm[5] = '_'; nm[6] = 'r'; nm[7] = 'i'; nm[8] = 'n'; nm[9] = 'g'; nm[10] = (char)('0' + i); nm[11] = 0;
+/* создать объект зоны: GameObject + LineRenderer, плашмя (alignment = TransformZ, поворот −90° вокруг X), локальные координаты. 1 — получилось */
+static int rg_make(void) {
+    void *mat, *go, *lr = NULL, *tr = NULL, *args[2], *name; u8 world = 0; int align = 1; char nm[16];
+    float rot[4];
+    nm[0] = 'k'; nm[1] = 'o'; nm[2] = 'n'; nm[3] = 's'; nm[4] = 't'; nm[5] = '_'; nm[6] = 'z'; nm[7] = 'o'; nm[8] = 'n'; nm[9] = 'e'; nm[10] = 0;
     mat = rg_material();
     if (!mat) return 0;
     go = A.object_new(RG.kGo);
@@ -272,61 +288,76 @@ static int rg_make(int i) {
     if (!rg_call("GameObject..ctor", RG.mGoCtor, go, args, NULL)) return 0;
     args[0] = RG.typeLr;
     if (!rg_call("AddComponent(LineRenderer)", RG.mAdd, go, args, &lr) || !lr || !hm_obj_ok(lr)) return 0;
-    g_rg_hGo[i] = RGA.gc_new(go, 0);
-    g_rg_hLr[i] = RGA.gc_new(lr, 0);
+    g_rg_hGo = RGA.gc_new(go, 0);
+    g_rg_hLr = RGA.gc_new(lr, 0);
     args[0] = mat;     rg_call("Renderer.set_material", RG.mSetMat, lr, args, NULL);
     args[0] = &world;  rg_call("LineRenderer.set_useWorldSpace", RG.mWorld, lr, args, NULL);
-    args[0] = &w;      rg_call("LineRenderer.set_widthMultiplier", RG.mWidth, lr, args, NULL);
-    args[0] = &cnt;    rg_call("LineRenderer.set_positionCount", RG.mCount, lr, args, NULL);
-    rg_set_color(i, g_rg_col[i]);
+    args[0] = &align;  rg_call("LineRenderer.set_alignment", RG.mAlign, lr, args, NULL);
+    if (RG.mLoop) { u8 lp = 1; args[0] = &lp; rg_call("LineRenderer.set_loop", RG.mLoop, lr, args, NULL); }
+    if (!rg_call("GameObject.get_transform", RG.mGetTr, go, NULL, &tr) || !tr || !hm_obj_ok(tr)) return 0;
+    rot[0] = -0.70710678f; rot[1] = 0.0f; rot[2] = 0.0f; rot[3] = 0.70710678f;          /* Quaternion: −90° вокруг X (локальный Z смотрит вверх) */
+    args[0] = rot;     if (!rg_call("Transform.set_rotation", RG.mTrRot, tr, args, NULL)) return 0;
+    rg_set_color(g_rg_colOk);
     return 1;
 }
 
-/* Радиус кольца на земле для трёхмерного расстояния R с вертикальной поправкой dz: sqrt(R² − dz²) */
+/* Высота пола у центра: по ногам игрока, пока не знаем — на метр ниже точки пикапа (так считал сервер: Transform.y + 1 = точка пикапа) */
+static float rg_floor_y(void) { return g_rg_gyOk ? g_rg_gy : g_rg_c[1] - 1.0f; }
+
+/* Радиус на полу для трёхмерного расстояния R: sqrt(R² − dz²), dz = высота точки пикапа над «центром тела» игрока (пол + 1 м) */
 static float rg_flat_r(float R) {
-    double v = (double)R * R - (double)g_rg_dz * g_rg_dz;
-    return v > 0.01 ? (float)__builtin_sqrt(v) : 0.0f;
+    double dz = (double)g_rg_c[1] - ((double)rg_floor_y() + 1.0);
+    double v = (double)R * R - dz * dz;
+    return v > 0.04 ? (float)__builtin_sqrt(v) : 0.2f;
 }
 
-/* расставить точки i-го кольца вокруг центра. 1 — без исключений */
-static int rg_points(int i, float R) {
-    void *lr, *args[2]; int k, idx, ok = 1; float p[3];
-    double c, s, a = 6.283185307179586 / RG_SEG, x, z, nx;
-    lr = g_rg_hLr[i] ? RGA.gc_target(g_rg_hLr[i]) : NULL;
+/* поставить объект на пол над центром */
+static int rg_place(void) {
+    void *go, *tr = NULL, *args[1]; float p[3];
+    go = g_rg_hGo ? RGA.gc_target(g_rg_hGo) : NULL;
+    if (!go || !hm_obj_ok(go)) return 0;
+    if (!rg_call("GameObject.get_transform", RG.mGetTr, go, NULL, &tr) || !tr || !hm_obj_ok(tr)) return 0;
+    p[0] = g_rg_c[0]; p[1] = rg_floor_y() + RG_LIFT + g_rg_lift; p[2] = g_rg_c[2];
+    args[0] = p;
+    return rg_call("Transform.set_position", RG.mTrPos, tr, args, NULL);
+}
+
+/* окружность по середине полосы: ширина линии = ширина зоны */
+static int rg_points(float rIn, float rOut) {
+    void *lr, *args[2]; int k, idx, ok = 1, cnt = RG.mLoop ? RG_SEG : RG_SEG + 1; float p[3], w = rOut - rIn, R = (rIn + rOut) * 0.5f;
+    double c, s, a = 6.283185307179586 / RG_SEG, x, y, nx;
+    lr = rg_lr();
     if (!lr) return 0;
+    args[0] = &w;   if (!rg_call("LineRenderer.set_widthMultiplier", RG.mWidth, lr, args, NULL)) return 0;
+    args[0] = &cnt; if (!rg_call("LineRenderer.set_positionCount", RG.mCount, lr, args, NULL)) return 0;
     c = 1.0 - a * a / 2 + a * a * a * a / 24 - a * a * a * a * a * a / 720;              /* cos и sin шага — без libm */
     s = a - a * a * a / 6 + a * a * a * a * a / 120 - a * a * a * a * a * a * a / 5040;
-    x = R; z = 0;                                                                         /* поворачиваем вектор радиуса шаг за шагом */
-    for (k = 0; k <= RG_SEG && ok; k++) {
-        p[0] = g_rg_c[0] + (float)x; p[1] = g_rg_c[1] - 1.0f + 0.05f; p[2] = g_rg_c[2] + (float)z;   /* на уровне ног: Transform.y игрока = y пикапа − 1 */
+    x = R; y = 0;                                                                         /* поворачиваем вектор радиуса шаг за шагом */
+    for (k = 0; k < cnt && ok; k++) {
+        p[0] = (float)x; p[1] = (float)y; p[2] = 0.0f;                                    /* локальная плоскость XY; поворот объекта кладёт её на пол */
         idx = k; args[0] = &idx; args[1] = p;
         ok = rg_call("LineRenderer.SetPosition", RG.mPos, lr, args, NULL);
-        nx = x * c - z * s; z = x * s + z * c; x = nx;
+        nx = x * c - y * s; y = x * s + y * c; x = nx;
     }
     return ok;
 }
 
-/* все три кольца живы? */
+/* объект зоны жив? */
 static int rg_alive(void) {
-    int i;
-    for (i = 0; i < RG_N; i++) {
-        void* lr = g_rg_hLr[i] ? RGA.gc_target(g_rg_hLr[i]) : NULL;
-        if (!lr || !hm_obj_ok(lr)) return 0;
-    }
-    return 1;
+    void* go = g_rg_hGo ? RGA.gc_target(g_rg_hGo) : NULL;
+    return go && hm_obj_ok(go) && rg_lr();
 }
 
-/* перерисовать все кольца (после смены центра/радиусов). 1 — получилось. Любое исключение (например, объект уничтожен при смене локации) —
+/* перерисовать зону (после смены центра/радиусов/пола). 1 — получилось. Любое исключение (например, объект уничтожен при смене локации) —
    всё убираем и в следующий тик создаём заново; 5 неудач подряд — выключаемся. */
 static int rg_draw(void) {
-    float R[RG_N]; int i, ok = 1;
-    R[0] = rg_flat_r(g_rg_rIn); R[2] = rg_flat_r(g_rg_rOut); R[1] = (R[0] + R[2]) * 0.5f;
+    int ok = 1;
     if (!rg_alive()) {
         rg_destroy_all();
-        for (i = 0; i < RG_N && ok; i++) ok = rg_make(i);
+        ok = rg_make();
     }
-    for (i = 0; i < RG_N && ok; i++) ok = rg_points(i, R[i]);
-    if (ok) { rg_enable(1); g_rg_dirty = 0; g_rg_fails = 0; }
+    if (ok) ok = rg_points(rg_flat_r(g_rg_rIn), rg_flat_r(g_rg_rOut)) && rg_place();
+    if (ok) { rg_enable(1); g_rg_dirty = 0; g_rg_fails = 0; g_rg_drawGy = rg_floor_y(); }
     else { g_rg_fails++; rg_destroy_all(); }
     return ok;
 }
@@ -401,7 +432,7 @@ static void rg_scan(long now) {
     if (arr) { total = int_field(dict, "_count", "count", NULL, -1); walk_struct_array(arr, total, "value", rg_pk_cb, NULL); }
     if (!RS.found) {
         g_rg_have = 0;
-        if (had) { rg_enable(0); dlog("ring: раздевалка пропала из зоны стрима — кольца скрыты"); }
+        if (had) { rg_enable(0); dlog("ring: раздевалка пропала из зоны стрима — зона скрыта"); }
         return;
     }
     g_rg_have = 1; g_rg_id = RS.id;
@@ -409,26 +440,67 @@ static void rg_scan(long now) {
     g_rg_notFoundSaid = 0;
     if (!had || rg_d3(old, g_rg_c) > 0.05f) {
         Buf b; char msg[200];
-        g_rg_dirty = 1;
+        g_rg_dirty = 1; g_rg_gyOk = 0; g_rg_zone = -1;
         b_init(&b, msg, sizeof msg);
-        b_s(&b, g_rg_any ? "Кольцо: центр — пикап ID " : "Кольцо у раздевалки: пикап ID "); b_int(&b, g_rg_id);
-        b_s(&b, ", красное — "); b_fix(&b, g_rg_rIn, 1); b_s(&b, " м (ближе не сработает), жёлтое — "); b_fix(&b, g_rg_rOut, 1); b_s(&b, " м (дальше диалог не примет)");
+        b_s(&b, g_rg_any ? "Зона: центр — пикап ID " : "Зона у раздевалки: пикап ID "); b_int(&b, g_rg_id);
+        b_s(&b, ". Стойте в ЗЕЛЁНОЙ зоне (");  b_fix(&b, g_rg_rIn, 1); b_s(&b, "–"); b_fix(&b, g_rg_rOut, 1); b_s(&b, " м от пикапа), красная — слишком близко или далеко");
         chat_say(msg);
         dlog2("ring: ", msg);
     }
 }
 
 /* цвет средней окружности по реальному расстоянию до центра: зелёная — рабочая зона */
-static void rg_zone_update(void) {
-    float me[3]; void* lp; int z; static const float red[4] = { 1.0f, 0.15f, 0.15f, 1.0f }, yel[4] = { 1.0f, 0.85f, 0.1f, 1.0f };
+
+/* ───────────── пол и зона ───────────── */
+static float rg_abs(float v) { return v < 0 ? -v : v; }
+
+/* 1 — на земле, 0 — в воздухе, -1 — не прочиталось (LocalPlayer.m_Controller.Movement.isOnGround, как в /tpl) */
+static int rg_on_ground(void* lp) {
+    void *ctrl = ref_field_s(lp, "m_Controller"), *mv = ctrl ? ref_field_s(ctrl, "Movement") : NULL, *m, *r = NULL;
+    if (!mv || !hm_obj_ok(mv)) return -1;
+    m = find_method(A.object_get_class(mv), "get_isOnGround", 0);
+    if (!m || !rg_call("get_isOnGround", m, mv, NULL, &r) || !r || !hm_readable((char*)r + HDR, 1)) return -1;
+    return *((u8*)r + HDR) ? 1 : 0;
+}
+
+/* Пол у раздевалки = Transform.y ног игрока (в пакете Transform.y + 1), пока он стоит на земле недалеко от центра. В прыжке и на другом этаже не обновляем. */
+static void rg_ground_update(void* lp, const float* me) {
+    float f[3], y, hx, hz; void* tr; int gr;
+    tr = rg_obj(lp, "get_transform");
+    if (tr && rg_vec(tr, "get_position", f)) { y = f[1]; hx = f[0] - g_rg_c[0]; hz = f[2] - g_rg_c[2]; }
+    else { y = me[1] - 1.0f; hx = me[0] - g_rg_c[0]; hz = me[2] - g_rg_c[2]; }
+    if (hx * hx + hz * hz > RG_GROUND_R * RG_GROUND_R) return;
+    if (rg_abs(y - (g_rg_c[1] - 1.0f)) > 4.0f) return;                      /* другой этаж / телепорт */
+    gr = rg_on_ground(lp);
+    if (gr == 0) return;                                                    /* прыжок или падение */
+    if (g_rg_gyOk && rg_abs(y - g_rg_gy) > (gr == 1 ? 2.5f : 0.12f)) return;
+    if (!g_rg_gyOk) {
+        Buf b; char msg[140];
+        b_init(&b, msg, sizeof msg); b_s(&b, "ring: пол по ногам игрока y="); b_fix(&b, y, 2); b_s(&b, ", пикап y="); b_fix(&b, g_rg_c[1], 2); b_s(&b, " (над полом на "); b_fix(&b, g_rg_c[1] - y, 2); b_s(&b, " м)");
+        dlog(msg);
+    }
+    g_rg_gy = y; g_rg_gyOk = 1;
+    if (rg_abs(rg_floor_y() - g_rg_drawGy) > 0.04f) g_rg_dirty = 1;
+}
+
+/* замер: расстояние до центра (трёхмерное, по позиции из пакета синхронизации — как считает сервер) и пол */
+static void rg_sample(void) {
+    float me[3]; void* lp;
     lp = local_player();
     if (!g_rg_have || !lp || !hm_obj_ok(lp) || !read_pos(lp, me)) return;
     g_rg_dist = rg_d3(me, g_rg_c);
-    z = g_rg_dist < RG_SRV_IN ? 0 : g_rg_dist > RG_SRV_OUT - 0.1f ? 2 : 1;
+    rg_ground_update(lp, me);
+}
+
+/* цвет зоны: зелёная — вы в зоне, красная — слишком близко или за зоной */
+static void rg_zone_color(void) {
+    int z;
+    if (!g_rg_have || g_rg_dist < 0.0f || !rg_alive()) return;
+    z = g_rg_dist < g_rg_rIn ? 0 : g_rg_dist > g_rg_rOut ? 2 : 1;
     if (z == g_rg_zone) return;
     g_rg_zone = z;
-    rg_set_color(1, z == 0 ? red : z == 2 ? yel : g_rg_col[1]);
-    dlog2("ring: зона: ", z == 0 ? "слишком близко (<1.5 м)" : z == 2 ? "слишком далеко (>3.9 м)" : "рабочая (1.5–3.9 м)");
+    rg_set_color(z == 1 ? g_rg_colOk : g_rg_colBad);
+    dlog2("ring: зона: ", z == 0 ? "слишком близко (красная)" : z == 2 ? "за зоной (красная)" : "в зоне (зелёная)");
 }
 
 /* ───────────── тик в главном потоке ───────────── */
@@ -444,11 +516,12 @@ static void rg_tick(void) {
         }
         return;
     }
+    rg_sample();
     if (g_rg_dirty && !rg_draw()) {
         if (g_rg_fails >= 5) { g_rg_on = 0; chat_say("Кольцо: не получилось нарисовать 5 раз подряд — выключено. Подробности в HLOG/konstt.log"); dlog("ring: 5 неудач подряд, выключено"); }
         return;
     }
-    rg_zone_update();
+    rg_zone_color();
 }
 
 /* ───────────── команда ───────────── */
@@ -473,14 +546,16 @@ static int rg_tokens(void* arr, char tok[][24], int maxn) {
     return n;
 }
 
+
 static void rg_info(void) {
     Buf b; char msg[300];
     b_init(&b, msg, sizeof msg);
-    if (!g_rg_on) { chat_say("Кольцо выключено. /ring on — включить"); return; }
-    if (!g_rg_have) { chat_say("Кольцо: центр не найден (раздевалка не в зоне стрима). /ring scan — искать заново, /ring any — любой пикап"); return; }
-    b_s(&b, "Кольцо: пикап ID "); b_int(&b, g_rg_id); b_s(&b, ", вы в "); b_fix(&b, g_rg_dist >= 0 ? g_rg_dist : 0, 1); b_s(&b, " м — ");
-    b_s(&b, g_rg_zone == 0 ? "СЛИШКОМ БЛИЗКО (ближе 1,5 м вход не сработает)" : g_rg_zone == 2 ? "СЛИШКОМ ДАЛЕКО (дальше 4 м диалог не примет)" : g_rg_zone == 1 ? "рабочая зона" : "расстояние не определилось");
-    b_s(&b, ". Радиусы: "); b_fix(&b, g_rg_rIn, 1); b_s(&b, " / "); b_fix(&b, g_rg_rOut, 1); b_s(&b, " м, dz "); b_fix(&b, g_rg_dz, 1); b_s(&b, g_rg_any ? ", центр: любой пикап" : ", центр: раздевалка");
+    if (!g_rg_on) { chat_say("Зона выключена. /ring on — включить"); return; }
+    if (!g_rg_have) { chat_say("Зона: центр не найден (раздевалка не в зоне стрима). /ring scan — искать заново, /ring any — любой пикап"); return; }
+    b_s(&b, "Зона: пикап ID "); b_int(&b, g_rg_id); b_s(&b, ", вы в "); b_fix(&b, g_rg_dist >= 0 ? g_rg_dist : 0, 1); b_s(&b, " м — ");
+    b_s(&b, g_rg_zone == 0 ? "СЛИШКОМ БЛИЗКО (ближе 1,5 м вход не сработает)" : g_rg_zone == 2 ? "ЗА ЗОНОЙ (дальше 4 м диалог не примет)" : g_rg_zone == 1 ? "в зоне, всё хорошо" : "расстояние не определилось");
+    b_s(&b, ". Зона "); b_fix(&b, g_rg_rIn, 1); b_s(&b, "–"); b_fix(&b, g_rg_rOut, 1); b_s(&b, " м, пол "); b_s(&b, g_rg_gyOk ? "по ногам" : "пока по пикапу"); b_s(&b, ", подъём "); b_fix(&b, g_rg_lift, 2);
+    b_s(&b, g_rg_see ? " м, поверх всего" : " м, на полу"); b_s(&b, g_rg_any ? ", центр: любой пикап" : ", центр: раздевалка");
     chat_say(msg);
 }
 
@@ -493,36 +568,43 @@ static void native_ring_cmd(void* self, void* args, void* mi) {
         if (want) {
             if (!rg_resolve()) { chat_say("Кольцо: не нашлись методы Unity, подробности в HLOG/konstt.log"); return; }
             mt_capture_ctx();                                   /* главный поток: берём SynchronizationContext для тиков */
-            g_rg_on = 1; g_rg_notFoundSaid = 0; g_rg_have = 0; g_rg_dirty = 1; g_rg_scanT = 0; g_rg_fails = 0;
+            g_rg_on = 1; g_rg_notFoundSaid = 0; g_rg_have = 0; g_rg_dirty = 1; g_rg_scanT = 0; g_rg_fails = 0; g_rg_gyOk = 0;
             if (!g_mt_ctx) chat_say("Кольцо: нет главного потока для автообновления — рисую один раз, повторный /ring on обновит");
             rg_tick();
-            if (g_rg_have) chat_say("Красное — не стойте внутри, жёлтое — не выходите за него, зелёное — стойте на нём. /ring info — расстояние");
         } else {
             g_rg_on = 0;
             rg_destroy_all();
-            chat_say("Кольцо выключено");
+            chat_say("Зона выключена");
         }
         return;
     }
     if (seq(tok[0], "info") || seq(tok[0], "status")) { rg_info(); return; }
-    if (seq(tok[0], "scan")) { g_rg_scanT = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; if (g_rg_on) rg_tick(); else chat_say("Кольцо выключено. /ring on — включить"); return; }
-    if (seq(tok[0], "any")) { g_rg_any = 1; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Кольцо: центр — ближайший пикап любой модели"); if (g_rg_on) rg_tick(); return; }
-    if (seq(tok[0], "cloth")) { g_rg_any = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Кольцо: центр — только раздевалка (модель «cloth»)"); if (g_rg_on) rg_tick(); return; }
-    if (seq(tok[0], "reset")) { g_rg_rIn = 1.7f; g_rg_rOut = 3.8f; g_rg_dz = 0.0f; g_rg_dirty = 1; chat_say("Кольцо: радиусы 1.7 / 3.8 м, dz 0"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "scan")) { g_rg_scanT = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; if (g_rg_on) rg_tick(); else chat_say("Зона выключена. /ring on — включить"); return; }
+    if (seq(tok[0], "any")) { g_rg_any = 1; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Зона: центр — ближайший пикап любой модели"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "cloth")) { g_rg_any = 0; g_rg_have = 0; g_rg_notFoundSaid = 0; chat_say("Зона: центр — только раздевалка (модель «cloth»)"); if (g_rg_on) rg_tick(); return; }
+    if (seq(tok[0], "see")) {
+        g_rg_see = !g_rg_see;
+        if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; }
+        rg_destroy_all();
+        chat_say(g_rg_see ? "Зона: рисуется поверх всего (видно и сквозь стены)" : "Зона: рисуется на полу (персонажи и стены её перекрывают)");
+        if (g_rg_on) rg_tick();
+        return;
+    }
+    if (seq(tok[0], "reset")) { g_rg_rIn = 1.6f; g_rg_rOut = 3.8f; g_rg_lift = 0.0f; if (g_rg_see) { g_rg_see = 0; if (g_rg_hMat) { RGA.gc_free(g_rg_hMat); g_rg_hMat = 0; } rg_destroy_all(); } g_rg_dirty = 1; chat_say("Зона: 1.6–3.8 м, подъём 0, на полу"); if (g_rg_on) rg_tick(); return; }
     if (seq(tok[0], "r") && n >= 3) {
         float a, c;
-        if (!rg_num(tok[1], &a) || !rg_num(tok[2], &c) || a < 0.5f || c > 8.0f || a >= c) { chat_say("Кольцо: /ring r 1.7 3.8 — внутренний и внешний радиус, м (от 0.5 до 8, внутренний меньше внешнего)"); return; }
-        g_rg_rIn = a; g_rg_rOut = c; g_rg_dirty = 1;
-        chat_say("Кольцо: радиусы изменены"); if (g_rg_on) rg_tick();
+        if (!rg_num(tok[1], &a) || !rg_num(tok[2], &c) || a < 0.5f || c > 8.0f || a >= c) { chat_say("Зона: /ring r 1.6 3.8 — внутренний и внешний радиус, м (от 0.5 до 8, внутренний меньше внешнего)"); return; }
+        g_rg_rIn = a; g_rg_rOut = c; g_rg_dirty = 1; g_rg_zone = -1;
+        chat_say("Зона: радиусы изменены"); if (g_rg_on) rg_tick();
         return;
     }
-    if (seq(tok[0], "dz") && n >= 2) {
+    if ((seq(tok[0], "y") || seq(tok[0], "dz")) && n >= 2) {
         float v;
-        if (!rg_num(tok[1], &v) || v < -3.0f || v > 3.0f) { chat_say("Кольцо: /ring dz 0.5 — на сколько точка пикапа выше центра игрока, м (от −3 до 3)"); return; }
-        g_rg_dz = v; g_rg_dirty = 1; chat_say("Кольцо: вертикальная поправка изменена"); if (g_rg_on) rg_tick();
+        if (!rg_num(tok[1], &v) || v < -2.0f || v > 2.0f) { chat_say("Зона: /ring y 0.05 — поднять зону над полом, м (от −2 до 2)"); return; }
+        g_rg_lift = v; g_rg_dirty = 1; chat_say("Зона: высота изменена"); if (g_rg_on) rg_tick();
         return;
     }
-    chat_say("Кольцо: /ring on|off, /ring info, /ring r 1.7 3.8, /ring dz 0.5, /ring any|cloth, /ring scan, /ring reset");
+    chat_say("Зона: /ring on|off, /ring info, /ring r 1.6 3.8, /ring y 0.05, /ring see, /ring any|cloth, /ring scan, /ring reset");
 }
 
 /* ───────────── самозапуск ───────────── */
