@@ -7,7 +7,7 @@
  *
  * Команда в чате (нативная, как /nocol):
  *   /die            убить своего персонажа (здоровье → 0)
- *   /hp 0..100      выставить здоровье (0 — смерть, как /die); /hp без числа показывает текущее
+ *   /hp 0..100      выставить здоровье (0 — смерть, как /die) и сразу отправить синк-пакет; /hp без числа показывает текущее
  *
  * Как это работает (по dump.cs и разбору libil2cpp.so, RVA из дампа этого APK)
  *   • LocalPlayer.SetHealth(float) (RVA 0x12FC5FC, override Actor.SetHealth) зовёт Actor.SetHealth: тот пишет m_Health (+0x5C)
@@ -17,6 +17,10 @@
  *   • Команда вызывается игрой в главном потоке — отдельно ничего постить не нужно.
  *   • /hp N (1..100) — тот же SetHealth(N), но смерти нет. ВАЖНО: это здоровье на вашей стороне (поле m_Health и полоска в интерфейсе);
  *     сервер хранит своё и может в любой момент прислать своё значение поверх. Смерть (0) сервер видит через RPC, поэтому она настоящая.
+ *   • Синк-пакеты: LocalPlayer.SendOnFootFullSyncData (RVA 0x12FAC6C) кладёт m_Health (+0x5C) и m_Armour (+0x64) в байты Health/Armour
+ *     OnFootSyncData (то же в Drive/Passenger), так что клиент и так сообщает серверу своё здоровье. Но SendSyncData (RVA 0x12F9640)
+ *     шлёт не чаще порога по времени, а стоящему NPC пакеты идут редко — поэтому после /hp N зовём SendSyncData(force = true):
+ *     он сам выберет пеший/водитель/пассажир и отправит пакет немедленно, с уже новым здоровьем.
  *   • Если SetHealth вдруг не нашёлся или бросил исключение — запасной путь: напрямую SendDeathNotification.
  */
 #pragma once
@@ -32,6 +36,16 @@ static int die_set_health(void* lp, float hp) {
     args[0] = &hp;
     A.runtime_invoke(m, lp, args, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("die: SetHealth бросил исключение: ", et); return 0; }
+    return 1;
+}
+/* LocalPlayer.SendSyncData(true): немедленно отправить синк-пакет (пеший / водитель / пассажир — выбирает сама игра). 1 — вызвали без исключения */
+static int die_force_sync(void* lp) {
+    void *m, *exc = NULL, *args[1]; u8 force = 1; char et[240];
+    m = find_method(A.object_get_class(lp), "SendSyncData", 1);
+    if (!m) { dlog("hp: SendSyncData не найден"); return 0; }
+    args[0] = &force;
+    A.runtime_invoke(m, lp, args, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("hp: SendSyncData бросил исключение: ", et); return 0; }
     return 1;
 }
 /* запасной путь: сразу уведомить сервер о смерти (приватный LocalPlayer.SendDeathNotification) */
@@ -66,7 +80,7 @@ static void native_die_cmd(void* self, void* args, void* mi) {
 
 /* Вызывается игрой в главном потоке при вводе /hp [0..100] */
 static void native_hp_cmd(void* self, void* args, void* mi) {
-    void* lp; int okf = 0, diag = 0, n; double hp; char msg[120]; Buf b;
+    void* lp; int okf = 0, diag = 0, n, synced; double hp; char msg[120]; Buf b;
     (void)self; (void)mi;
     ensure_attached();
     lp = local_player();
@@ -86,10 +100,12 @@ static void native_hp_cmd(void* self, void* args, void* mi) {
         chat_say("/hp: не получилось, подробности в konstt.log");
         return;
     }
+    synced = (n > 0) ? die_force_sync(lp) : 0;                /* при 0 пакет о смерти уже ушёл из OnHealthChanged */
     hp = num_field(lp, "m_Health", &okf);
     b_init(&b, msg, sizeof msg);
     b_s(&b, "hp: SetHealth("); b_int(&b, n); b_s(&b, ") вызван");
     if (okf) { b_s(&b, ", m_Health теперь "); b_fix(&b, hp, 1); }
+    if (n > 0) b_s(&b, synced ? ", синк-пакет отправлен" : ", синк-пакет НЕ отправлен");
     dlog(msg);
     b_init(&b, msg, sizeof msg);
     b_s(&b, "/hp: здоровье "); b_int(&b, n);
