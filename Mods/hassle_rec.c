@@ -4,8 +4,16 @@
  *
  * Как это работает
  *   • Реконнект — только нативная чат-команда /rec [секунд 0–600] (HTTP-эндпоинта /rec больше нет), как в оригинальном libHassleExtended:
- *     Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
+ *     Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем ЛОКАЛЬНЫЙ разрыв
+ *     RakNet (CloseConnection + ожидание, пока список соединений опустеет), затем
  *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). Game.Reset() сознательно не вызывается.
+ *     Зачем разрыв (по дизассемблеру libil2cpp.so и libRakNet.so): OnApplicationQuit лишь ОТПРАВЛЯЕТ пакет 21 (ldr State; cmp #2;
+ *     SendPacket(0x15, 1, 2, 0)) и ничего не закрывает у клиента, а Connect.MoveNext игры выбрасывает результат RakNetClient.Connect.
+ *     Пока запись о старом соединении жива (isActive), RakPeer::SendConnectionRequest возвращает 3 (ALREADY_CONNECTED_TO_ENDPOINT) и
+ *     молча ничего не делает: пакета 17 «не удалось подключиться» нет → игра сама не повторяет, клиент висит на «Подключение…», пока
+ *     старое соединение не отвалится по таймауту (ID 22 → игра сама делает Game.Reset()+Connect). Закрыв соединение до DelayedConnect,
+ *     это окно убираем. CloseConnection(notify) переводит запись в DISCONNECT_ASAP; закрывается она, когда уйдут исходящие данные, и
+ *     RakNet кладёт игре ID 21 («Вы были отключены от сервера», без перезахода). Ждём по GetConnectionState (5/6 = записи нет).
  *   • /rec работает и без мода Near: команда сама проверяет готовность IL2CPP (набрать её можно только когда игра уже идёт).
  *   • Нативная чат-команда: мод регистрирует «/rec» прямо в реестре команд игры (WebViewSystem.m_ChatCommandEvents), так что
  *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr
@@ -43,34 +51,101 @@ typedef struct { u8 addr[16]; u16 dport; u16 sidx; } RakSysAddr;                
 typedef struct { RakGuid guid; RakSysAddr addr; } RakAOG;                       /* AddressOrGUID: 40 байт, передаётся по значению */
 typedef int  (*rak_getlist_t)(void* peer, RakSysAddr* out, u16* num);
 typedef void (*rak_close_t)(void* peer, RakAOG target, u8 notify, u8 channel, int prio);
+typedef int  (*rak_state_t)(void* peer, RakAOG target);      /* GetConnectionState: 2 CONNECTED, 3 DISCONNECTING, 5 DISCONNECTED, 6 NOT_CONNECTED */
 
-static void rak_close_all(void* nc) {
-    void *rk, *peer, *h; rak_getlist_t gl = NULL; rak_close_t cl = NULL; const RakGuid* ug = NULL;
-    RakSysAddr list[8]; u16 num = 8; int i, n, closed = 0;
+typedef struct { rak_getlist_t gl; rak_close_t cl; rak_state_t st; const RakGuid* ug; } RakFn;
+
+/* Символы libRakNet.so (только если библиотека уже загружена игрой). 1 — GetConnectionList и CloseConnection найдены. */
+static int rak_resolve(RakFn* f) {
+    void* h = dlopen("libRakNet.so", RTLD_NOW_ | 4);                            /* RTLD_NOLOAD: только если уже загружена */
+    f->gl = NULL; f->cl = NULL; f->st = NULL; f->ug = NULL;
+    if (!h) { dlog("реконнект: libRakNet.so недоступна"); return 0; }
+    *(void**)&f->gl = dlsym(h, "_ZNK6RakNet7RakPeer17GetConnectionListEPNS_13SystemAddressEPt");
+    *(void**)&f->cl = dlsym(h, "_ZN6RakNet7RakPeer15CloseConnectionENS_13AddressOrGUIDEbh14PacketPriority");
+    *(void**)&f->st = dlsym(h, "_ZN6RakNet7RakPeer18GetConnectionStateENS_13AddressOrGUIDE");
+    f->ug = (const RakGuid*)dlsym(h, "_ZN6RakNet22UNASSIGNED_RAKNET_GUIDE");
+    if (!f->gl) { dlog("реконнект: RakPeer::GetConnectionList не найден в libRakNet.so"); return 0; }
+    if (!f->cl) { dlog("реконнект: RakPeer::CloseConnection не найден в libRakNet.so"); return 0; }
+    if (!f->st) dlog("реконнект: RakPeer::GetConnectionState не найден — ждём закрытия вслепую");
+    return 1;
+}
+static void* rak_peer_of(void* nc) {                                            /* Game.Network.m_RakNet._nativeClient */
+    void *rk, *peer;
     rk = ref_field(nc, "m_RakNet");
-    if (!rk) { dlog("реконнект: Game.Network.m_RakNet не найден или пуст"); return; }
+    if (!rk) { dlog("реконнект: Game.Network.m_RakNet не найден или пуст"); return NULL; }
     peer = ref_field(rk, "_nativeClient");
-    if (!peer) { dlog("реконнект: m_RakNet._nativeClient пуст"); return; }
-    h = dlopen("libRakNet.so", RTLD_NOW_ | 4);                                  /* RTLD_NOLOAD: только если уже загружена */
-    if (!h) { dlog("реконнект: libRakNet.so / GetConnectionList недоступны"); return; }
-    *(void**)&gl = dlsym(h, "_ZNK6RakNet7RakPeer17GetConnectionListEPNS_13SystemAddressEPt");
-    *(void**)&cl = dlsym(h, "_ZN6RakNet7RakPeer15CloseConnectionENS_13AddressOrGUIDEbh14PacketPriority");
-    ug = (const RakGuid*)dlsym(h, "_ZN6RakNet22UNASSIGNED_RAKNET_GUIDE");
-    if (!gl) { dlog("реконнект: libRakNet.so / GetConnectionList недоступны"); return; }
-    if (!cl) { dlog("реконнект: RakPeer::CloseConnection не найден в libRakNet.so"); return; }
-    { unsigned k; for (k = 0; k < sizeof list; k++) ((u8*)list)[k] = 0; }
-    gl(peer, list, &num);
-    n = num > 8 ? 8 : (int)num;
+    if (!peer) { dlog("реконнект: m_RakNet._nativeClient пуст"); return NULL; }
+    return peer;
+}
+static void rak_aog(RakAOG* a, const RakFn* f, const RakSysAddr* addr) {        /* AddressOrGUID: guid «не задан», адрес — наш */
+    unsigned k;
+    for (k = 0; k < sizeof *a; k++) ((u8*)a)[k] = 0;
+    if (f->ug) a->guid = *f->ug; else { a->guid.g = ~0ULL; a->guid.si = 0xFFFF; }
+    a->addr = *addr;
+}
+/* ВАЖНО: GetConnectionList отдаёт только соединения в состоянии CONNECTED (в libRakNet: isActive && connectMode == 7). Как только
+   CloseConnection(notify) переводит соединение в DISCONNECT_ASAP, оно пропадает из списка, хотя запись ещё жива (isActive) и
+   RakPeer::Connect по-прежнему вернёт 3 «ALREADY_CONNECTED». Поэтому ждём по GetConnectionState, а не по списку. */
+static int rak_list(void* peer, const RakFn* f, RakSysAddr* out) {              /* число соединений (0–8), адреса — в out[8] */
+    u16 num = 8; unsigned k;
+    for (k = 0; k < 8 * sizeof *out; k++) ((u8*)out)[k] = 0;
+    f->gl(peer, out, &num);
+    return num > 8 ? 8 : (int)num;
+}
+static void rak_close_addr(void* peer, const RakFn* f, const RakSysAddr* addr, int notify) {
+    RakAOG a;
+    rak_aog(&a, f, addr);
+    f->cl(peer, a, (u8)notify, 0, 0);                                           /* канал 0, IMMEDIATE_PRIORITY */
+}
+static int rak_state(void* peer, const RakFn* f, const RakSysAddr* addr) {      /* -1 — GetConnectionState недоступна */
+    RakAOG a;
+    if (!f->st) return -1;
+    rak_aog(&a, f, addr);
+    return f->st(peer, a);
+}
+static int rak_pending(void* peer, const RakFn* f, const RakSysAddr* addrs, int n) {   /* сколько записей ещё не исчезло (не 5/6) */
+    int i, left = 0, s;
+    for (i = 0; i < n; i++) { s = rak_state(peer, f, &addrs[i]); if (s != 5 && s != 6) left++; }
+    return left;
+}
+/* CloseConnection выполняется потоком RakNet: запись исчезает, когда он отправит пакет 21. Ждём в главном потоке короткими шагами
+   (поток RakNet работает независимо). Возвращает, сколько записей осталось. */
+#define REC_CLOSE_WAIT_MS  800
+#define REC_CLOSE_WAIT2_MS 300
+#define REC_CLOSE_BLIND_MS 300                                                  /* если GetConnectionState нет — просто пауза */
+static int rak_wait_closed(void* peer, const RakFn* f, const RakSysAddr* addrs, int n, int max_ms) {
+    int waited = 0, left;
+    if (!f->st) { usleep(REC_CLOSE_BLIND_MS * 1000); return 0; }
+    left = rak_pending(peer, f, addrs, n);
+    while (left > 0 && waited < max_ms) { usleep(10000); waited += 10; left = rak_pending(peer, f, addrs, n); }
+    dlog_i("реконнект: ждали закрытия соединений, мс: ", waited);
+    dlog_i("реконнект: записей RakNet осталось: ", left);
+    return left;
+}
+
+/* Локальный разрыв: CloseConnection с уведомлением (локально игра получит пакет 21 → в чате «Вы были отключены от сервера»; ID 22 с
+   Game.Reset()+Connect игры при этом НЕ приходит) и ожидание, пока запись исчезнет. Если за REC_CLOSE_WAIT_MS она живa (сервер не
+   подтвердил) — закрываем без уведомления, но только записи в состоянии «отключается» (3/4): для CONNECTED тихий CloseConnection
+   сам кладёт игре ID 22. При любой неудаче просто выходим: /rec работает как раньше. */
+static void rak_disconnect(void* nc) {
+    void* peer; RakFn f; RakSysAddr addrs[8]; int n, i, left, s;
+    peer = rak_peer_of(nc);
+    if (!peer || !rak_resolve(&f)) return;
+    n = rak_list(peer, &f, addrs);
     dlog_i("реконнект: активных соединений RakNet: ", n);
-    for (i = 0; i < n; i++) {
-        RakAOG a; unsigned k;
-        for (k = 0; k < sizeof a; k++) ((u8*)&a)[k] = 0;
-        if (ug) a.guid = *ug; else { a.guid.g = ~0ULL; a.guid.si = 0xFFFF; }
-        a.addr = list[i];
-        cl(peer, a, 1, 0, 0);                                                   /* уведомить сервер, канал 0, IMMEDIATE_PRIORITY */
-        closed++;
+    if (n <= 0) return;
+    for (i = 0; i < n; i++) rak_close_addr(peer, &f, &addrs[i], 1);
+    dlog_i("реконнект: закрыто соединений (с уведомлением): ", n);
+    left = rak_wait_closed(peer, &f, addrs, n, REC_CLOSE_WAIT_MS);
+    if (left > 0 && f.st) {
+        int sil = 0;
+        for (i = 0; i < n; i++) {
+            s = rak_state(peer, &f, &addrs[i]);
+            if (s == 3 || s == 4) { rak_close_addr(peer, &f, &addrs[i], 0); sil++; }
+        }
+        dlog_i("реконнект: не закрылись за ожидание, закрыто без уведомления: ", sil);
+        if (sil > 0) rak_wait_closed(peer, &f, addrs, n, REC_CLOSE_WAIT2_MS);
     }
-    dlog_i("реконнект: закрыто соединений: ", closed);
 }
 
 /* ── Камера → «в воздух», как при заходе в игру, БЕЗ загрузки чего-либо ──
@@ -200,11 +275,15 @@ static void do_reconnect(int t, RecRes* r) {
     /* 1) корректный выход с сервера (внутри сам проверяет State == Connected).
        Как в оригинальном libHassleExtended (HassleRec): OnApplicationQuit → DelayedConnect.
        Game.Reset() НЕ вызываем (нагружает, на прошлом клиенте игра вылетала спустя время); кулдауна между /rec нет, как в оригинале;
-       прямой разрыв через RakNet (rak_close_all) из /rec убран; камера (rec_camera_stock) возвращена. */
+       локальный разрыв RakNet (rak_disconnect) возвращён — см. шапку файла: без него Connect мог молча не сработать; камера (rec_camera_stock) возвращена. */
     exc = NULL;
     A.runtime_invoke(mq, nc, NULL, &exc);
     if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
     else r->quit = 1;
+
+    /* 1а) локальный разрыв RakNet: OnApplicationQuit только шлёт пакет 21 и не закрывает соединение у клиента, а игра при Connect
+       не проверяет ответ RakPeerConnect — живая запись о старом соединении делает DelayedConnect молчаливым пустым вызовом. */
+    rak_disconnect(nc);
 
     /* 1б) камера — в стоковое (лёгкие сеттеры, ничего не грузим) */
     rec_camera_stock();
