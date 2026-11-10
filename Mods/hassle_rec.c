@@ -19,6 +19,11 @@
  *     ни rec.js, ни HTTP-порты для /rec не нужны. Делегат клонируется с уже зарегистрированной игрой команды, подменяется method_ptr
  *     (всё это делает ядро: hm_cmd_install). Свой поток-ждун, как у /nocol и /route.
  *   • /rec diag — состояние в чат.
+ *   • /rec off — ТОЛЬКО отключение, без переподключения: тот же OnApplicationQuit + локальный разрыв RakNet + камера в воздух, но
+ *     DelayedConnect не вызывается и таймер под чатом не показывается. Клиент остаётся на экране «Вы были отключены от сервера»,
+ *     игра сама не заходит обратно (приходит ID 21, а не ID 22, см. выше). Вернуться — обычным «/rec 5»: данные подключения
+ *     (Game.Network.m_Host/m_Port/m_Password/m_NickName) никто не трогает, OnApplicationQuit при State != Connected ничего не шлёт.
+ *     Скрипт (HassleB) на строю: автовход не трогает, шлёт «/rec off», по истечении времени шлёт «/rec 5».
  *   • Таймер под чатом: после успешного запуска мод один раз вызывает WebViewSystem.ExecuteJavaScript(string) (static, 1 аргумент —
  *     из метаданных клиента) и внедряет в WebView маленький оверлей. Дальше считает JS сам: «Реконнект через N с» → «Подключение… N с»;
  *     прячется, когда открылось окно Authorization, при новом /rec или через (N + 120) с. Ничего в фоне и ничего в главный поток не постится.
@@ -235,14 +240,36 @@ static void rec_timer_show(int t) {
     dlog_i("реконнект: таймер под чатом запущен, секунд ", t);
 }
 
+/* Есть ли среди аргументов команды слово w (латиница, без учёта регистра). Своя маленькая копия разбора: ядро знает только «diag»,
+   а менять ядро ради одного слова нельзя — его используют остальные моды. */
+static int rec_has_word(void* arr, const char* w) {
+    long len; int i; char* data;
+    if (!arr) return 0;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 16) return 0;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)(data + (uptr)i * sizeof(void*));
+        char tmp[64]; int n, k; const u16* ch;
+        if (!s) continue;
+        n = A.string_length(s); ch = A.string_chars(s);
+        if (n <= 0 || n > 40 || !ch) continue;
+        utf16_to_utf8(ch, n, tmp, sizeof tmp);
+        for (k = 0; tmp[k]; k++) if (tmp[k] >= 'A' && tmp[k] <= 'Z') tmp[k] = (char)(tmp[k] + 32);
+        if (seq(tmp, w)) return 1;
+    }
+    return 0;
+}
+
 /* Общая часть: и для HTTP /rec, и для нативной чат-команды. IL2CPP при необходимости поднимается ЛЕНИВО — набрать /rec можно только
    тогда, когда игра уже идёт, поэтому ждать сборщика (бывшие 60 секунд) не нужно. */
-static void do_reconnect(int t, RecRes* r) {
+static void rec_run(int t, int only_off, RecRes* r) {
     int state = -1, port = 0, ok = 0;
     void *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL, *host, *pw, *nick;
     unsigned short port16; float tf; char et[256];
 
     r->ok = 0; r->state = -1; r->port = 0; r->quit = 0; r->why[0] = 0; r->exc[0] = 0;
+    if (only_off) t = 0;                                /* /rec off: задержки нет — подключения не будет */
     if (t < REC_MIN_S) t = REC_MIN_S;                   /* диапазон 0–600 */
     if (t > REC_MAX_S) t = REC_MAX_S;
     r->t = t;
@@ -263,11 +290,12 @@ static void do_reconnect(int t, RecRes* r) {
     pw = ref_field(nc, "m_Password");
     nick = ref_field(nc, "m_NickName");
     port = (int)num_field(nc, "m_Port", &ok);
-    if (!host || !nick) { rec_set(r, "нет данных подключения (m_Host/m_NickName пусты)"); return; }
     mq = find_method(nk, "OnApplicationQuit", 0);
-    md = find_method(nk, "DelayedConnect", 5);
-    if (!mq || !md) { rec_set(r, !md ? "метод DelayedConnect не найден" : "метод OnApplicationQuit не найден"); return; }
+    md = only_off ? NULL : find_method(nk, "DelayedConnect", 5);
+    if (!only_off && (!host || !nick)) { rec_set(r, "нет данных подключения (m_Host/m_NickName пусты)"); return; }
+    if (!mq || (!only_off && !md)) { rec_set(r, !mq ? "метод OnApplicationQuit не найден" : "метод DelayedConnect не найден"); return; }
 
+    dlog(only_off ? "реконнект: /rec off — только отключение" : "реконнект: обычный /rec");
     dlog_i("реконнект: старт, секунд ", t);
     dlog_i("реконнект: State ", state);
     dlog_i("реконнект: порт ", port);
@@ -287,6 +315,13 @@ static void do_reconnect(int t, RecRes* r) {
 
     /* 1б) камера — в стоковое (лёгкие сеттеры, ничего не грузим) */
     rec_camera_stock();
+
+    /* /rec off: на этом всё — DelayedConnect не зовём, таймер не показываем. Вернуться потом можно обычным /rec N. */
+    if (only_off) {
+        r->ok = 1; r->state = state; r->port = port;
+        dlog("реконнект: /rec off выполнен (отключены, камера в воздухе, переподключение не запланировано)");
+        return;
+    }
 
     /* 2) подключение через N секунд (внутри UniTask.Delay(N), затем NetworkClient.Connect) */
     port16 = (unsigned short)port; tf = (float)t;
@@ -314,12 +349,16 @@ static void do_reconnect(int t, RecRes* r) {
     rec_timer_show(t);                                  /* таймер под чатом (только при успехе — при ошибке в чате и так причина) */
 }
 
+static void do_reconnect(int t, RecRes* r) { rec_run(t, 0, r); }
+static void do_disconnect(RecRes* r) { rec_run(0, 1, r); }
+
 static int g_recReg;                             /* 1 — /rec зарегистрирована, -1 — нет */
 /* Вызывается игрой в главном потоке: (this-цель делегата, string[] args, MethodInfo*) */
 static void native_rec_cmd(void* self, void* args, void* mi) {
-    RecRes r; int diag = 0, t; Buf b; char msg[300];
+    RecRes r; int diag = 0, t, off; Buf b; char msg[300];
     (void)self; (void)mi;
     t = parse_cmd_args(args, &diag);
+    off = rec_has_word(args, "off");
     dlog_i("нативная /rec: вызвана, секунд ", t);
     b_init(&b, msg, sizeof msg);
     if (diag) {
@@ -328,9 +367,16 @@ static void native_rec_cmd(void* self, void* args, void* mi) {
         chat_say(msg);
         return;
     }
+    if (off) {                                          /* /rec off — только отключиться, без возврата */
+        do_disconnect(&r);
+        if (r.ok) return;
+        b_s(&b, "Отключение: "); b_s(&b, r.why);
+        chat_say(msg);
+        return;
+    }
     if (t < 0) t = 5;                                   /* без аргумента — 5 секунд */
     if (t < REC_MIN_S || t > REC_MAX_S) {               /* допустимо 0–600 */
-        chat_usage("Используйте: /rec [секунды (0-600]");
+        chat_usage("Используйте: /rec [секунды 0-600] или /rec off (только отключиться)");
         return;
     }
     do_reconnect(t, &r);
