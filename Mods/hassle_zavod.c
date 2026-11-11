@@ -37,7 +37,7 @@
  *
  * Меню внедряется JS через WebViewSystem.ExecuteJavaScript (APK пересобирать не нужно). Нажатия меню уходят как «/zavod q …» через window.sendChatInput (q — «тихо»),
  *   состояние мод присылает обратно тем же ExecuteJavaScript. Если страница перезагрузилась (реконнект) — введите /zavod ещё раз. Текст меню — между метками
- *   ZV_MENU_BEGIN/END; править tools/zavod_menu.js и запускать tools/embed_zavod_menu.py.
+ *   ZV_MENU_BEGIN/END; править tools/zavod_menu.js и запускать tools/embed_zavod_menu.py. (v2: хук чата через Hud.$refs.chat.add; фигурка «в руках» только по ответу сервера.)
  *
  * НЕ ПРОВЕРЕНО НА УСТРОЙСТВЕ (собрано и проверено компилятором). Если что-то не так — смотрите HLOG/konstt.log (строки «zavod:») и пришлите.
  */
@@ -394,8 +394,8 @@ static const char g_zv_menu_js[] =
 "function ev(n,a){try{if(typeof sendClientEvent==='function'&&typeof gm!=='undefined'){sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,n,a);return 1;}}catch(e){}   /* та же форма вызова, что у Interactions.onClick в игре */\n"
 " try{window.sendClientEventHandle(0,n,a);return 1;}catch(e){}try{window.sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,{ignoreChat:true},n,a);return 1;}catch(e){}return 0;}\n"
 "function turnerEnd(){   /* как в Code2.js: Turner_OnPlayerEnd сразу, не дожидаясь, пока заполнятся прямоугольники */\n"
-" try{if(typeof sendClientEvent==='function'&&typeof gm!=='undefined'){sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,'Turner_OnPlayerEnd');N.turn++;turnAt=Date.now();hasFig=1;actLast=turnAt+400;jl('FIG Turner закрыт — несу на склад');return 1;}}catch(e){}\n"
-" if(ev('Turner_OnPlayerEnd',0)){N.turn++;turnAt=Date.now();hasFig=1;actLast=turnAt+400;jl('FIG Turner закрыт — несу на склад');return 1;}return 0;}\n"
+" try{if(typeof sendClientEvent==='function'&&typeof gm!=='undefined'){sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,'Turner_OnPlayerEnd');N.turn++;turnAt=Date.now();actLast=turnAt+400;jl('FIG Turner закрыт — жду ответ сервера');return 1;}}catch(e){}\n"
+" if(ev('Turner_OnPlayerEnd',0)){N.turn++;turnAt=Date.now();actLast=turnAt+400;jl('FIG Turner закрыт — жду ответ сервера');return 1;}return 0;}\n"
 "function turnerOpen(){try{return !!(window.getInterfaceStatus&&window.getInterfaceStatus('Turner'));}catch(e){return false;}}\n"
 "/* ───── журнал интерфейсов → HLOG/zvui.txt (через мод /jlog) ─────\n"
 "   Пишет: открытие/закрытие каждого интерфейса (имя + кусок текста), вызовы openInterface/closeInterface с параметрами, появление/пропажу плашки «Направляйтесь к станку» (с цепочкой классов и именами интерфейсов-владельцев). */\n"
@@ -488,7 +488,7 @@ static const char g_zv_menu_js[] =
 "xb.addEventListener('click',function(){setOpen(false);});\n"
 "fr.addEventListener('click',function(){fast=!fast;render();});\n"
 "lr.addEventListener('click',function(){LOGI=!LOGI;if(LOGI){knownUi=null;jl('--- лог включён ---');}render();});\n"
-"setInterval(function(){try{if(LOGI)uiPoll();hintPoll(Date.now());}catch(e){}},400);\n"
+"setInterval(function(){try{if(LOGI)uiPoll();hintPoll(Date.now());hookChat();}catch(e){}},400);\n"
 "jl('--- zavod: лог интерфейсов запущен ---');\n"
 "mb.addEventListener('click',function(){cmd('mode '+(S.mo?0:1));});\n"
 "rs.addEventListener('click',function(){N={ok:0,bad:0,skip:0,turn:0};render();});\n"
@@ -548,7 +548,7 @@ static const char g_zv_menu_js[] =
 " if(S.mo===1&&++skipRun>=3){skipRun=0;hasFig=1;jl('FIG станки не принимают 3 раза — возможно, фигурка в руках');}}\n"
 "function doMake(now){\n"
 " why='делаем';\n"
-" if(turnAt&&turnAt>makeAt&&now-turnAt>900){go('put');return;}     /* Turner закрыт, ответа в чате не было — считаем, что фигурка есть */\n"
+" if(turnAt&&turnAt>makeAt&&now-turnAt>1200){hasFig=1;jl('FIG ответа чата нет — пробую сдать один раз');go('put');return;}     /* Turner закрыт, ответа в чате не было — считаем, что фигурка есть */\n"
 " if(S.mo===0&&S.nb===1&&now-makeAt>1500){go('put');return;}        /* таймерный завод: станок снова «свободен» — продукт готов */\n"
 " if(now-makeAt>(S.mo===0?MAKE_MAX:MAKE_FAST)){N.bad++;why='долго нет результата';go('take');}}\n"
 "function doPut(now){\n"
@@ -568,7 +568,7 @@ static const char g_zv_menu_js[] =
 " if(!tpAt){var p=S.pt;if(p)tp(p);else if(S.k)tpGps();else{why='нет точки «сдать»: встаньте и /zavod bind put';return;}\n"
 "  why='сдаём'+(tries?' (повтор '+tries+')':'');tpAt=now;actLast=now+SETTLE;tries++;return;}\n"
 " if(now-tpAt<SETTLE+MENU_WAIT)return;\n"
-" if(hasFig&&tries<5){why='сдача не подтверждена сервером — повтор '+tries;jl('PUT нет ответа, повтор '+tries+' меню='+lastMenu);rt=1;tpAt=0;return;}   /* с фигуркой в руках за бревном не идём */\n"
+" if(hasFig&&tries<2){why='сдача не подтверждена сервером — повтор '+tries;jl('PUT нет ответа, повтор '+tries+' меню='+lastMenu);rt=1;tpAt=0;return;}   /* с фигуркой в руках за бревном не идём */\n"
 " hasFig=0;putAt=now;go('take');}                                   /* 5 повторов без ответа или «Отнесите…» в чате не видели: старое поведение */\n"
 "function tick(){try{\n"
 " var now=Date.now();\n"
@@ -621,9 +621,16 @@ static const char g_zv_menu_js[] =
 " w.__zv=1;window.openInterface=w;})();\n"
 "(function(){var cf=window.closeInterface;if(typeof cf!=='function'||cf.__zv)return;var w=function(n){try{if(LOGI)jl('closeInterface '+n);}catch(e){}return cf.apply(this,arguments);};w.__zv=1;window.closeInterface=w;})();\n"
 "/* сообщения сервера в чате — быстрые подсказки для цикла (если чат так не вызывается, цикл работает по таймерам) */\n"
+"var CHATRX=/станк|бревн|металл|продукт|фигур|склад|завод|взя[лт]|положи|Turner|Срок|вознагражд|сначала/i;\n"
+"function hookChat(){try{var h=typeof window.interface==='function'?window.interface('Hud'):null;var c=h&&h.$refs&&h.$refs.chat;   /* игра шлёт чат через interface('Hud').$refs['chat'].add(текст, цвет), а не через window.onChatMessage */\n"
+" if(!c||typeof c.add!=='function'||c.add.__zv)return;var f=c.add;\n"
+" var w=function(m){try{var q=String(m).replace(/[{][0-9a-fA-F]{6}[}]/g,'');if(LOGI&&CHATRX.test(q))jl('chat '+q.slice(0,100));chatEv(q);}catch(e){}return f.apply(this,arguments);};\n"
+" w.__zv=1;c.add=w;jl('chat hook ok');}catch(e){}}\n"
 "function chatEv(t){\n"
 " if(!cyc)return;\n"
 " if(t.indexOf('Отнесите сделанную фигурку')>=0||t.indexOf('Вы уже сделали фигурку')>=0){hasFig=1;jl('FIG есть');if(ph!=='put')go('put');}\n"
+" else if(t.indexOf('сначала сделать её')>=0||t.indexOf('Вы не сделали фигурку')>=0){hasFig=0;jl('FIG сервер: фигурки нет');if(ph==='put'||ph==='make')go('take');}\n"
+" else if(ph==='put'&&(t.indexOf('За выполненную фигурку')>=0||t.indexOf('Срок заключения')>=0)){hasFig=0;jl('FIG сдана (по награде)');countOk();go('take');}\n"
 " else if(t.indexOf('сломалась фигурка')>=0){N.bad++;hasFig=0;go('take');}\n"
 " else if(t.indexOf('Вы взяли бревно')>=0||t.indexOf('уже есть в руках бревно')>=0){hasFig=0;if(ph==='take')go('mach');}\n"
 " else if(t.indexOf('Станок занят')>=0){if(cur>=0)bad[cur]=1;N.skip++;if(ph==='mach'||ph==='make'){ph='mach';tpAt=0;}}\n"
