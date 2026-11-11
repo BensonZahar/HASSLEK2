@@ -384,6 +384,7 @@ static void zv_resolve(void) {
    Подпись = Hassle.Global.Pooling.CreateText3DParams: ID, Color, Position, Distance (радиус показа), TestLOS, PlayerID / VehicleID (к кому прикреплена), Text.
    Пишем только НОВЫЕ («+») и ИЗМЕНИВШИЕСЯ («~», текст или место при том же ID) подписи; /zavod labels dump — разово всё, что сейчас в стриме («=»).
    Координаты в логе — SAMP (x y z): Unity (x, y, z) → SAMP (x, z, y). Сервер стримит подписи только рядом — чтобы собрать всё, пройдитесь по карте с включённым логом. */
+static void zv_ui_inject(void);          /* определена ниже, в разделе меню */
 #define ZV_LG_LINES 6000                /* потолок записей за сессию (чтобы не раздуть konstt.log); /zavod labels clear — сбросить */
 #define ZV_LG_PERSCAN 80                /* не больше записей за один проход (подписи с бегущими таймерами) */
 static unsigned g_zv_lgH[65536];        /* ID подписи → хэш последней записанной версии (0 — не видели) */
