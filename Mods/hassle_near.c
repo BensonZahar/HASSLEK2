@@ -11,6 +11,8 @@
  *     http://127.0.0.1:17771/near  и получает JSON. Ничего из IL2CPP на главный поток не навешивается — игру это не трогает.
  *   • Оба потока ждут ядро (hm_wait_started) и, пока игра грузится, отдают в JSON её стадию; опрос игроков начинается, когда ядро
  *     выставило g_ready. Пул игроков (static-поле с PlayerPool) ищет ядро, здесь он только читается.
+ *   • /nwatch — постоянное слежение за игроками по ID/нику (зона стрима + весь пул + PlayerPool.Get), события в чат, в HLOG/near_watch.log и в
+ *     HTTP GET /watch (см. блок «/nwatch» ниже). Работает само в потоке-сборщике, HUD для этого не нужен.
  *   • Команда /nearlog [N] пишет N снимков в HLOG/near_snap.log (см. ниже), /nearlog diag — стадия и порт HTTP-сервера в чат.
  */
 #pragma once
@@ -204,12 +206,599 @@ static void on_player(void* item, void* ctx) {
     g_np++;
 }
 
+/* ───────────── /nwatch — постоянное слежение за игроками («всегда следит, пишет, когда появился») ─────────────
+   Цели: до NW_MAX игроков по ID или по нику (часть ника тоже годится, «_» и пробел одно и то же, регистр не важен), плюс режим «any» —
+   сообщать о ЛЮБОМ новом игроке в зоне. Слежение идёт в потоке-сборщике каждые 300 мс само по себе: HUD/Near.js для этого не нужны.
+   Список целей хранится в HLOG/near_watch.txt и поднимается при следующем запуске игры — после реконнекта или рестарта сервера слежение продолжается.
+
+   Как ищем игрока (все способы по очереди, первый нашедший побеждает; в событиях и в /watch это поле how):
+     1 — PlayersInStream по ID           (игрок в зоне стрима, позиция из пакета синхронизации, свежая)
+     2 — PlayersInStream по нику         (подпись над головой «Ник_Фамилия (ID)»)
+     3 — PlayerPool.m_Items по ID        (все игроки, которых клиент знает: онлайн, но вне зоны стрима; позиция — последняя известная)
+     4 — PlayerPool.m_Items по нику
+     5 — PlayerPool.Get(id) напрямую     (запасной путь, если словарь не нашёл)
+   Слежка по ID запоминает ник и дальше следует за НИКОМ: если игрок перезашёл и получил другой ID, цель перепривязывается сама.
+   Состояния: 1 в зоне, 2 онлайн но вне зоны, 3 нет в пуле (вышел/реконнект), 0 пока не определено.
+   Куда идут события: чат игры, HLOG/near_watch.log, HTTP GET /watch[?since=N] (для скриптов-NPC и Telegram; seq растёт, ничего не теряется). */
+#define NW_MAX 8
+#define NW_EVN 48
+#define NW_MISS 8                      /* тиков подряд «не вижу в зоне» (~2,4 с), прежде чем считать, что вышел из зоны */
+#define NW_MISS_POOL 4                 /* то же для «пропал из пула» */
+#define NW_POOLMAX 512
+#define NW_Q 24
+#define NW_LOGMAX 1500000
+static volatile unsigned g_ticks;                      /* номер тика сборщика (его читают /nwatch и JSON) */
+typedef struct {
+    int used, id, st, how, cid, hasPos, veh, miss, idTaken;
+    char q[40], qn[40], nick[64];
+    float x, y, z, d, d2; double hp;
+    long tSince, tSeen;
+} NwT;
+typedef struct { long seq, ms; int tgt, id; char kind[14], nick[64]; float d; char msg[220]; } NwEv;
+typedef struct { int ok, score, id, hasPos, veh, how; char nick[64]; float x, y, z; double hp; } NwC;
+typedef struct { int id, hasPos, veh, inStream; char nick[64]; float x, y, z; double hp; } NwP;
+static NwT g_nw[NW_MAX];
+static NwEv g_nwEv[NW_EVN];
+static long g_nwSeq;
+static NwP g_nwP[NW_POOLMAX];
+static int g_nwNP, g_nwPoolTotal = -2, g_nwPoolNicks;
+static volatile int g_nwLock, g_nwAny, g_nwChat = 1, g_nwLoaded;
+static char g_nwq[NW_Q][220];
+static volatile unsigned g_nwqH, g_nwqT;
+static volatile int g_nwPostPend; static long g_nwPostT;
+static long g_nwLogBytes;
+static char g_nwTj[2][9216]; static volatile int g_nwTjCur;
+static int g_nwGetFail, g_nwCtxTries, g_nwNoCtxLogged;
+#ifdef KONSTT_TEST
+static int g_nwTestTotal = -1;
+#endif
+static int g_nwAnyId[MAXP], g_nwAnyMiss[MAXP]; static char g_nwAnyNick[MAXP][40]; static int g_nwAnyN, g_nwAnySeeded;
+static long g_nwWinT; static int g_nwWinN, g_nwWinSkip;
+
+static void nw_lock(void) { while (__sync_lock_test_and_set(&g_nwLock, 1)) usleep(100); }
+static void nw_unlock(void) { __sync_lock_release(&g_nwLock); }
+
+static void nw_norm(const char* s, char* o, int cap) {      /* нижний регистр (латиница и кириллица), «_» → пробел */
+    int n = 0;
+    for (; s && *s && n + 2 < cap; s++) {
+        u8 c = (u8)*s;
+        if (c >= 'A' && c <= 'Z') c = (u8)(c + 32);
+        else if (c == '_') c = ' ';
+        else if (c == 0xD0 && (u8)s[1] >= 0x90 && (u8)s[1] <= 0xAF) {
+            u8 d = (u8)s[1];
+            if (d <= 0x9F) { o[n++] = (char)0xD0; o[n++] = (char)(d + 0x20); }
+            else { o[n++] = (char)0xD1; o[n++] = (char)(d - 0x20); }
+            s++; continue;
+        }
+        o[n++] = (char)c;
+    }
+    o[n] = 0;
+}
+static int nw_has(const char* hay, const char* nd) {
+    int i, L = (int)slen(nd);
+    if (!L) return 0;
+    for (i = 0; hay[i]; i++) { int k = 0; while (k < L && hay[i + k] == nd[k]) k++; if (k == L) return 1; }
+    return 0;
+}
+static int nw_isnum(const char* s) { int i = 0; if (!s[0]) return 0; for (; s[i]; i++) if (s[i] < '0' || s[i] > '9') return 0; return i <= 5; }
+static int nw_atoi(const char* s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
+static void nw_cpy(char* d, const char* s, int cap) { int i = 0; for (; s && s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0; }
+
+/* путь соседнего файла в HLOG (как у near_snap.log) */
+static int nw_path(const char* name, char* out, int cap) {
+    unsigned L = slen(g_flog), i; Buf b;
+    if (!g_flog[0] || !ends_with(g_flog, HM_LOGNAME)) return 0;
+    b_init(&b, out, cap);
+    for (i = 0; i + HM_LOGNAME_LEN < L && b.n + 1 < b.cap; i++) b_ch(&b, g_flog[i]);
+    b_s(&b, name);
+    return 1;
+}
+static void nw_save(void) {                                   /* список целей → HLOG/near_watch.txt */
+    char path[320], t[900]; Buf b; int i;
+    if (!nw_path("near_watch.txt", path, sizeof path)) return;
+    b_init(&b, t, sizeof t);
+    nw_lock();
+    for (i = 0; i < NW_MAX; i++) if (g_nw[i].used) { b_s(&b, g_nw[i].id >= 0 ? "id " : "nick "); if (g_nw[i].id >= 0) b_int(&b, g_nw[i].id); else b_s(&b, g_nw[i].q); b_ch(&b, '\n'); }
+    if (g_nwAny) b_s(&b, "any 1\n");
+    if (!g_nwChat) b_s(&b, "chat 0\n");
+    nw_unlock();
+    flog_write(path, b.p, b.n, 1);
+}
+static int nw_add_locked(const char* tok) {                   /* 1 — добавлена, 0 — уже есть, -1 — места нет */
+    int i, id = -1; char qn[40];
+    if (nw_isnum(tok)) id = nw_atoi(tok); else nw_norm(tok, qn, sizeof qn);
+    for (i = 0; i < NW_MAX; i++) if (g_nw[i].used && ((id >= 0 && g_nw[i].id == id) || (id < 0 && g_nw[i].id < 0 && seq(g_nw[i].qn, qn)))) return 0;
+    for (i = 0; i < NW_MAX; i++) if (!g_nw[i].used) {
+        NwT* t = &g_nw[i];
+        { char* z = (char*)t; unsigned k; for (k = 0; k < sizeof *t; k++) z[k] = 0; }
+        t->used = 1; t->id = id; t->cid = -1; nw_cpy(t->q, tok, sizeof t->q);
+        if (id < 0) nw_cpy(t->qn, qn, sizeof t->qn);
+        return 1;
+    }
+    return -1;
+}
+static void nw_load(void) {                                   /* один раз, когда путь журнала уже известен */
+    char path[320], t[900]; int fd, p = 0; long n;
+    if (g_nwLoaded) return;
+    if (!nw_path("near_watch.txt", path, sizeof path)) return;
+    g_nwLoaded = 1;
+    fd = open(path, 0);
+    if (fd < 0) return;
+    n = read(fd, t, sizeof t - 1); close(fd);
+    if (n <= 0) return;
+    t[n] = 0;
+    nw_lock();
+    while (t[p]) {
+        char line[64]; int q = 0;
+        while (t[p] && t[p] != '\n' && t[p] != '\r') { if (q < 63) line[q++] = t[p]; p++; }
+        while (t[p] == '\n' || t[p] == '\r') p++;
+        line[q] = 0;
+        if (sprefix(line, "id ")) nw_add_locked(line + 3);
+        else if (sprefix(line, "nick ")) nw_add_locked(line + 5);
+        else if (seq(line, "any 1")) g_nwAny = 1;
+        else if (seq(line, "chat 0")) g_nwChat = 0;
+    }
+    nw_unlock();
+    dlog("nwatch: список слежения восстановлен из HLOG/near_watch.txt");
+}
+
+/* ── событие (вызывать ТОЛЬКО под nw_lock) ── */
+static void nw_ev(int tgt, int id, const char* kind, const char* nick, float d, const char* msg, int chat) {
+    NwEv* e = &g_nwEv[g_nwSeq % NW_EVN]; char path[320], line[300]; Buf b;
+    e->seq = ++g_nwSeq; e->ms = mono_ms(); e->tgt = tgt; e->id = id; e->d = d;
+    nw_cpy(e->kind, kind, sizeof e->kind); nw_cpy(e->nick, nick, sizeof e->nick); nw_cpy(e->msg, msg, sizeof e->msg);
+    if (g_nwLogBytes < NW_LOGMAX && nw_path("near_watch.log", path, sizeof path)) {
+        b_init(&b, line, sizeof line);
+        b_ch(&b, '+'); b_int(&b, time(NULL) - g_flogT0); b_s(&b, "с #"); b_int(&b, e->seq); b_ch(&b, ' '); b_s(&b, msg); b_ch(&b, '\n');
+        if (flog_write(path, b.p, b.n, 0)) g_nwLogBytes += b.n;
+    }
+    if (tgt >= 0) dlog2("nwatch: ", msg);                      /* в konstt.log (лимит 4000 строк) — только события целей, «any» — лишь в near_watch.log */
+    if (chat && g_nwChat) {
+        if (g_nwqH - g_nwqT >= NW_Q) g_nwqT++;                  /* очередь полна — теряем самое старое */
+        nw_cpy(g_nwq[g_nwqH % NW_Q], msg, sizeof g_nwq[0]);
+        g_nwqH++;
+    }
+}
+
+/* ── главный поток: канал для сообщений в чат ── */
+static void native_nwatch_cmd(void* self, void* args, void* mi);
+static int nw_grab_ctx(void) {                                 /* как mem_grab_ctx: UnitySynchronizationContext главного потока без команды */
+    void *img, **th, *kcb, *pm; uptr n = 0, i; void** (*threads_all)(uptr*);
+    if (g_mt_ctx && g_mt_postM && g_mt_kCb) return 1;
+    if (g_nwCtxTries >= 60 || !g_ready || g_tplState != 1 || !g_tplDelegate || !g_il2cpp) return 0;
+    { static long last; long now = mono_ms(); if (now - last < 3000) return 0; last = now; }
+    g_nwCtxTries++;
+    *(void**)&threads_all = dlsym(g_il2cpp, "il2cpp_thread_get_all_attached_threads");
+    if (!threads_all) { g_nwCtxTries = 99; dlog("nwatch: нет il2cpp_thread_get_all_attached_threads — в чат пишет только команда /nwatch"); return 0; }
+    ensure_attached();
+    th = threads_all(&n);
+    if (!th || n == 0 || n > 4096) return 0;
+    for (i = 0; i < n; i++) {
+        void *t = th[i], *ec, *sc;
+        if (!t || !hm_obj_ok(t)) continue;
+        ec = ref_field_s(t, "m_ExecutionContext"); if (!ec) continue;
+        sc = ref_field_s(ec, "_syncContext"); if (!sc) sc = ref_field_s(ec, "_syncContextNoFlow");
+        if (!sc || !hm_obj_ok(sc) || !seq(A.class_get_name(A.object_get_class(sc)), "UnitySynchronizationContext")) continue;
+        pm = find_method(A.object_get_class(sc), "Post", 2);
+        if (!pm) return 0;
+        img = find_image_pre("mscorlib");
+        kcb = img ? A.class_from_name(img, "System.Threading", "SendOrPostCallback") : NULL;
+        g_mt_kCb = (kcb && A.class_instance_size && A.class_instance_size(kcb) == g_cmdSize) ? kcb : g_cmdKls;
+        g_mt_postM = pm; g_mt_ctx = sc;
+        dlog("nwatch: главный поток найден сам, сообщения в чат пойдут без команды");
+        return 1;
+    }
+    return 0;
+}
+static void nw_flush_chat(void) {                              /* в ГЛАВНОМ потоке */
+    while (g_nwqT != g_nwqH) { char m[220]; nw_cpy(m, g_nwq[g_nwqT % NW_Q], sizeof m); g_nwqT++; chat_say(m); }
+    g_nwPostPend = 0;
+}
+static void nw_pump(void) {                                    /* из сборщика: если в очереди есть сообщения — просим главный поток вывести */
+    void *cb, *st, *a[2], *exc = NULL; char et[200]; long now;
+    if (g_nwqT == g_nwqH) return;
+    now = mono_ms();
+    if (g_nwPostPend && now - g_nwPostT < 3000) return;
+    if (!nw_grab_ctx()) {
+        if (!g_nwNoCtxLogged && g_nwCtxTries >= 5) { g_nwNoCtxLogged = 1; dlog("nwatch: канала в главный поток нет — события только в near_watch.log и /watch, пока не введёте любую команду /nwatch"); }
+        return;
+    }
+    ensure_attached();
+    cb = clone_cmd_delegate(g_mt_kCb, g_cmdSize, g_cmdOffMp, g_cmdOffIi, (uptr)native_nwatch_cmd);
+    st = A.string_new("nw-flush");
+    if (!cb || !st) return;
+    g_nwPostPend = 1; g_nwPostT = now;
+    a[0] = cb; a[1] = st;
+    A.runtime_invoke(g_mt_postM, g_mt_ctx, a, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("nwatch: Post бросил: ", et); g_nwPostPend = 0; }
+}
+
+/* ── чтение игроков из пула ── */
+static void nw_fill_p(void* it, NwP* q) {
+    float pos[3]; int ok, has = 0, got; PInfo pi;
+    q->id = int_field(it, "m_ID", NULL, NULL, -1);
+    read_label(it, &pi);
+    if (q->id < 0 && pi.labelId >= 0) q->id = pi.labelId;
+    nw_cpy(q->nick, pi.nick, sizeof q->nick);
+    q->hasPos = read_pos_k(it, pos, NULL);
+    got = bool_field(it, "m_IsPositionReceived", &has);
+    if (q->hasPos && has && !got && pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) q->hasPos = 0;
+    q->x = q->hasPos ? pos[0] : 0; q->y = q->hasPos ? pos[1] : 0; q->z = q->hasPos ? pos[2] : 0;
+    q->hp = num_field(it, "m_Health", &ok);
+    q->veh = ref_field(it, "Vehicle") ? 1 : 0;
+    q->inStream = 0;
+}
+static void nw_pool_cb(void* it, void* ctx) {
+    (void)ctx;
+    if (g_nwNP >= NW_POOLMAX || !it || it == g_local || !hm_obj_ok(it)) return;
+    nw_fill_p(it, &g_nwP[g_nwNP]);
+    if (g_nwP[g_nwNP].nick[0]) g_nwPoolNicks++;
+    g_nwNP++;
+}
+static int nw_scan_pool(void* pool) {                          /* все игроки пула (не только зона стрима); -1 — словарь не прочитался */
+    void *dict, *arr; int total, i, k;
+    g_nwNP = 0; g_nwPoolNicks = 0;
+    dict = ref_field_s(pool, "m_Items");
+    arr = dict ? ref_field_s(dict, "_entries") : NULL;
+    if (!arr) return -1;
+    total = int_field(dict, "_count", "count", NULL, -1);
+    walk_struct_array(arr, total, "value", nw_pool_cb, NULL);
+    for (i = 0; i < g_nwNP; i++) for (k = 0; k < g_np; k++) if (g_pl[k].id == g_nwP[i].id) { g_nwP[i].inStream = 1; break; }
+    return total;
+}
+static int nw_get_direct(void* pool, int id, NwP* q) {         /* PlayerPool.Get(id) */
+    void *m, *args[1], *exc = NULL, *r; int v = id;
+#ifdef KONSTT_TEST
+    (void)pool; (void)q; (void)v; (void)m; (void)args; (void)exc; (void)r; return 0;
+#else
+    if (g_nwGetFail >= 3) return 0;
+    m = find_method(A.object_get_class(pool), "Get", 1);
+    if (!m) { g_nwGetFail = 99; return 0; }
+    args[0] = &v;
+    r = A.runtime_invoke(m, pool, args, &exc);
+    if (exc) { g_nwGetFail++; return 0; }
+    if (!r || !hm_obj_ok(r) || r == g_local) return 0;
+    nw_fill_p(r, q);
+    if (q->id < 0) q->id = id;
+    return 1;
+#endif
+}
+
+/* ── сопоставление цели и игрока: 0 нет, 1 частично, 2 точно, -1 это тот же ID, но другой игрок ── */
+static int nw_match(const NwT* t, int pid, const char* nick) {
+    char a[64], n[64];
+    if (nick[0]) nw_norm(nick, n, sizeof n); else n[0] = 0;
+    if (t->id >= 0) {
+        if (t->nick[0] && n[0]) {
+            nw_norm(t->nick, a, sizeof a);
+            if (seq(a, n)) return 2;                           /* тот же ник — следуем и при смене ID */
+            return pid == t->id ? -1 : 0;
+        }
+        return pid == t->id ? 2 : 0;
+    }
+    if (!n[0]) return 0;
+    if (seq(n, t->qn)) return 2;
+    if (slen(t->qn) >= 3 && nw_has(n, t->qn)) return 1;
+    return 0;
+}
+static void nw_consider(NwT* t, int pid, const char* nick, int hasPos, float x, float y, float z, int veh, double hp, int how, NwC* best) {
+    int sc = nw_match(t, pid, nick);
+    if (sc < 0) { t->idTaken = 1; return; }
+    if (sc == 0) return;
+    if (best->ok && (sc < best->score || (sc == best->score && !(pid == t->cid && best->id != t->cid)))) return;
+    best->ok = 1; best->score = sc; best->id = pid; best->hasPos = hasPos; best->x = x; best->y = y; best->z = z; best->veh = veh; best->hp = hp; best->how = how;
+    nw_cpy(best->nick, nick, sizeof best->nick);
+}
+static void nw_distfmt(Buf* b, const NwT* t, int havePos) {
+    if (t->hasPos && havePos) { b_fix(b, t->d, 1); b_s(b, " м"); } else b_s(b, "расстояние неизвестно");
+}
+static void nw_name(Buf* b, const NwT* t) {
+    b_s(b, t->nick[0] ? t->nick : t->q); b_s(b, " ["); if (t->cid >= 0) b_int(b, t->cid); else b_ch(b, '?'); b_ch(b, ']');
+}
+static const char* g_nwHow[] = { "?", "зона/ID", "зона/ник", "пул/ID", "пул/ник", "Get(id)" };
+
+static void nw_transition(NwT* t, int idx, int ns, int havePos) {
+    char m[220]; Buf b; const char* kind;
+    b_init(&b, m, sizeof m);
+    b_s(&b, "Near: "); nw_name(&b, t);
+    if (ns == 1) {
+        kind = t->st == 2 ? "enter" : "appear";
+        b_s(&b, t->st == 2 ? " вошёл в зону: " : t->st == 3 ? " появился в игре и сразу в зоне: " : " в зоне: ");
+        nw_distfmt(&b, t, havePos); if (t->veh) b_s(&b, ", в машине");
+        if (t->hasPos && havePos) { b_s(&b, " (по горизонтали "); b_fix(&b, t->d2, 1); b_s(&b, ")"); }
+    } else if (ns == 2) {
+        kind = t->st == 1 ? "leave" : "online";
+        b_s(&b, t->st == 1 ? (g_nwPoolTotal >= 0 ? " вышел из зоны, он онлайн" : " вышел из зоны (пул игроков не читается — онлайн ли, не знаю)") : " онлайн, но вне зоны стрима");
+        if (t->hasPos && havePos) { b_s(&b, " (последняя позиция "); b_fix(&b, t->d, 0); b_s(&b, " м)"); }
+    } else {
+        kind = "gone";
+        b_s(&b, t->st == 0 ? " не найден: ни в зоне, ни в пуле игроков" : " пропал из пула игроков (вышел из игры или реконнект)");
+        if (t->idTaken) b_s(&b, "; его ID теперь у другого игрока");
+    }
+    nw_ev(idx, t->cid, kind, t->nick[0] ? t->nick : t->q, t->hasPos && havePos ? t->d : -1.0f, m, 1);
+}
+static void nw_any_flush(void) {                               /* «ещё N событий» — по таймеру, чтобы сводка не ждала следующего события */
+    long now = mono_ms();
+    if (g_nwWinSkip > 0 && now - g_nwWinT > 3000) {
+        char m[220]; Buf b; b_init(&b, m, sizeof m);
+        b_s(&b, "Near: ещё "); b_int(&b, g_nwWinSkip); b_s(&b, " событий «любой игрок» не показано (много людей) — всё в near_watch.log");
+        nw_ev(-1, -1, "any_more", "", -1, m, 1);
+        g_nwWinT = now; g_nwWinN = 0; g_nwWinSkip = 0;
+    }
+}
+static void nw_say_any(int appear, const char* what, int id, const char* nick, float d, int havePos) {   /* режим any: не больше 4 сообщений в чат за 3 с */
+    char m[220]; Buf b; long now = mono_ms(); int chat = 1;
+    if (now - g_nwWinT > 3000) {
+        if (g_nwWinSkip > 0) { b_init(&b, m, sizeof m); b_s(&b, "Near: ещё "); b_int(&b, g_nwWinSkip); b_s(&b, " событий «любой игрок» не показано (много людей) — всё в near_watch.log"); nw_ev(-1, -1, "any_more", "", -1, m, 1); }
+        g_nwWinT = now; g_nwWinN = 0; g_nwWinSkip = 0;
+    }
+    if (g_nwWinN >= 4) { chat = 0; g_nwWinSkip++; } else g_nwWinN++;
+    b_init(&b, m, sizeof m);
+    b_s(&b, "Near: "); b_s(&b, nick[0] ? nick : "игрок"); b_s(&b, " ["); b_int(&b, id); b_s(&b, "] "); b_s(&b, what);
+    if (d >= 0 && havePos) { b_s(&b, ": "); b_fix(&b, d, 1); b_s(&b, " м"); }
+    nw_ev(-1, id, appear ? "any_appear" : "any_leave", nick, havePos ? d : -1.0f, m, chat);
+}
+
+static void nw_reset(void) {                                   /* игра сбросила пул (реконнект, загрузка): состояния «неизвестно», события вспыхнут заново */
+    int i;
+    nw_lock();
+    for (i = 0; i < NW_MAX; i++) { g_nw[i].st = 0; g_nw[i].miss = 0; }
+    g_nwAnySeeded = 0; g_nwAnyN = 0; g_nwPoolTotal = -2; g_nwNP = 0;
+    nw_unlock();
+}
+
+static void nw_publish(const float* me, int havePos, int meId) {   /* JSON целей для /watch (под nw_lock) */
+    Buf b; int next = g_nwTjCur ^ 1, i; long now = mono_ms();
+    b_init(&b, g_nwTj[next], sizeof g_nwTj[next]);
+    b_s(&b, "\"watch\":{\"any\":"); b_int(&b, g_nwAny); b_s(&b, ",\"chat\":"); b_int(&b, g_nwChat);
+    b_s(&b, ",\"pool\":"); b_int(&b, g_nwPoolTotal); b_s(&b, ",\"poolNicks\":"); b_int(&b, g_nwPoolNicks); b_s(&b, ",\"stream\":"); b_int(&b, g_np);
+    b_s(&b, ",\"me\":{\"id\":"); b_int(&b, meId);
+    if (havePos) { b_s(&b, ",\"x\":"); b_fix(&b, me[0], 1); b_s(&b, ",\"y\":"); b_fix(&b, me[1], 1); b_s(&b, ",\"z\":"); b_fix(&b, me[2], 1); }
+    b_s(&b, "},\"t\":[");
+    for (i = 0; i < NW_MAX; i++) {
+        NwT* t = &g_nw[i]; int first = (b.p[b.n - 1] == '[');
+        if (!t->used) continue;
+        if (!first) b_ch(&b, ',');
+        b_s(&b, "{\"i\":"); b_int(&b, i); b_s(&b, ",\"q\":"); b_jstr(&b, t->q);
+        b_s(&b, ",\"id\":"); b_int(&b, t->cid); b_s(&b, ",\"nick\":"); b_jstr(&b, t->nick);
+        b_s(&b, ",\"st\":"); b_int(&b, t->st); b_s(&b, ",\"how\":"); b_int(&b, t->how);
+        b_s(&b, ",\"veh\":"); b_int(&b, t->veh); b_s(&b, ",\"hp\":"); b_fix(&b, t->hp, 0);
+        if (t->hasPos) {
+            b_s(&b, ",\"x\":"); b_fix(&b, t->x, 1); b_s(&b, ",\"y\":"); b_fix(&b, t->y, 1); b_s(&b, ",\"z\":"); b_fix(&b, t->z, 1);
+            if (havePos) { b_s(&b, ",\"d\":"); b_fix(&b, t->d, 1); b_s(&b, ",\"d2\":"); b_fix(&b, t->d2, 1); }
+        }
+        b_s(&b, ",\"since\":"); b_int(&b, t->tSince ? now - t->tSince : 0);
+        b_s(&b, ",\"seenAgo\":"); b_int(&b, t->tSeen ? now - t->tSeen : -1);
+        b_s(&b, ",\"idTaken\":"); b_int(&b, t->idTaken);
+        b_ch(&b, '}');
+    }
+    b_s(&b, "]}");
+    g_nwTjCur = next;
+}
+
+/* ── главная проверка: каждый тик сборщика (после чтения PlayersInStream в g_pl) ── */
+static void nw_tick(const float* me, int havePos, int meId, void* pool) {
+    int i, k, any = 0, doPool;
+    for (i = 0; i < NW_MAX; i++) if (g_nw[i].used) any = 1;
+    if (!any && !g_nwAny) { nw_lock(); nw_publish(me, havePos, meId); nw_unlock(); return; }
+    doPool = (g_ticks % 5 == 1) || g_nwPoolTotal == -2;       /* весь пул — раз в ~1,5 с (ники читаются через IL2CPP, это дороже) */
+    if (doPool) {
+#ifdef KONSTT_TEST
+        int tot = g_nwTestTotal;                              /* юнит-тест подставляет g_nwP сам */
+#else
+        int tot = nw_scan_pool(pool);
+#endif
+        if (tot != g_nwPoolTotal) { if (g_nwPoolTotal == -2 || tot < 0) dlog_i("nwatch: пул игроков, записей (-1 — не прочитался) ", tot); }
+        g_nwPoolTotal = tot;
+        if (tot >= 0) { static int once; if (!once) { once = 1; dlog_i("nwatch: игроков в пуле с читаемым ником ", g_nwPoolNicks); } }
+    } else {                                                  /* между сканами пула — только обновить флаг «в зоне» */
+        for (i = 0; i < g_nwNP; i++) { g_nwP[i].inStream = 0; for (k = 0; k < g_np; k++) if (g_pl[k].id == g_nwP[i].id) { g_nwP[i].inStream = 1; break; } }
+    }
+    nw_lock();
+    for (i = 0; i < NW_MAX; i++) {
+        NwT* t = &g_nw[i]; NwC best; int ns, oldId;
+        if (!t->used) continue;
+        { char* z = (char*)&best; unsigned q; for (q = 0; q < sizeof best; q++) z[q] = 0; }
+        t->idTaken = 0;
+        for (k = 0; k < g_np; k++) { PInfo* p = &g_pl[k]; nw_consider(t, p->id, p->nick, p->hasPos, p->x, p->y, p->z, p->veh, p->hp, 1, &best); }
+        if (best.ok) { best.how = (t->id >= 0 || nw_isnum(t->q)) ? 1 : 2; ns = 1; }
+        else {
+            for (k = 0; k < g_nwNP; k++) { NwP* p = &g_nwP[k]; if (!p->inStream) nw_consider(t, p->id, p->nick, p->hasPos, p->x, p->y, p->z, p->veh, p->hp, (t->id >= 0 || nw_isnum(t->q)) ? 3 : 4, &best); }
+            if (!best.ok && doPool && t->id >= 0 && g_nwPoolTotal >= 0) {      /* словарь не нашёл — спрашиваем пул напрямую */
+                NwP q;
+                if (nw_get_direct(pool, t->id, &q) && nw_match(t, q.id, q.nick) > 0) {
+                    best.ok = 1; best.score = 2; best.id = q.id; best.hasPos = q.hasPos; best.x = q.x; best.y = q.y; best.z = q.z; best.veh = q.veh; best.hp = q.hp; best.how = 5;
+                    nw_cpy(best.nick, q.nick, sizeof best.nick);
+                }
+            }
+            if (best.ok) ns = 2;
+            else ns = (g_nwPoolTotal >= 0) ? 3 : (t->st == 1 ? 2 : 0);   /* пул не читается — «не знаю», а не «пропал» */
+        }
+        if (best.ok) {
+            oldId = t->cid;
+            if (best.nick[0]) nw_cpy(t->nick, best.nick, sizeof t->nick);
+            t->cid = best.id; t->how = best.how; t->hasPos = best.hasPos; t->veh = best.veh; t->hp = best.hp;
+            if (best.hasPos) { t->x = best.x; t->y = best.y; t->z = best.z; }
+            if (t->hasPos && havePos) {
+                float dx = t->x - me[0], dy = t->y - me[1], dz = t->z - me[2];
+                t->d = __builtin_sqrtf(dx * dx + dy * dy + dz * dz); t->d2 = __builtin_sqrtf(dx * dx + dy * dy);
+            }
+            t->tSeen = mono_ms();
+            if (t->id >= 0 && best.id != t->id && t->st != 0) {   /* слежка по ID: тот же ник у другого ID — перезаход */
+                char m[200]; Buf b; b_init(&b, m, sizeof m);
+                b_s(&b, "Near: "); b_s(&b, t->nick); b_s(&b, " сменил ID: "); b_int(&b, t->id); b_s(&b, " → "); b_int(&b, best.id); b_s(&b, " (слежу дальше по нику)");
+                nw_ev(i, best.id, "newid", t->nick, -1, m, 1);
+            }
+            if (t->id >= 0) t->id = best.id;
+            (void)oldId;
+        }
+        /* смена состояния с задержкой на уход (мерцание на границе зоны не должно сыпать сообщениями) */
+        if (ns == t->st || (ns == 0 && t->st != 0)) { t->miss = 0; }
+        else if (t->st == 0 || ns == 1 || (t->st == 3 && ns == 2)) {
+            nw_transition(t, i, ns, havePos); t->st = ns; t->miss = 0; t->tSince = mono_ms();
+        } else {
+            int lim = (t->st == 1) ? NW_MISS : NW_MISS_POOL;
+            if (++t->miss >= lim) { nw_transition(t, i, ns, havePos); t->st = ns; t->miss = 0; t->tSince = mono_ms(); }
+        }
+        if (ns == 3 && t->st == 3) t->hasPos = 0;
+    }
+    if (g_nwAny) {                                             /* «любой игрок»: новые в зоне и ушедшие из зоны */
+        int j;
+        for (k = 0; k < g_np; k++) {
+            PInfo* p = &g_pl[k]; int found = -1, tracked = 0;
+            if (p->id < 0) continue;
+            for (j = 0; j < g_nwAnyN; j++) if (g_nwAnyId[j] == p->id) { found = j; break; }
+            for (j = 0; j < NW_MAX; j++) if (g_nw[j].used && g_nw[j].cid == p->id && g_nw[j].st == 1) tracked = 1;
+            if (found >= 0) { g_nwAnyMiss[found] = 0; nw_cpy(g_nwAnyNick[found], p->nick, sizeof g_nwAnyNick[0]); continue; }
+            if (g_nwAnyN >= MAXP) continue;
+            g_nwAnyId[g_nwAnyN] = p->id; g_nwAnyMiss[g_nwAnyN] = 0; nw_cpy(g_nwAnyNick[g_nwAnyN], p->nick, sizeof g_nwAnyNick[0]); g_nwAnyN++;
+            if (g_nwAnySeeded && !tracked) {
+                float d = -1;
+                if (p->hasPos && havePos) { float dx = p->x - me[0], dy = p->y - me[1], dz = p->z - me[2]; d = __builtin_sqrtf(dx * dx + dy * dy + dz * dz); }
+                nw_say_any(1, "появился в зоне", p->id, p->nick, d, havePos);
+            }
+        }
+        for (j = 0; j < g_nwAnyN; ) {
+            int present = 0;
+            for (k = 0; k < g_np; k++) if (g_pl[k].id == g_nwAnyId[j]) { present = 1; break; }
+            if (present) { j++; continue; }
+            if (++g_nwAnyMiss[j] < NW_MISS) { j++; continue; }
+            if (g_nwAnySeeded) { int tr = 0, q; for (q = 0; q < NW_MAX; q++) if (g_nw[q].used && g_nw[q].cid == g_nwAnyId[j]) tr = 1; if (!tr) nw_say_any(0, "ушёл из зоны", g_nwAnyId[j], g_nwAnyNick[j], -1, 0); }
+            g_nwAnyId[j] = g_nwAnyId[g_nwAnyN - 1]; g_nwAnyMiss[j] = g_nwAnyMiss[g_nwAnyN - 1]; nw_cpy(g_nwAnyNick[j], g_nwAnyNick[g_nwAnyN - 1], sizeof g_nwAnyNick[0]); g_nwAnyN--;
+        }
+        g_nwAnySeeded = 1;
+        nw_any_flush();
+    } else { g_nwAnySeeded = 0; g_nwAnyN = 0; }
+    nw_publish(me, havePos, meId);
+    nw_unlock();
+}
+
+/* ── JSON событий для GET /watch?since=N (под nw_lock) ── */
+static void nw_events_json(Buf* b, long since) {
+    long s; int first = 1;
+    b_s(b, ",\"seq\":"); b_int(b, g_nwSeq); b_s(b, ",\"ev\":[");
+    for (s = g_nwSeq > NW_EVN ? g_nwSeq - NW_EVN + 1 : 1; s <= g_nwSeq; s++) {
+        NwEv* e = &g_nwEv[(s - 1) % NW_EVN];
+        if (e->seq != s || s <= since) continue;
+        if (!first) b_ch(b, ',');
+        first = 0;
+        b_s(b, "{\"seq\":"); b_int(b, e->seq); b_s(b, ",\"ms\":"); b_int(b, e->ms); b_s(b, ",\"k\":"); b_jstr(b, e->kind);
+        b_s(b, ",\"t\":"); b_int(b, e->tgt); b_s(b, ",\"id\":"); b_int(b, e->id); b_s(b, ",\"nick\":"); b_jstr(b, e->nick);
+        if (e->d >= 0) { b_s(b, ",\"d\":"); b_fix(b, e->d, 1); }
+        b_s(b, ",\"msg\":"); b_jstr(b, e->msg); b_ch(b, '}');
+    }
+    b_s(b, "]");
+}
+
+/* ── команда /nwatch ── */
+static int nw_tokens(void* arr, char tok[][48], int maxn) {
+    long len; int i, n = 0; char* data;
+    if (!arr) return 0;
+    len = *(long*)((char*)arr + 3 * sizeof(void*));
+    if (len < 0 || len > 16) return 0;
+    data = (char*)arr + 4 * sizeof(void*);
+    for (i = 0; i < len; i++) {
+        void* s = *(void**)(data + (uptr)i * sizeof(void*));
+        char tmp[160]; int cnt, p = 0; const u16* ch;
+        if (!s) continue;
+        cnt = A.string_length(s); ch = A.string_chars(s);
+        if (cnt <= 0 || cnt > 40 || !ch) continue;
+        utf16_to_utf8(ch, cnt, tmp, sizeof tmp);
+        while (tmp[p]) {
+            char w[48]; int q = 0, z;
+            while (tmp[p] == ' ') p++;
+            while (tmp[p] && tmp[p] != ' ') { if (q < 47) w[q++] = tmp[p]; p++; }
+            w[q] = 0;
+            if (!q || w[0] == '/' || seq(w, "nwatch")) continue;
+            if (n < maxn) { for (z = 0; z <= q; z++) tok[n][z] = w[z]; n++; }
+        }
+    }
+    return n;
+}
+static void nw_status(void) {
+    char m[220]; Buf b; int i, n = 0;
+    nw_lock();
+    for (i = 0; i < NW_MAX; i++) {
+        NwT* t = &g_nw[i]; if (!t->used) continue; n++;
+        b_init(&b, m, sizeof m);
+        b_s(&b, "Near слежу "); b_int(&b, i + 1); b_s(&b, ") «"); b_s(&b, t->q); b_s(&b, "» → "); nw_name(&b, t); b_s(&b, ": ");
+        b_s(&b, t->st == 1 ? "в зоне " : t->st == 2 ? "онлайн, вне зоны " : t->st == 3 ? "нет в пуле" : "ещё не определено");
+        if (t->st == 1 || t->st == 2) { if (t->hasPos) { b_fix(&b, t->d, 1); b_s(&b, " м"); } else b_s(&b, "позиция неизвестна"); b_s(&b, ", способ: "); b_s(&b, g_nwHow[t->how < 6 ? t->how : 0]); }
+        if (t->idTaken) b_s(&b, "; этот ID теперь у другого игрока");
+        chat_say(m);
+    }
+    nw_unlock();
+    b_init(&b, m, sizeof m);
+    b_s(&b, n ? "Near: режим «любой игрок» " : "Near: целей нет; режим «любой игрок» "); b_s(&b, g_nwAny ? "ВКЛ" : "выкл"); b_s(&b, ", сообщения в чат "); b_s(&b, g_nwChat ? "ВКЛ" : "выкл");
+    chat_say(m);
+}
+static void nw_usage(void) {
+    chat_usage("/nwatch ID или ник — следить (до 8 целей; ник можно частью). Пишу в чат и в HLOG/near_watch.log, когда появился/вышел из зоны/пропал");
+    chat_usage("/nwatch off ID|ник|all — снять;  /nwatch any — вкл/выкл «любой новый игрок в зоне»;  /nwatch list — состояние");
+    chat_usage("/nwatch chat — вкл/выкл сообщения в чат (файл и http://127.0.0.1:17771/watch остаются);  /nwatch diag — диагностика");
+}
+static void native_nwatch_cmd(void* self, void* args, void* mi) {
+    char tok[6][48]; int nt, i;
+    (void)self; (void)mi;
+    if (args && seq(A.class_get_name(A.object_get_class(args)), "String")) { nw_flush_chat(); return; }   /* тик из сборщика, а не команда */
+    mt_capture_ctx();                                            /* мы в главном потоке: запомним канал для сообщений */
+    nt = nw_tokens(args, tok, 6);
+    if (nt == 0 || seq(tok[0], "list") || seq(tok[0], "status") || seq(tok[0], "список")) { nw_status(); return; }
+    if (seq(tok[0], "help") || seq(tok[0], "?") || seq(tok[0], "помощь")) { nw_usage(); return; }
+    if (seq(tok[0], "diag")) {
+        char m[220]; Buf b; b_init(&b, m, sizeof m);
+        b_s(&b, "Near diag: пул "); b_int(&b, g_nwPoolTotal); b_s(&b, " (с ником "); b_int(&b, g_nwPoolNicks); b_s(&b, "), в зоне "); b_int(&b, g_np);
+        b_s(&b, ", главный поток "); b_s(&b, (g_mt_ctx && g_mt_postM) ? "есть" : "нет"); b_s(&b, ", Get(id) сбоев "); b_int(&b, g_nwGetFail);
+        chat_say(m); return;
+    }
+    if (seq(tok[0], "any") || seq(tok[0], "все") || seq(tok[0], "всех")) {
+        g_nwAny = !g_nwAny; nw_save();
+        chat_say(g_nwAny ? "Near: режим «любой игрок» ВКЛ — напишу о каждом, кто появился в зоне или ушёл (4 сообщения в 3 с, остальное в near_watch.log)" : "Near: режим «любой игрок» выкл");
+        return;
+    }
+    if (seq(tok[0], "chat") || seq(tok[0], "чат")) { g_nwChat = !g_nwChat; nw_save(); chat_say(g_nwChat ? "Near: сообщения слежения в чат ВКЛ" : "Near: сообщения слежения в чат выкл (файл near_watch.log и /watch работают)"); return; }
+    if (seq(tok[0], "off") || seq(tok[0], "del") || seq(tok[0], "stop") || seq(tok[0], "выкл") || seq(tok[0], "стоп")) {
+        int removed = 0;
+        if (nt < 2 || seq(tok[1], "all") || seq(tok[1], "все")) { nw_lock(); for (i = 0; i < NW_MAX; i++) { removed += g_nw[i].used; g_nw[i].used = 0; } nw_unlock(); }
+        else {
+            char qn[40]; int id = nw_isnum(tok[1]) ? nw_atoi(tok[1]) : -1;
+            if (id < 0) nw_norm(tok[1], qn, sizeof qn);
+            nw_lock();
+            for (i = 0; i < NW_MAX; i++) {
+                NwT* t = &g_nw[i]; char nn[64];
+                if (!t->used) continue;
+                nw_norm(t->nick, nn, sizeof nn);
+                if ((id >= 0 && (t->id == id || t->cid == id)) || (id < 0 && (seq(t->qn, qn) || seq(nn, qn)))) { t->used = 0; removed++; }
+            }
+            nw_unlock();
+        }
+        nw_save();
+        { char m[120]; Buf b; b_init(&b, m, sizeof m); b_s(&b, "Near: снято целей: "); b_int(&b, removed); chat_say(m); }
+        return;
+    }
+    {                                                            /* /nwatch <ID|ник> [ещё...] */
+        int added = 0, dup = 0, full = 0;
+        for (i = 0; i < nt; i++) {
+            int r;
+            if (seq(tok[i], "on") || seq(tok[i], "add") || seq(tok[i], "вкл")) continue;
+            nw_lock(); r = nw_add_locked(tok[i]); nw_unlock();
+            if (r > 0) added++; else if (r == 0) dup++; else full++;
+        }
+        nw_save();
+        { char m[200]; Buf b; b_init(&b, m, sizeof m);
+          if (added) { b_s(&b, "Near: слежу, добавлено целей: "); b_int(&b, added); b_s(&b, " — напишу, как только найду (способы: зона, пул игроков, Get(id), ник)"); }
+          else if (dup) b_s(&b, "Near: эта цель уже на слежении (/nwatch list)");
+          else b_s(&b, "Near: нет места, максимум 8 целей (/nwatch off ID)");
+          if (added && full) b_s(&b, "; часть не влезла (максимум 8)");
+          chat_say(m); }
+    }
+}
+
 /* ───────────── итоговый JSON ───────────── */
 static char g_json[2][32768];
 static volatile int g_jsonCur;
 static volatile long g_snapMs[2];                      /* когда прочитан снимок g_json[i] — по нему при ответе считаем возраст «ago» */
 static float g_meV[3]; static int g_meHasV;
-static volatile unsigned g_ticks;
 static void publish(int ok, const char* why, int havePos, float mx, float my, float mz, int meId) {
     Buf b; int next = g_jsonCur ^ 1, i;
     b_init(&b, g_json[next], sizeof g_json[next]);
@@ -301,7 +890,7 @@ static void collect_tick(void) {
     if (!g_poolSrcField) scan_for_pool();
     if (!g_poolSrcField) { set_stage("static-поле с PlayerPool не найдено"); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
     pool = current_pool();
-    if (!pool) { set_stage("PlayerPool ещё не создан (вы не в игре?)"); g_np = 0; publish(0, g_stage, 0, 0, 0, 0, -1); return; }
+    if (!pool) { set_stage("PlayerPool ещё не создан (вы не в игре?)"); g_np = 0; nw_reset(); publish(0, g_stage, 0, 0, 0, 0, -1); return; }
 
     if (!g_fieldsDumped) {
         dump_class(g_cPlayerPool, "PlayerPool");
@@ -316,7 +905,7 @@ static void collect_tick(void) {
         if (havePos) { vel_track(-2, me, g_tickMs, g_meV); g_meHasV = 1; }
     }
     stream = ref_field(pool, "PlayersInStream");
-    if (!stream) { set_stage("PlayersInStream = null"); g_np = 0; publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
+    if (!stream) { set_stage("PlayersInStream = null"); g_np = 0; nw_reset(); publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
     g_np = 0;
     if (!walk_collection(stream, on_player, NULL)) { set_stage("неизвестный тип PlayersInStream — см. /diag"); publish(0, g_stage, havePos, me[0], me[1], me[2], meId); return; }
     set_stage("работает");
@@ -329,6 +918,7 @@ static void collect_tick(void) {
     }
     publish(1, g_stage, havePos, me[0], me[1], me[2], meId);
     snap_write(me, havePos, meId);
+    nw_tick(me, havePos, meId, pool);                    /* /nwatch: постоянное слежение (если цели есть) */
 }
 
 /* /nearlog [N] — записать N снимков в HLOG/near_snap.log. Выполняется в главном потоке; сам снимок пишет поток-сборщик (g_pl не трогаем отсюда) */
@@ -364,7 +954,7 @@ static void near_try_register(void) {
     int st = __atomic_load_n(&g_tplState, __ATOMIC_ACQUIRE);
     if (g_nearlogReg || !st) return;                     /* 0 — образец ещё ищется */
     g_nearlogReg = 1;
-    if (st == 1) { cmd_register("nearlog", native_nearlog_cmd); cmd_register("nearid", native_nearid_cmd); }
+    if (st == 1) { cmd_register("nearlog", native_nearlog_cmd); cmd_register("nearid", native_nearid_cmd); cmd_register("nwatch", native_nwatch_cmd); }
     else dlog("нативная /nearlog: образец делегата не найден, команды не будет");
 }
 
@@ -379,9 +969,12 @@ static void* near_collector_main(void* arg) {
     }
     dlog("near: игра готова, начинаю опрос игроков");
     hm_mod_ready(g_near_modId);                          /* мод заработал — на экране загрузки он засчитан */
+    nw_load();                                           /* список слежения прошлого запуска (HLOG/near_watch.txt) */
     for (;;) {
         near_try_register();
+        nw_load();                                       /* если путь журнала появился позже */
         collect_tick();
+        nw_pump();                                       /* сообщения слежения → чат (через главный поток) */
         usleep(TICK_US);
     }
     return NULL;
@@ -448,6 +1041,19 @@ static void* server_main(void* arg) {
                 rq[n] = 0;
                 { static int hl; if (hl < 15) { char q[48]; int k; hl++; for (k = 0; k < 47 && rq[k] && rq[k] != '\r' && rq[k] != '\n'; k++) q[k] = rq[k]; q[k] = 0; dlog2("HTTP: запрос ", q); } }
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
+                else if (sprefix(rq, "GET /watch")) {   /* слежение: цели, состояние, события с seq (?since=N — только новее N) */
+                    static char wout[9216 + NW_EVN * 720 + 128];                 /* цели + все события с запасом на экранирование: JSON не должен обрезаться */ Buf wb; long since = 0; const char* q = rq; int cur;
+                    while (*q && *q != '\r' && *q != '\n') { if (sprefix(q, "since=")) { q += 6; while (*q >= '0' && *q <= '9' && since < 1000000000L) since = since * 10 + (*q++ - '0'); break; } q++; }
+                    b_init(&wb, wout, sizeof wout);
+                    nw_lock();
+                    cur = g_nwTjCur;
+                    b_s(&wb, "{\"v\":1,\"tick\":"); b_int(&wb, (long)g_ticks); b_ch(&wb, ',');
+                    b_s(&wb, g_nwTj[cur][0] ? g_nwTj[cur] : "\"watch\":{\"any\":0,\"t\":[]}");
+                    nw_events_json(&wb, since);
+                    nw_unlock();
+                    b_ch(&wb, '}');
+                    respond(c, "200 OK", "application/json", wb.p, wb.n);
+                }
                 else if (sprefix(rq, "GET /near")) {   /* к снимку дописываем "ago" — сколько мс ему было на момент ответа (Near.js двигает цель на это время) */
                     static char out[32768 + 64]; int cur = g_jsonCur; const char* j = g_json[cur]; long ago = mono_ms() - g_snapMs[cur]; Buf ob;
                     if (ago < 0) ago = 0;
