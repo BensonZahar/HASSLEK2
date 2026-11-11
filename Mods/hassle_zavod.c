@@ -37,7 +37,7 @@
  *
  * Меню внедряется JS через WebViewSystem.ExecuteJavaScript (APK пересобирать не нужно). Нажатия меню уходят как «/zavod q …» через window.sendChatInput (q — «тихо»),
  *   состояние мод присылает обратно тем же ExecuteJavaScript. Если страница перезагрузилась (реконнект) — введите /zavod ещё раз. Текст меню — между метками
- *   ZV_MENU_BEGIN/END; править tools/zavod_menu.js и запускать tools/embed_zavod_menu.py. (v2: хук чата через Hud.$refs.chat.add; фигурка «в руках» только по ответу сервера.)
+ *   ZV_MENU_BEGIN/END; править tools/zavod_menu.js и запускать tools/embed_zavod_menu.py. (v4: лог 3D-подписей /zavod labels; v3: хук чата через Hud.$refs.chat.add с защитой от дублей; фигурка «в руках» только по ответу сервера.)
  *
  * НЕ ПРОВЕРЕНО НА УСТРОЙСТВЕ (собрано и проверено компилятором). Если что-то не так — смотрите HLOG/konstt.log (строки «zavod:») и пришлите.
  */
@@ -95,6 +95,7 @@ static float g_zv_bTk[3], g_zv_bPt[3], g_zv_bM[ZV_MAXB][3]; static int g_zv_hasB
 static float g_zv_tk[3], g_zv_pt[3]; static int g_zv_hasTk, g_zv_hasPt, g_zv_srcTk, g_zv_srcPt, g_zv_srcM;    /* итог: источник 0 нет, 1 bind, 2 подпись, 3 встроено */
 static ZvM g_zv_m[ZV_MAXM]; static int g_zv_nm;
 static int g_zv_nb, g_zv_mark, g_zv_poolN = -1;
+static int g_zv_oId = -1, g_zv_oCol = -1, g_zv_oDist = -1, g_zv_oLos = -1, g_zv_oPl = -1, g_zv_oVeh = -1;   /* необязательные поля CreateText3DParams (для лога подписей) */
 static int g_zv_modId = -1, g_zv_errs, g_zv_q, g_zv_uiOk, g_zv_fz, g_zv_fzErr, g_zv_layoutOk, g_zv_oPos, g_zv_oTxt;
 static char g_zv_lastJs[3800];
 
@@ -269,6 +270,15 @@ static int zv_lb_layout(void) {                                     /* смещ�
     f = find_field(sc, "Text"); if (!f) { dlog("zavod: нет поля CreateText3DParams.Text"); return 0; }
     g_zv_oTxt = A.field_get_offset(f) - shift;
     if (g_zv_oPos < 0 || g_zv_oTxt < 0 || g_zv_oPos > 120 || g_zv_oTxt > 120) { dlog_i("zavod: странная раскладка CreateText3DParams, Position ", g_zv_oPos); return 0; }
+    {   /* остальные поля нужны только логу подписей: не нашлись — в логе будет «?» */
+        void* g;
+        g = find_field(sc, "ID"); g_zv_oId = g ? A.field_get_offset(g) - shift : -1;
+        g = find_field(sc, "Color"); g_zv_oCol = g ? A.field_get_offset(g) - shift : -1;
+        g = find_field(sc, "Distance"); g_zv_oDist = g ? A.field_get_offset(g) - shift : -1;
+        g = find_field(sc, "TestLOS"); g_zv_oLos = g ? A.field_get_offset(g) - shift : -1;
+        g = find_field(sc, "PlayerID"); g_zv_oPl = g ? A.field_get_offset(g) - shift : -1;
+        g = find_field(sc, "VehicleID"); g_zv_oVeh = g ? A.field_get_offset(g) - shift : -1;
+    }
     g_zv_layoutOk = 1;
     return 1;
 }
@@ -370,6 +380,124 @@ static void zv_resolve(void) {
     }
 }
 
+/* ───────────── лог ВСЕХ 3D-подписей сервера → HLOG/konstt.log (строки «zavod: L…») ─────────────
+   Подпись = Hassle.Global.Pooling.CreateText3DParams: ID, Color, Position, Distance (радиус показа), TestLOS, PlayerID / VehicleID (к кому прикреплена), Text.
+   Пишем только НОВЫЕ («+») и ИЗМЕНИВШИЕСЯ («~», текст или место при том же ID) подписи; /zavod labels dump — разово всё, что сейчас в стриме («=»).
+   Координаты в логе — SAMP (x y z): Unity (x, y, z) → SAMP (x, z, y). Сервер стримит подписи только рядом — чтобы собрать всё, пройдитесь по карте с включённым логом. */
+#define ZV_LG_LINES 6000                /* потолок записей за сессию (чтобы не раздуть konstt.log); /zavod labels clear — сбросить */
+#define ZV_LG_PERSCAN 80                /* не больше записей за один проход (подписи с бегущими таймерами) */
+static unsigned g_zv_lgH[65536];        /* ID подписи → хэш последней записанной версии (0 — не видели) */
+static int g_zv_lg, g_zv_lgLines, g_zv_lgEmit, g_zv_lgDump;
+typedef struct { int id, col, los, pl, veh; float dist, p[3]; } ZvLbF;
+static unsigned zv_hash(const char* s) { unsigned h = 2166136261u; while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; } return h | 1u; }
+static int zv_lb_read_full(void* it, char* tmp, int cap, ZvLbF* o) {
+    void *sf, *sc, *s; char* sp; int n; const u16* ch;
+    if (!hm_obj_ok(it)) return 0;
+    sf = find_field(A.object_get_class(it), "m_CreateParams");
+    if (!sf) return 0;
+    sc = A.class_from_type(A.field_get_type(sf));
+    if (!sc || !A.class_is_valuetype(sc)) return 0;
+    sp = (char*)it + A.field_get_offset(sf);
+    if (!hm_readable(sp + g_zv_oPos, 12) || !hm_readable(sp + g_zv_oTxt, 8)) return 0;
+    s = *(void**)(sp + g_zv_oTxt);
+    if (!s || !hm_obj_ok(s)) return 0;
+    n = A.string_length(s); ch = A.string_chars(s);
+    if (n <= 0 || n > 600 || !ch) return 0;
+    utf16_to_utf8(ch, n, tmp, cap);
+    o->p[0] = ((float*)(sp + g_zv_oPos))[0]; o->p[1] = ((float*)(sp + g_zv_oPos))[1]; o->p[2] = ((float*)(sp + g_zv_oPos))[2];
+    if (!zv_finite(o->p)) return 0;
+    o->id  = (g_zv_oId  >= 0 && hm_readable(sp + g_zv_oId, 2))  ? (int)*(u16*)(sp + g_zv_oId)  : -1;
+    o->col = (g_zv_oCol >= 0 && hm_readable(sp + g_zv_oCol, 4)) ? *(int*)(sp + g_zv_oCol)      : 0;
+    o->dist = (g_zv_oDist >= 0 && hm_readable(sp + g_zv_oDist, 4)) ? *(float*)(sp + g_zv_oDist) : -1.0f;
+    o->los = (g_zv_oLos >= 0 && hm_readable(sp + g_zv_oLos, 1)) ? (int)*(u8*)(sp + g_zv_oLos)  : -1;
+    o->pl  = (g_zv_oPl  >= 0 && hm_readable(sp + g_zv_oPl, 2))  ? (int)*(u16*)(sp + g_zv_oPl)  : -1;
+    o->veh = (g_zv_oVeh >= 0 && hm_readable(sp + g_zv_oVeh, 2)) ? (int)*(u16*)(sp + g_zv_oVeh) : -1;
+    return 1;
+}
+static void zv_b_hex8(Buf* b, unsigned v) { int s; for (s = 28; s >= 0; s -= 4) b_ch(b, "0123456789ABCDEF"[(v >> s) & 15]); }
+static void zv_lg_emit(char sign, const ZvLbF* o, const char* txt) {   /* строка с полями + текст (длинный режется на продолжения «↳» по границе символа) */
+    char m[460]; Buf b; int i = 0, first = 1;
+    while (first || txt[i]) {
+        int k = 0;
+        b_init(&b, m, sizeof m);
+        if (first) {
+            b_s(&b, "zavod: L"); b_ch(&b, sign);
+            b_s(&b, " #"); if (o->id >= 0) b_int(&b, o->id); else b_ch(&b, '?');
+            b_s(&b, " d="); b_fix(&b, zv_dist(o->p, g_zv_ref), 1);
+            b_s(&b, "м SAMP("); b_fix(&b, o->p[0], 2); b_ch(&b, ' '); b_fix(&b, o->p[2], 2); b_ch(&b, ' '); b_fix(&b, o->p[1], 2);
+            b_s(&b, ") R="); if (o->dist >= 0.0f) b_fix(&b, o->dist, 1); else b_ch(&b, '?');
+            b_s(&b, " LOS="); if (o->los >= 0) b_int(&b, o->los); else b_ch(&b, '?');
+            b_s(&b, " pl="); if (o->pl >= 0 && o->pl != 0xFFFF) b_int(&b, o->pl); else b_ch(&b, '-');
+            b_s(&b, " veh="); if (o->veh >= 0 && o->veh != 0xFFFF) b_int(&b, o->veh); else b_ch(&b, '-');
+            b_s(&b, " col="); zv_b_hex8(&b, (unsigned)o->col);
+            b_s(&b, " | ");
+        } else b_s(&b, "zavod: L  ↳ ");
+        first = 0;
+        while (txt[i] && k < 200) {
+            int len = 1, z; unsigned char c = (unsigned char)txt[i];
+            if (c >= 0xF0) len = 4; else if (c >= 0xE0) len = 3; else if (c >= 0xC0) len = 2;
+            if (k + len > 200) break;
+            for (z = 0; z < len && txt[i + z]; z++) b_ch(&b, txt[i + z] == '\n' ? '|' : txt[i + z]);
+            i += z; k += z;
+        }
+        dlog(m);
+    }
+}
+static void zv_lg_cb(void* it, void* ctx) {
+    char tmp[1300]; ZvLbF o; unsigned h; int slot; char sign; (void)ctx;
+    if (g_zv_lgLines >= ZV_LG_LINES || g_zv_lgEmit >= ZV_LG_PERSCAN) return;
+    if (!zv_lb_read_full(it, tmp, sizeof tmp, &o)) return;
+    h = zv_hash(tmp);
+    if (!(o.pl >= 0 && o.pl != 0xFFFF) && !(o.veh >= 0 && o.veh != 0xFFFF)) {           /* прикреплённые к игроку/машине двигаются — место в хэш не берём */
+        h = (h * 31u + (unsigned)(int)(o.p[0] * 10.0f)) * 31u + (unsigned)(int)(o.p[1] * 10.0f); h = (h * 31u + (unsigned)(int)(o.p[2] * 10.0f)) | 1u;
+    }
+    slot = o.id >= 0 ? o.id : (int)(h >> 16);
+    if (g_zv_lgDump) sign = '=';
+    else if (g_zv_lgH[slot] == 0) sign = '+';
+    else if (g_zv_lgH[slot] != h) sign = '~';
+    else return;
+    g_zv_lgH[slot] = h; g_zv_lgLines++; g_zv_lgEmit++;
+    zv_lg_emit(sign, &o, tmp);
+}
+static int zv_lg_scan(int dump) {                                   /* число подписей в пуле, -1 — не прочиталось */
+    int total;
+    if (!g_safe || !il2cpp_light() || !zv_lb_layout()) return -1;
+    ensure_attached();
+    if (!zv_myref(g_zv_ref)) return -1;
+    g_zv_lgDump = dump; g_zv_lgEmit = 0;
+    if (dump) {
+        char m[200]; Buf b; b_init(&b, m, sizeof m);
+        b_s(&b, "zavod: L=== дамп подписей. Вы (SAMP): "); b_fix(&b, g_zv_ref[0], 2); b_ch(&b, ' '); b_fix(&b, g_zv_ref[2], 2); b_ch(&b, ' '); b_fix(&b, g_zv_ref[1] + 1.0f, 2);
+        dlog(m);
+    }
+    total = zv_scan_pool("Text3DLables", zv_lg_cb);
+    g_zv_lgDump = 0;
+    return total;
+}
+static void zv_lg_reset(void) { int i; for (i = 0; i < 65536; i++) g_zv_lgH[i] = 0; g_zv_lgLines = 0; }
+static void zv_labels_cmd(const char* a) {
+    char m[200]; Buf b;
+    if (seq(a, "dump") || seq(a, "дамп")) {
+        int total = zv_lg_scan(1);
+        if (total < 0) { chat_say("/zavod labels: подписи не прочитались (вы не в игре?) — подробности в konstt.log"); return; }
+        b_init(&b, m, sizeof m); b_s(&b, "/zavod: подписей в стриме "); b_int(&b, total); b_s(&b, ", записано "); b_int(&b, g_zv_lgEmit); b_s(&b, " — HLOG/konstt.log, строки «zavod: L=»");
+        chat_say(m);
+        return;
+    }
+    if (seq(a, "clear") || seq(a, "сброс")) { zv_lg_reset(); zv_say("/zavod: лог подписей: память «что уже записано» и счётчик сброшены"); return; }
+    if (seq(a, "off") || seq(a, "выкл") || seq(a, "0")) { g_zv_lg = 0; zv_say("/zavod: лог подписей выключен"); return; }
+    if (seq(a, "on") || seq(a, "вкл") || seq(a, "1") || !a[0]) {
+        if (!a[0] && g_zv_lg) { g_zv_lg = 0; zv_say("/zavod: лог подписей выключен"); return; }
+        g_zv_lg = 1;
+        if (!g_zv_uiOk) zv_ui_inject();
+        dlog("zavod: L=== лог подписей включён (+ новая, ~ изменилась, = дамп; SAMP x y z; R — радиус показа, LOS — проверка видимости, pl/veh — прикреплена к игроку/машине)");
+        zv_lg_scan(0);
+        zv_say("/zavod: лог подписей включён — пишет новые и изменившиеся в HLOG/konstt.log («zavod: L»). Разово всё вокруг: /zavod labels dump");
+        return;
+    }
+    chat_usage("/zavod labels on|off|dump|clear — лог всех 3D-подписей мира в konstt.log: on/off — вести лог (новые и изменившиеся), dump — разово всё в стриме, clear — забыть записанное");
+}
+
 /* ───────────── меню: внедрение JS и обмен состоянием ───────────── */
 /* ZV_MENU_BEGIN */
 static const char g_zv_menu_js[] =
@@ -434,7 +562,7 @@ static const char g_zv_menu_js[] =
 "var css='#zv-fab{position:fixed;right:1.4vh;top:44vh;width:6.6vh;height:6.6vh;border-radius:50%;background:rgba(12,10,6,.82);border:0.35vh solid #4fc3f7;z-index:999990;pointer-events:auto;display:flex;align-items:center;justify-content:center}'\n"
 "+'#zv-fab.on{background:rgba(79,195,247,.9)}'\n"
 "+'#zv-fab svg{width:3.6vh;height:3.6vh}'\n"
-"+'#zv-panel{position:fixed;left:50%;top:50%;margin-left:-30vh;margin-top:-30vh;width:60vh;background:rgba(12,10,6,.95);border:0.3vh solid #4fc3f7;border-radius:1.6vh;z-index:999991;pointer-events:auto;color:#eeeee6;font-family:\"Open Sans\",sans-serif;display:none;padding:1.2vh 1.6vh 1.4vh 1.6vh;box-sizing:border-box}'\n"
+"+'#zv-panel{position:fixed;left:50%;top:50%;margin-left:-30vh;margin-top:-36vh;width:60vh;background:rgba(12,10,6,.95);border:0.3vh solid #4fc3f7;border-radius:1.6vh;z-index:999991;pointer-events:auto;color:#eeeee6;font-family:\"Open Sans\",sans-serif;display:none;padding:1.2vh 1.6vh 1.4vh 1.6vh;box-sizing:border-box}'\n"
 "+'#zv-panel.show{display:block}'\n"
 "+'.zv-h{display:flex;align-items:center;justify-content:space-between;height:6vh}'\n"
 "+'.zv-t{font-size:2.9vh;font-weight:700;color:#4fc3f7}'\n"
@@ -464,6 +592,10 @@ static const char g_zv_menu_js[] =
 "var csub=el('div',null,'zv-s','выкл');cl.appendChild(csub);cr.appendChild(cl);var csw=mkSw();cr.appendChild(csw);panel.appendChild(cr);\n"
 "var lr=el('div',null,'zv-row');var ll=el('div',null,'zv-l');ll.appendChild(el('div',null,'zv-n','Лог интерфейсов'));\n"
 "var lsub=el('div',null,'zv-s','');ll.appendChild(lsub);lr.appendChild(ll);var lsw=mkSw();lr.appendChild(lsw);panel.appendChild(lr);\n"
+"var gr=el('div',null,'zv-row');var gl=el('div',null,'zv-l');gl.appendChild(el('div',null,'zv-n','Лог 3D-подписей'));\n"
+"var gsub=el('div',null,'zv-s','');gl.appendChild(gsub);gr.appendChild(gl);var gsw=mkSw();gr.appendChild(gsw);panel.appendChild(gr);\n"
+"var dr=el('div',null,'zv-row');var dl=el('div',null,'zv-l');dl.appendChild(el('div',null,'zv-n','Подписи вокруг'));dl.appendChild(el('div',null,'zv-s','разово всё в konstt.log'));\n"
+"dr.appendChild(dl);var db=el('div',null,'zv-b','Дамп');dr.appendChild(db);panel.appendChild(dr);\n"
 "var fr=el('div',null,'zv-row');var fl=el('div',null,'zv-l');fl.appendChild(el('div',null,'zv-n','Быстрый Turner'));\n"
 "var fsub=el('div',null,'zv-s','');fl.appendChild(fsub);fr.appendChild(fl);var fsw=mkSw();fr.appendChild(fsw);panel.appendChild(fr);\n"
 "var mr=el('div',null,'zv-row');var ml=el('div',null,'zv-l');ml.appendChild(el('div',null,'zv-n','Режим'));\n"
@@ -474,7 +606,7 @@ static const char g_zv_menu_js[] =
 "ft.appendChild(hint);ft.appendChild(rs);panel.appendChild(ft);\n"
 "document.body.appendChild(fab);document.body.appendChild(panel);\n"
 "function render(){\n"
-" fab.className=cyc?'on':'';csw.className='zv-sw'+(cyc?' on':'');lsw.className='zv-sw'+(LOGI?' on':'');lsub.textContent=LOGI?('вкл · HLOG/zvui.txt'+(logDrop?' · потеряно строк '+logDrop:'')):'выкл';fsw.className='zv-sw'+(fast?' on':'');\n"
+" fab.className=cyc?'on':'';csw.className='zv-sw'+(cyc?' on':'');lsw.className='zv-sw'+(LOGI?' on':'');lsub.textContent=LOGI?('вкл · HLOG/zvui.txt'+(logDrop?' · потеряно строк '+logDrop:'')):'выкл';fsw.className='zv-sw'+(fast?' on':'');gsw.className='zv-sw'+(S.lg?' on':'');gsub.textContent=S.lg?'вкл · konstt.log «zavod: L»':'выкл';\n"
 " csub.textContent=cyc?(ph+' · '+why):(why||'выкл');\n"
 " fsub.textContent=fast?'вкл · Turner закрывается сразу, как в Code2.js':'выкл';\n"
 " msub.textContent=NAMES[S.mo]||'?';\n"
@@ -490,6 +622,9 @@ static const char g_zv_menu_js[] =
 "lr.addEventListener('click',function(){LOGI=!LOGI;if(LOGI){knownUi=null;jl('--- лог включён ---');}render();});\n"
 "setInterval(function(){try{if(LOGI)uiPoll();hintPoll(Date.now());hookChat();}catch(e){}},400);\n"
 "jl('--- zavod: лог интерфейсов запущен ---');\n"
+"setInterval(function(){try{if(S.lg)cmd('lg');}catch(e){}},1000);   /* лог 3D-подписей: опрос раз в секунду, пока включён */\n"
+"gr.addEventListener('click',function(){cmd('labels '+(S.lg?'off':'on'));});\n"
+"db.addEventListener('click',function(){cmd('labels dump');});\n"
 "mb.addEventListener('click',function(){cmd('mode '+(S.mo?0:1));});\n"
 "rs.addEventListener('click',function(){N={ok:0,bad:0,skip:0,turn:0};render();});\n"
 "/* ───── автоцикл ───── */\n"
@@ -621,11 +756,12 @@ static const char g_zv_menu_js[] =
 " w.__zv=1;window.openInterface=w;})();\n"
 "(function(){var cf=window.closeInterface;if(typeof cf!=='function'||cf.__zv)return;var w=function(n){try{if(LOGI)jl('closeInterface '+n);}catch(e){}return cf.apply(this,arguments);};w.__zv=1;window.closeInterface=w;})();\n"
 "/* сообщения сервера в чате — быстрые подсказки для цикла (если чат так не вызывается, цикл работает по таймерам) */\n"
+"var lastQ='',lastQAt=0,hookN=0,hookedC=null,hookedAdd=null;\n"
 "var CHATRX=/станк|бревн|металл|продукт|фигур|склад|завод|взя[лт]|положи|Turner|Срок|вознагражд|сначала/i;\n"
 "function hookChat(){try{var h=typeof window.interface==='function'?window.interface('Hud'):null;var c=h&&h.$refs&&h.$refs.chat;   /* игра шлёт чат через interface('Hud').$refs['chat'].add(текст, цвет), а не через window.onChatMessage */\n"
-" if(!c||typeof c.add!=='function'||c.add.__zv)return;var f=c.add;\n"
-" var w=function(m){try{var q=String(m).replace(/[{][0-9a-fA-F]{6}[}]/g,'');if(LOGI&&CHATRX.test(q))jl('chat '+q.slice(0,100));chatEv(q);}catch(e){}return f.apply(this,arguments);};\n"
-" w.__zv=1;c.add=w;jl('chat hook ok');}catch(e){}}\n"
+" if(!c||typeof c.add!=='function'||c.add.__zv||(c===hookedC&&c.add===hookedAdd))return;var f=c.add;\n"
+" var w=function(m){try{var q=String(m).replace(/[{][0-9a-fA-F]{6}[}]/g,''),nw=Date.now();if(!(q===lastQ&&nw-lastQAt<400)){lastQ=q;lastQAt=nw;if(LOGI&&CHATRX.test(q))jl('chat '+q.slice(0,100));chatEv(q);}}catch(e){}return f.apply(this,arguments);};   /* то же сообщение в пределах 400 мс — дубль от повторно навешенной обёртки */\n"
+" w.__zv=1;c.add=w;hookedC=c;hookedAdd=c.add;if(++hookN<=3)jl('chat hook ok ('+hookN+')');}catch(e){}}\n"
 "function chatEv(t){\n"
 " if(!cyc)return;\n"
 " if(t.indexOf('Отнесите сделанную фигурку')>=0||t.indexOf('Вы уже сделали фигурку')>=0){hasFig=1;jl('FIG есть');if(ph!=='put')go('put');}\n"
@@ -669,6 +805,7 @@ static void zv_ui_push(int force) {                                 /* сост�
     b_s(&b, ",k:"); b_int(&b, g_zv_mark);
     b_s(&b, ",p:"); b_int(&b, g_zv_poolN >= 0 ? 1 : 0);
     b_s(&b, ",z:"); b_int(&b, g_zv_fz);
+    b_s(&b, ",lg:"); b_int(&b, g_zv_lg);
     b_s(&b, ",bt:"); b_int(&b, g_zv_srcTk); b_s(&b, ",bp:"); b_int(&b, g_zv_srcPt);     /* источник точек: 1 — /zavod bind (приоритет над меткой сервера) */
     b_s(&b, ",mc:[");
     for (i = 0; i < g_zv_nm; i++) {
@@ -720,6 +857,7 @@ static void zv_usage(void) {
     chat_usage("/zavod — тестовый автоцикл завода: меню на экране.  /zavod on|off — автоцикл;  /zavod mode 0|1 — 0 завод, 1 цех тюрьмы (токарные станки)");
     chat_usage("/zavod bind take|put|mach|clear — запомнить текущее место как «взять» / «сдать» / станок / сбросить;  /zavod list — ближайшие 3D-подписи;  /zavod status");
     chat_usage("/zavod fz [on|off] — ручная заморозка персонажа (автоцикл замораживает сам)");
+    chat_usage("/zavod labels on|off|dump|clear — лог ВСЕХ 3D-подписей мира в HLOG/konstt.log (строки «zavod: L»)");
 }
 static const char* zv_src_name(int s) { return s == 1 ? "bind" : s == 2 ? "подпись сервера" : s == 3 ? "встроено из Pawn" : "нет"; }
 static void zv_status(void) {
@@ -798,6 +936,8 @@ static void zv_cmd_run(char tok[][32], int nt) {
         return;
     }
     if (seq(tok[0], "bind") || seq(tok[0], "запомнить")) { if (nt < 2) { chat_usage("/zavod bind take|put|mach|clear"); return; } zv_bind(tok[1]); zv_sync(0); return; }
+    if (seq(tok[0], "lg")) { if (g_zv_lg) zv_lg_scan(0); return; }                                  /* тик лога подписей из меню (раз в секунду) */
+    if (seq(tok[0], "labels") || seq(tok[0], "подписи")) { zv_labels_cmd(nt >= 2 ? tok[1] : ""); return; }
     if (seq(tok[0], "list") || seq(tok[0], "список")) { zv_list(); return; }
     if (seq(tok[0], "status") || seq(tok[0], "статус")) { zv_sync(0); zv_status(); return; }
     if (seq(tok[0], "log")) { if (nt >= 2) dlog2("zavod: js: ", tok[1]); return; }
