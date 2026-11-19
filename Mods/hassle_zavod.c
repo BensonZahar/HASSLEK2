@@ -15,6 +15,9 @@
  *   /zavod list            ближайшие 3D-подписи (текст + расстояние): по ним видно, как на вашем сервере называются склады и станки (ключевые слова — ZV_KW_* ниже)
  *   /zavod status          что мод сейчас видит: режим, откуда взяты точки, сколько станков, свободны ли
  *   /zavod fz [on|off]     ручная заморозка персонажа (автоцикл замораживает сам и отпускает при остановке)
+ *   /zavod fake [on|off]   режим «подмена позиции»: вместо телепорта (/tpl to) цикл шлёт серверу позицию командой /fpos (мод hassle_fakepos.c), персонаж стоит на месте.
+ *                          Для цикла «ваша позиция» = та, что видит сервер (по ней считается прибытие). Остановка цикла возвращает настоящую позицию. Точка «взять» по метке
+ *                          сервера (/tpl gps go) в этом режиме по-прежнему телепортирует — задайте её через /zavod bind take. Не проверено на устройстве.
  *   /zavod help
  *
  * Откуда мод берёт точки (по порядку): 1) /zavod bind  2) 3D-подпись сервера («Склад брёвен», «Склад фигурок», «Токарный станок №N / Статус: Свободен|Занят»,
@@ -51,6 +54,13 @@
 #define ZV_NEAR 2.5f                    /* подпись станка в пределах этих метров (по горизонтали) от вас — «станок рядом» (nb) */
 #define ZV_OVERLAY_R 2.0f               /* подпись «Свободно/Занято» относится к встроенному станку, если стоит в этих метрах от него */
 #define ZV_FZ_TYPE "zavod"              /* имя типа заморозки в Entity.m_FreezeTypes */
+
+/* Режим «подмена позиции» (/zavod fake on): вместо телепорта (/tpl to) цикл шлёт серверу точку командой /fpos (мод hassle_fakepos.c), персонаж не двигается.
+   Зависимости при сборке нет: функции берутся по weak-ссылке и могут отсутствовать (тогда режим не включится). */
+extern int konstt_fakepos_get(float* out) __attribute__((weak));
+extern int konstt_fakepos_set(const float* pos) __attribute__((weak));
+static int g_zv_fake;                                   /* 1 — режим включён (в меню JS приходит как S.fk) */
+#pragma GCC diagnostic ignored "-Waddress"                /* в бандле мод /fpos виден компилятору, и проверка weak-ссылки кажется ему лишней; в сборке без него она нужна */
 
 /* Ключевые слова подписей сервера (подстрока, регистр важен). «Склад бр» — чтобы не зависеть от е/ё. Меняйте под свой сервер (смотрите /zavod list). */
 #define ZV_KW_TAKE "Склад бр"           /* цех тюрьмы: «Склад брёвен» */
@@ -167,7 +177,7 @@ static int zv_vec(void* obj, const char* name, float* out) {        /* мето�
     out[0] = f[0]; out[1] = f[1]; out[2] = f[2];
     return 1;
 }
-static int zv_myref(float* out) {                                   /* ваша позиция (Transform) */
+static int zv_myref_real(float* out) {                              /* ваша НАСТОЯЩАЯ позиция (Transform) */
     void* me = local_player();
     void* tr;
     if (!me || !hm_obj_ok(me)) return 0;
@@ -175,6 +185,10 @@ static int zv_myref(float* out) {                                   /* ваша 
     if (!tr) tr = zv_obj(me, "get_transform");
     if (tr && zv_vec(tr, "get_position", out)) return 1;
     return read_pos(me, out);
+}
+static int zv_myref(float* out) {                                   /* позиция для цикла: в режиме подмены — та, что видит сервер, иначе настоящая */
+    if (g_zv_fake && konstt_fakepos_get && konstt_fakepos_get(out)) return 1;
+    return zv_myref_real(out);
 }
 static int zv_scan_pool(const char* field, item_cb cb) {            /* значения словаря пула (BasePool<T>.m_Items); -1 — не прочиталось, иначе число записей */
     void *pool = zv_pool(field), *dict, *arr; int total;
@@ -220,7 +234,7 @@ static int zv_freeze(int on) {
     if (!m) { if (g_zv_fzErr < 6) { g_zv_fzErr++; dlog("zavod: нет Entity.ToggleFreeze(string,bool,bool)"); } return 0; }
     if (!on && g_zv_fz) {
         float p[3];
-        if (zv_myref(p)) { p[1] += ZV_LAND_UP; zv_set_pos(me, p, 1); }
+        if (zv_myref_real(p)) { p[1] += ZV_LAND_UP; zv_set_pos(me, p, 1); }     /* настоящая позиция: при подмене «ставить на землю» надо там, где вы стоите */
     }
     args[0] = A.string_new(ZV_FZ_TYPE); args[1] = &st; args[2] = &acc;
     if (!args[0]) return 0;
@@ -507,7 +521,7 @@ static const char g_zv_menu_js[] =
 "/* Состояние от C (мод шлёт его через window.__zv.u): mo — режим (0 завод-цех продуктов, 1 цех тюрьмы), me — ваша позиция,\n"
 "   tk/pt — куда ставить игрока для «взять»/«сдать» (Transform, уже со сдвигом), mc — станки [x,y,z,статус 0?/1 свободен/2 занят],\n"
 "   nb — статус станка рядом с вами (0 нет подписи, 1 свободен, 2 занят), k — сервер показывает маркер, p — подписи/пул прочитались */\n"
-"var S={mo:0,me:[0,0,0],tk:null,pt:null,mc:[],nb:0,k:0,z:0,p:0,bt:0,bp:0,bm:0};\n"
+"var S={mo:0,me:[0,0,0],tk:null,pt:null,mc:[],nb:0,k:0,z:0,p:0,bt:0,bp:0,bm:0,fk:0};\n"
 "var cyc=false,fast=true,open=false,syncT=null,cycT=null,fzHeld=false,dragged=false;\n"
 "var N={ok:0,bad:0,skip:0,turn:0};\n"
 "var ph='take',hasFig=0,skipRun=0,phAt=0,tpAt=0,actLast=0,clkLast=0,clk=0,syncLast=0,tries=0,makeAt=0,turnAt=0,putAt=0,noTake=0,okAt=0,turnPoll=0,hintPh='',hintAt=0,hintTxt='',putWaitAt=0,rt=0,usedMk=0,lastMenu='',LOGI=true;\n"
@@ -518,7 +532,7 @@ static const char g_zv_menu_js[] =
 "function cmd(x){try{window.sendChatInput('/zavod q '+x);}catch(e){}}\n"
 "function frz(v){fzHeld=!!v;cmd('fz '+(v?1:0));}\n"
 "function f2(v){return (Math.round(v*100)/100).toFixed(2);}\n"
-"function tp(p){jl('TP '+f2(p[0])+' '+f2(p[2]));if(cyc)frz(1);try{window.sendChatInput('/tpl to '+f2(p[0])+' '+f2(p[1])+' '+f2(p[2]));}catch(e){}}\n"
+"function tp(p){jl((S.fk?'FP ':'TP ')+f2(p[0])+' '+f2(p[2]));if(cyc&&!S.fk)frz(1);try{window.sendChatInput((S.fk?'/fpos ':'/tpl to ')+f2(p[0])+' '+f2(p[1])+' '+f2(p[2]));}catch(e){}}\n"
 "function tpGps(){jl('TP gps');if(cyc)frz(1);try{window.sendChatInput('/tpl gps go');}catch(e){}}\n"
 "function ev(n,a){try{if(typeof sendClientEvent==='function'&&typeof gm!=='undefined'){sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,n,a);return 1;}}catch(e){}   /* та же форма вызова, что у Interactions.onClick в игре */\n"
 " try{window.sendClientEventHandle(0,n,a);return 1;}catch(e){}try{window.sendClientEvent(gm.EVENT_EXECUTE_PUBLIC,{ignoreChat:true},n,a);return 1;}catch(e){}return 0;}\n"
@@ -723,7 +737,7 @@ static const char g_zv_menu_js[] =
 "}catch(e){why='ошибка: '+e;}}\n"
 "function cycSet(v,reason){if(v===cyc)return;cyc=v;if(cycT){clearInterval(cycT);cycT=null;}\n"
 " if(cyc){clk=0;actLast=0;clkLast=0;syncLast=0;turnAt=0;putAt=0;hasFig=0;bad={};go('take');if(hintPh==='mach')go('mach');else if(hintPh==='put')go('put');why='старт';cmd('sync');cycT=setInterval(tick,TICK);}\n"
-" else{if(fzHeld)frz(0);why=reason||'';}\n"
+" else{if(fzHeld)frz(0);if(S.fk)cmd('fake stop');why=reason||'';}\n"
 " render();}\n"
 "cr.addEventListener('click',function(){cycSet(!cyc);});\n"
 "function manual(src){if(cyc)cycSet(false,'стоп: ручное управление ('+src+')');}\n"
@@ -806,6 +820,7 @@ static void zv_ui_push(int force) {                                 /* сост�
     b_s(&b, ",k:"); b_int(&b, g_zv_mark);
     b_s(&b, ",p:"); b_int(&b, g_zv_poolN >= 0 ? 1 : 0);
     b_s(&b, ",z:"); b_int(&b, g_zv_fz);
+    b_s(&b, ",fk:"); b_int(&b, g_zv_fake);
     b_s(&b, ",lg:"); b_int(&b, g_zv_lg);
     b_s(&b, ",bt:"); b_int(&b, g_zv_srcTk); b_s(&b, ",bp:"); b_int(&b, g_zv_srcPt);     /* источник точек: 1 — /zavod bind (приоритет над меткой сервера) */
     b_s(&b, ",mc:[");
@@ -858,6 +873,7 @@ static void zv_usage(void) {
     chat_usage("/zavod — тестовый автоцикл завода: меню на экране.  /zavod on|off — автоцикл;  /zavod mode 0|1 — 0 завод, 1 цех тюрьмы (токарные станки)");
     chat_usage("/zavod bind take|put|mach|clear — запомнить текущее место как «взять» / «сдать» / станок / сбросить;  /zavod list — ближайшие 3D-подписи;  /zavod status");
     chat_usage("/zavod fz [on|off] — ручная заморозка персонажа (автоцикл замораживает сам)");
+    chat_usage("/zavod fake [on|off] — вместо телепорта слать серверу позицию (мод /fpos), персонаж стоит на месте");
     chat_usage("/zavod labels on|off|dump|clear — лог ВСЕХ 3D-подписей мира в HLOG/konstt.log (строки «zavod: L»)");
 }
 static const char* zv_src_name(int s) { return s == 1 ? "bind" : s == 2 ? "подпись сервера" : s == 3 ? "встроено из Pawn" : "нет"; }
@@ -898,7 +914,7 @@ static void zv_bind(const char* what) {
         zv_say("/zavod: всё запомненное сброшено, точки снова берутся из подписей сервера / встроенных координат");
         return;
     }
-    if (!zv_myref(p)) { chat_say("/zavod: ваша позиция не прочиталась — подробности в konstt.log"); return; }
+    if (!zv_myref_real(p)) { chat_say("/zavod: ваша позиция не прочиталась — подробности в konstt.log"); return; }
     if (seq(what, "take") || seq(what, "взять")) { zv_cp3(g_zv_bTk, p); g_zv_hasBTk = 1; zv_say("/zavod: точка «взять» запомнена"); }
     else if (seq(what, "put") || seq(what, "сдать")) { zv_cp3(g_zv_bPt, p); g_zv_hasBPt = 1; zv_say("/zavod: точка «сдать» запомнена"); }
     else if (seq(what, "mach") || seq(what, "станок")) {
@@ -933,6 +949,17 @@ static void zv_cmd_run(char tok[][32], int nt) {
         if (v < 0) { chat_usage("/zavod mode 0|1 — 0 завод (металл → рабочее место → склад), 1 цех тюрьмы (бревно → токарный станок → склад фигурок)"); return; }
         g_zv_mode = v;
         zv_say(v ? "/zavod: режим 1 — цех тюрьмы (бревно → токарный станок → склад фигурок)" : "/zavod: режим 0 — завод (металл → рабочее место → склад)");
+        zv_sync(0);
+        return;
+    }
+    if (seq(tok[0], "fake") || seq(tok[0], "fp") || seq(tok[0], "подмена")) {
+        int want = nt >= 2 ? (seq(tok[1], "on") || seq(tok[1], "вкл") || seq(tok[1], "1")) ? 1 : (seq(tok[1], "off") || seq(tok[1], "выкл") || seq(tok[1], "0")) ? 0 : seq(tok[1], "stop") ? 2 : -1 : !g_zv_fake;
+        if (want < 0) { chat_usage("/zavod fake [on|off] — вместо телепорта слать серверу позицию (мод /fpos), персонаж стоит на месте"); return; }
+        if (want == 2) { if (konstt_fakepos_set) konstt_fakepos_set(NULL); return; }          /* из JS при остановке цикла: сервер снова видит настоящую позицию */
+        if (want && !konstt_fakepos_set) { chat_say("/zavod fake: мода /fpos нет в бандле (hassle_fakepos.c) — режим не включён"); return; }
+        g_zv_fake = want;
+        if (!want && konstt_fakepos_set) konstt_fakepos_set(NULL);
+        zv_say(want ? "/zavod: режим ПОДМЕНЫ позиции включён — цикл шлёт серверу точку через /fpos, персонаж не двигается (выключить: /zavod fake off)" : "/zavod: режим подмены выключен — цикл снова телепортирует (/tpl to), сервер видит настоящую позицию");
         zv_sync(0);
         return;
     }
